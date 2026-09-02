@@ -143,13 +143,27 @@ class TestPrefetchThreadExplosion:
 # ---------------------------------------------------------------------------
 
 class TestTimeoutCompatibility:
+    @pytest.mark.skipif(
+        sys.version_info >= (3, 11),
+        reason=(
+            "On Python 3.11+ concurrent.futures.TimeoutError IS the builtin "
+            "TimeoutError, so `except TimeoutError` works and this probe is moot. "
+            "The negative-assertion only has meaning on the 3.10 floor."
+        ),
+    )
     def test_concurrent_futures_timeout_is_caught(self):
         """_recall.py:535 catches builtin TimeoutError.
 
-        On 3.11+ concurrent.futures.TimeoutError IS the builtin, so this works.
-        On 3.10 (the project's stated floor) it is a distinct class, the except
-        clause never fires, as_completed's timeout escapes to the outer
-        `except Exception` and is logged at debug → recall silently returns [].
+        On 3.10 the project's stated floor `except TimeoutError` does NOT catch
+        `concurrent.futures.TimeoutError` (they are distinct classes until 3.11),
+        so the except clause is dead code on 3.10 and as_completed's timeout
+        escapes to the outer `except Exception`, logged at debug → recall
+        silently returns [].
+
+        The test asserts the OPPOSITE of the desired behaviour: it fails when
+        the assertion is False, which is exactly when 3.10 needs the fix.
+        A pass here would mean the assertion is True, which would mean 3.10
+        already works — which it doesn't.
         """
         assert issubclass(cf.TimeoutError, TimeoutError), (
             f"Python {sys.version.split()[0]}: concurrent.futures.TimeoutError is "

@@ -25,10 +25,18 @@ jobs:
           # 这是代码 backend=auto 的真实首选链路（ONNX，无 torch）。
           - python-version: "3.10"
             name: vector
-            install: ".[dev] lancedb>=0.17,<1 pyarrow>=14 fastembed>=0.3,<1"
+            install: |
+              .[dev]
+              lancedb>=0.17,<1
+              pyarrow>=14
+              fastembed>=0.3,<1
           - python-version: "3.13"
             name: vector
-            install: ".[dev] lancedb>=0.17,<1 pyarrow>=14 fastembed>=0.3,<1"
+            install: |
+              .[dev]
+              lancedb>=0.17,<1
+              pyarrow>=14
+              fastembed>=0.3,<1
     env:
       # 向量后端首次会下载 ONNX 模型。禁用 xet 存储后端，避免 HF 的 xet CDN
       # 在部分环境返回 401（本地国内网络才需要 HF_ENDPOINT 镜像，CI runner
@@ -47,12 +55,17 @@ jobs:
 
       - name: Install package
         env:
-          # 用中间环境变量承载含 < > | 等特殊字符的安装规格，
-          # 并在 shell 里用双引号包住，防止 bash 单词拆分/重定向。
+          # matrix.install 是 YAML 多行字符串（含 < 等特殊字符），
+          # 必须经 env 中转（防注入）+ IFS= read 行（防单词拆分），
+          # 配合 awk 去掉 YAML 缩进产生的前导空格，
+          # 才能让 pip 正确按行解析多个 requirement。
           INSTALL_SPEC: ${{ matrix.install }}
         run: |
           python -m pip install --upgrade pip
-          pip install "$INSTALL_SPEC"
+          echo "$INSTALL_SPEC" | awk '{$1=$1; print}' | while IFS= read -r req; do
+            [ -z "$req" ] && continue
+            python -m pip install "$req"
+          done
 
       - name: Cache HuggingFace models
         uses: actions/cache@v4
