@@ -46,10 +46,13 @@ jobs:
           cache: pip
 
       - name: Install package
+        env:
+          # 用中间环境变量承载含 < > | 等特殊字符的安装规格，
+          # 并在 shell 里用双引号包住，防止 bash 单词拆分/重定向。
+          INSTALL_SPEC: ${{ matrix.install }}
         run: |
           python -m pip install --upgrade pip
-          # matrix.install 含 `<1` 等特殊字符，必须加引号防止 bash 解析为重定向
-          pip install ${{ matrix.install | quote }}
+          pip install "$INSTALL_SPEC"
 
       - name: Cache HuggingFace models
         uses: actions/cache@v4
