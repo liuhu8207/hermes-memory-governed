@@ -1,0 +1,114 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>hermes-memory-governed 独立池方案核对 + 正确修法验证</title>
+<style>
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body { font-family: -apple-system, "Segoe UI", "Microsoft YaHei", sans-serif; background: #f6f7f9; color: #1f2933; line-height: 1.7; padding: 32px 16px; }
+  .wrap { max-width: 960px; margin: 0 auto; }
+  header { background: linear-gradient(135deg, #7c2d12, #ea580c); color: #fff; border-radius: 16px; padding: 32px 36px; margin-bottom: 24px; }
+  header h1 { font-size: 24px; margin-bottom: 6px; }
+  header p { opacity: .85; font-size: 14px; }
+  .metrics { display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 12px; margin: 20px 0 26px; }
+  .metric { background: #fff; border-radius: 12px; padding: 16px; border: 1px solid #e3e8ee; }
+  .metric .num { font-size: 24px; font-weight: 700; }
+  .metric .label { font-size: 13px; color: #64748b; margin-top: 2px; }
+  .metric.green .num { color: #16a34a; }
+  .metric.red .num { color: #dc2626; }
+  section { background: #fff; border-radius: 16px; padding: 26px 30px; margin-bottom: 20px; border: 1px solid #e3e8ee; }
+  h2 { font-size: 19px; margin-bottom: 14px; padding-bottom: 8px; border-bottom: 2px solid #eef2f6; }
+  table { width: 100%; border-collapse: collapse; font-size: 14px; }
+  th, td { padding: 9px 12px; text-align: left; border-bottom: 1px solid #eef2f6; vertical-align: top; }
+  th { background: #f8fafc; font-weight: 600; }
+  .ok { color: #16a34a; font-weight: 700; }
+  .bad { color: #dc2626; font-weight: 700; }
+  .warn { color: #ea580c; font-weight: 700; }
+  .issue { border-left: 4px solid #dc2626; padding: 12px 16px; margin-bottom: 14px; background: #fafbfc; border-radius: 0 10px 10px 0; }
+  .issue.orange { border-left-color: #ea580c; }
+  .issue.green { border-left-color: #16a34a; }
+  .issue .title { font-weight: 700; margin-bottom: 6px; }
+  .issue .loc { font-size: 12px; color: #64748b; font-family: Consolas, monospace; }
+  .issue .detail { font-size: 14px; color: #475569; }
+  .evidence { background: #f1f5f9; border-radius: 8px; padding: 10px 14px; font-family: Consolas, monospace; font-size: 12.5px; margin-top: 8px; white-space: pre-wrap; color: #334155; }
+  pre.code { background: #1f2933; color: #e5e7eb; border-radius: 8px; padding: 14px 16px; font-family: Consolas, monospace; font-size: 12.5px; overflow-x: auto; margin-top: 8px; }
+  .note { font-size: 12.5px; color: #94a3b8; margin-top: 10px; }
+  code { background: #f1f5f9; padding: 1px 6px; border-radius: 5px; font-family: Consolas, monospace; font-size: 13px; }
+</style>
+</head>
+<body>
+<div class="wrap">
+
+<header>
+  <h1>hermes-memory-governed「独立池 + with」方案核对</h1>
+  <p>2026-08-28 · 并发退化已解决，但 with 管理把「超时阻塞」带了回来 · 附验证过的正确修法</p>
+</header>
+
+<div class="metrics">
+  <div class="metric green"><div class="num">✅</div><div class="label">并发退化：已解决（池间隔离）</div></div>
+  <div class="metric red"><div class="num">❌</div><div class="label">超时阻塞：回归（2.00s / 配置 0.5s）</div></div>
+  <div class="metric green"><div class="num">✅</div><div class="label">shutdown 串行降级：保持</div></div>
+</div>
+
+<section>
+  <h2>一、本次方案实测</h2>
+  <table>
+    <tr><th>场景</th><th>实测</th><th>结论</th></tr>
+    <tr><td>单次召回（慢任务 2s，超时 0.5s）</td><td>耗时 <b>2.00s</b>，结果 ['P4']</td><td class="bad">with 的 __exit__ → shutdown(wait=True) 阻塞等慢任务，第三轮修掉的阻塞回归</td></tr>
+    <tr><td>重叠召回（两个后台线程，间隔 0.3s）</td><td>A: ['P4']，B: ['P4']，各自独立池</td><td class="ok">池间隔离生效，并发退化解决</td></tr>
+    <tr><td>shutdown 后召回</td><td>4.00s 串行跑满，返回全部 3 层</td><td class="ok">串行降级保持，不崩溃</td></tr>
+  </table>
+  <p class="note">关键点：代码注释写「The pool is shut down (wait=False) on exit」，但标准 with 语句的 __exit__ 实际调用的是 shutdown(wait=True)——注释与行为不符。标准 ThreadPoolExecutor 的 with 语法无法改 wait 行为。</p>
+</section>
+
+<section>
+  <h2>二、跷跷板困境</h2>
+  <table>
+    <tr><th>方案</th><th>并发退化</th><th>超时阻塞</th><th>线程泄漏</th></tr>
+    <tr><td>共享池（上轮）</td><td class="bad">❌ 排队退化</td><td class="ok">✅ 不阻塞</td><td class="ok">✅ 无</td></tr>
+    <tr><td>独立池 + with（本轮）</td><td class="ok">✅ 池间隔离</td><td class="bad">❌ shutdown(wait=True) 阻塞</td><td class="ok">✅ 无</td></tr>
+    <tr><td><b>独立池 + shutdown(wait=False)（建议）</b></td><td class="ok">✅</td><td class="ok">✅</td><td class="ok">✅ 已实测无泄漏</td></tr>
+  </table>
+</section>
+
+<section>
+  <h2>三、已验证的正确修法（PoC 实测通过）</h2>
+  <div class="issue green">
+    <div class="title">手动池 + shutdown(wait=False)：三个问题同时解决</div>
+    <div class="loc">替换 parallel_recall 中的 with 块</div>
+    <pre class="code">pool = ThreadPoolExecutor(max_workers=3, thread_name_prefix="recall")
+try:
+    futures = {
+        pool.submit(self._search_l2, query): "l2",
+        pool.submit(self._search_l3, query): "l3",
+        pool.submit(self._get_l4_result): "l4",
+    }
+    try:
+        for future in as_completed(futures, timeout=timeout):
+            ...  # 现有收集逻辑不变
+    except TimeoutError:
+        ...  # 现有超时兜底不变
+finally:
+    pool.shutdown(wait=False)  # 不阻塞；运行中任务继续，线程完成后自行退出</pre>
+    <div class="detail">
+      <b>PoC 实测</b>：① 单次召回 0.51s（不阻塞）② 重叠召回 A/B 均返回 P4（不退化）③ 召回结束时有 4 个 recall 线程（任务运行中的正常暂态），2.5s 后全部退出（0 残留，无泄漏）。<br>
+      <b>为什么 shutdown(wait=False) 与 with 不同</b>：wait=False 立即返回，不等运行中任务；已提交任务继续跑完，worker 线程随后自行退出——既不阻塞调用方，也不泄漏线程。
+    </div>
+  </div>
+  <p class="note">注：shutdown(wait=False) 后若进程立即退出，非 daemon 线程会阻塞退出至任务完成（最长约 2s）。若需彻底规避，可在创建后立即把 pool._threads 中线程设 daemon（需在 submit 之后设置才有效），或接受此短暂延迟（长驻进程通常无感）。</p>
+</section>
+
+<section>
+  <h2>四、回归确认</h2>
+  <table>
+    <tr><th>场景</th><th>状态</th></tr>
+    <tr><td>L3 中英混合检索（Python 2 / 天气 3 / 今天 天气 1 / Python 天气 4）</td><td class="ok">与上轮一致，无回归</td></tr>
+    <tr><td>测试套件</td><td class="ok">38/38 通过（1.62s）</td></tr>
+    <tr><td>「50%了」0 hits</td><td class="warn">已知边缘，维持现状</td></tr>
+  </table>
+</section>
+
+</div>
+</body>
+</html>

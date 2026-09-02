@@ -1,0 +1,115 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Obsidian 双向链接落地报告</title>
+<style>
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body { font-family: -apple-system, "Segoe UI", "Microsoft YaHei", sans-serif; background: #f6f7f9; color: #1f2933; line-height: 1.7; padding: 32px 16px; }
+  .wrap { max-width: 940px; margin: 0 auto; }
+  header { background: linear-gradient(135deg, #4c1d95, #7c3aed); color: #fff; border-radius: 16px; padding: 32px 36px; margin-bottom: 24px; }
+  header h1 { font-size: 24px; margin-bottom: 6px; }
+  header p { opacity: .85; font-size: 14px; }
+  .metrics { display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 12px; margin: 20px 0 26px; }
+  .metric { background: #fff; border-radius: 12px; padding: 16px; border: 1px solid #e3e8ee; }
+  .metric .num { font-size: 24px; font-weight: 700; color: #16a34a; }
+  .metric .label { font-size: 13px; color: #64748b; margin-top: 2px; }
+  section { background: #fff; border-radius: 16px; padding: 26px 30px; margin-bottom: 20px; border: 1px solid #e3e8ee; }
+  h2 { font-size: 19px; margin-bottom: 14px; padding-bottom: 8px; border-bottom: 2px solid #eef2f6; }
+  h3 { font-size: 15.5px; margin: 16px 0 8px; }
+  table { width: 100%; border-collapse: collapse; font-size: 13.5px; }
+  th, td { padding: 9px 12px; text-align: left; border-bottom: 1px solid #eef2f6; vertical-align: top; }
+  th { background: #f8fafc; font-weight: 600; }
+  .ok { color: #16a34a; font-weight: 700; }
+  .bad { color: #dc2626; font-weight: 700; }
+  .warn { color: #ea580c; font-weight: 700; }
+  code { background: #f1f5f9; padding: 1px 6px; border-radius: 5px; font-family: Consolas, monospace; font-size: 12.5px; }
+  pre.sample { background: #1f2933; color: #e5e7eb; border-radius: 10px; padding: 16px 18px; font-family: Consolas, monospace; font-size: 12.5px; white-space: pre-wrap; margin: 10px 0; }
+  .note { font-size: 12.5px; color: #94a3b8; margin-top: 10px; }
+</style>
+</head>
+<body>
+<div class="wrap">
+
+<header>
+  <h1>Obsidian 双向链接落地报告</h1>
+  <p>2026-08-28 15:47 · 知识笔记互相 [[wikilink]] + 全链路幂等 · 独立核对 8/8 PASS · 59/59 测试</p>
+</header>
+
+<div class="metrics">
+  <div class="metric"><div class="num">1</div><div class="label">新增脚本 knowledge_links.py</div></div>
+  <div class="metric"><div class="num">2</div><div class="label">生成器文件名清理</div></div>
+  <div class="metric"><div class="num">8/8</div><div class="label">端到端核对 PASS</div></div>
+  <div class="metric"><div class="num">59/59</div><div class="label">测试回归</div></div>
+</div>
+
+<section>
+  <h2>一、需求与实现</h2>
+  <p><b>需求</b>：无 Obsidian 时，生成的 md 用其它软件可读即可；用 Obsidian 时，笔记间要有双向链接（backlinks）。</p>
+  <p><b>实现</b>：新增 <code>scripts/knowledge_links.py</code> 作为知识库的<b>链接后处理步骤</b>（knowledge_sync 的最后一步）：扫描 knowledge 目录全部笔记的 frontmatter（title/tags/concepts），为每篇笔记生成「相关笔记」区——用 Obsidian 原生 <code>[[wikilink]]</code> 链到共享 tag/concept 的笔记（按共享数排序，最多 5 条）。幂等：重复运行只替换该区块。</p>
+  <h3>生成样例（实测）</h3>
+  <pre class="sample">---
+title: Docker 部署方案
+type: concept
+tags: [部署, docker, chat-extractor]
+---
+
+# Docker 部署方案
+
+用 Docker Compose 部署服务。
+
+## 相关笔记
+- [[2026-08-28_我们项目的部署方案确定了：用 Docker Compose|我们项目的部署方案确定了：用 Docker Compose 部署，配置文件在 c…]]
+- [[2026-08-28_本周周会：讨论部署方案和架构设计优化，大家有什么问题？|本周周会：讨论部署方案和架构设计优化，大家有什么问题？]]</pre>
+</section>
+
+<section>
+  <h2>二、实测核对（8/8）</h2>
+  <table>
+    <tr><th>核对项</th><th>结果</th></tr>
+    <tr><td>chats 提取（周会 + deploy 两个知识会话）</td><td class="ok">✅ 2 篇</td></tr>
+    <tr><td>会议纪要生成（basic 降级，无 LLM）</td><td class="ok">✅ 1 篇</td></tr>
+    <tr><td>所有笔记含「相关笔记」区</td><td class="ok">✅</td></tr>
+    <tr><td>wikilink target 无尾空格（Obsidian 可解析）</td><td class="ok">✅</td></tr>
+    <tr><td>chat 笔记互链（共享 tag）</td><td class="ok">✅</td></tr>
+    <tr><td>文件名干净（无尾空格 / Windows 非法字符）</td><td class="ok">✅</td></tr>
+    <tr><td>纯 markdown 可读（非 Obsidian 软件直接打开）</td><td class="ok">✅</td></tr>
+    <tr><td>幂等（二次运行内容不变）</td><td class="ok">✅</td></tr>
+  </table>
+</section>
+
+<section>
+  <h2>三、过程中发现并修复的问题</h2>
+  <table>
+    <tr><th>问题</th><th>影响</th><th>修复</th></tr>
+    <tr><td><span class="bad">文件名尾空格</span></td><td>title 截断 40 字符残留尾空格进文件名 → wikilink target 与文件名不匹配，<b>Obsidian 链接断裂</b></td><td>chat_extractor / meeting_recap 生成文件名统一 strip + 替换 Windows 非法字符（<>:"/\|?*）</td></tr>
+    <tr><td><span class="bad">链接格式抖动</span></td><td>「相关笔记」区块首跑与次跑尾换行不一致 → 幂等失败</td><td>replace 路径统一补尾换行</td></tr>
+    <tr><td><span class="warn">前置 bug 连锁</span></td><td>meeting_recap 适配缺 <code>import time</code> / <code>import re</code>（迁移适配引入）</td><td>已补（本报告前置轮次修复）</td></tr>
+  </table>
+</section>
+
+<section>
+  <h2>四、使用方式</h2>
+  <table>
+    <tr><th>场景</th><th>做法</th></tr>
+    <tr><td>不用 Obsidian</td><td>什么都不用做——笔记是标准 markdown（frontmatter + 正文），Typora / VSCode / 任何编辑器可读；<code>[[链接]]</code> 显示为文本</td></tr>
+    <tr><td>用 Obsidian</td><td>二选一：① 把 <code>WIKI_DIR</code>（默认 ~/wiki）直接设为 vault 内的目录；② 用 Obsidian「打开文件夹作为仓库」指向 ~/wiki。打开后相关笔记自动变为可点击链接，backlinks 面板自动显示反向引用</td></tr>
+    <tr><td>链接重建</td><td><code>python scripts/knowledge_links.py</code>（或作为 knowledge_sync 的最后一步自动跑）</td></tr>
+  </table>
+  <p class="note">链接语义：[[文件名|标题]] —— Obsidian 按文件名解析链接（文件名即去扩展名的笔记名），| 后为显示别名。共享任意 tag/concept 即视为相关，按共享数排序取前 5。</p>
+</section>
+
+<section>
+  <h2>五、回归确认</h2>
+  <table>
+    <tr><th>场景</th><th>结果</th></tr>
+    <tr><td>测试套件</td><td class="ok">59/59 通过</td></tr>
+    <tr><td>full_sync（chats + meetings + dashboard + links）</td><td class="ok">ok=True</td></tr>
+    <tr><td>既有功能（L1-L4 / 并行召回 / Bridge）</td><td class="ok">无回归</td></tr>
+  </table>
+</section>
+
+</div>
+</body>
+</html>

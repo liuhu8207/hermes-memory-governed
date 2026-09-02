@@ -1,0 +1,139 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>hermes-memory-governed 第二轮修复验证报告</title>
+<style>
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body { font-family: -apple-system, "Segoe UI", "Microsoft YaHei", sans-serif; background: #f6f7f9; color: #1f2933; line-height: 1.7; padding: 32px 16px; }
+  .wrap { max-width: 960px; margin: 0 auto; }
+  header { background: linear-gradient(135deg, #1e3a5f, #2d6a9f); color: #fff; border-radius: 16px; padding: 36px 40px; margin-bottom: 28px; }
+  header h1 { font-size: 26px; margin-bottom: 8px; }
+  header p { opacity: .85; font-size: 14px; }
+  .metrics { display: grid; grid-template-columns: repeat(auto-fit, minmax(160px, 1fr)); gap: 14px; margin: 22px 0 30px; }
+  .metric { background: #fff; border-radius: 12px; padding: 18px; border: 1px solid #e3e8ee; }
+  .metric .num { font-size: 30px; font-weight: 700; }
+  .metric .label { font-size: 13px; color: #64748b; margin-top: 4px; }
+  .metric.green .num { color: #16a34a; }
+  .metric.orange .num { color: #ea580c; }
+  .metric.red .num { color: #dc2626; }
+  .metric.blue .num { color: #2563eb; }
+  section { background: #fff; border-radius: 16px; padding: 28px 32px; margin-bottom: 24px; border: 1px solid #e3e8ee; }
+  h2 { font-size: 20px; margin-bottom: 16px; padding-bottom: 10px; border-bottom: 2px solid #eef2f6; }
+  table { width: 100%; border-collapse: collapse; margin: 14px 0; font-size: 14px; }
+  th, td { padding: 10px 12px; text-align: left; border-bottom: 1px solid #eef2f6; vertical-align: top; }
+  th { background: #f8fafc; font-weight: 600; }
+  .ok { color: #16a34a; font-weight: 700; }
+  .bad { color: #dc2626; font-weight: 700; }
+  .warn { color: #ea580c; font-weight: 700; }
+  .issue { border-left: 4px solid #e2e8f0; padding: 12px 16px; margin-bottom: 14px; background: #fafbfc; border-radius: 0 10px 10px 0; }
+  .issue.red { border-left-color: #dc2626; }
+  .issue.orange { border-left-color: #ea580c; }
+  .issue.green { border-left-color: #16a34a; }
+  .issue .title { font-weight: 700; margin-bottom: 6px; }
+  .issue .loc { font-size: 12px; color: #64748b; font-family: Consolas, monospace; }
+  .issue .detail { font-size: 14px; color: #475569; }
+  .evidence { background: #f1f5f9; border-radius: 8px; padding: 10px 14px; font-family: Consolas, monospace; font-size: 12.5px; margin-top: 8px; white-space: pre-wrap; color: #334155; }
+  code { background: #f1f5f9; padding: 1px 6px; border-radius: 5px; font-family: Consolas, monospace; font-size: 13px; }
+  .note { font-size: 12.5px; color: #94a3b8; margin-top: 8px; }
+</style>
+</head>
+<body>
+<div class="wrap">
+
+<header>
+  <h1>hermes-memory-governed 第二轮修复验证报告</h1>
+  <p>对 2026-08-27 第二轮修复总结（6 项）的逐项实测核对 · 环境：Windows + Python 3.13 + lancedb 0.37.1 · 28/28 测试通过</p>
+</header>
+
+<div class="metrics">
+  <div class="metric green"><div class="num">5</div><div class="label">修复项有效</div></div>
+  <div class="metric orange"><div class="num">2</div><div class="label">部分修复（仍有问题）</div></div>
+  <div class="metric red"><div class="num">2</div><div class="label">修复无效/引入新问题</div></div>
+</div>
+
+<section>
+  <h2>一、总体结论</h2>
+  <p>第二轮修复质量明显高于第一轮：L2 建表/写入/读取链路已真实打通，score 方向、文本评分、backend 路径都改对了。但 <b>FTS5 中文检索的「逐字符 prefix 匹配」方案实测双重失败</b>——中文依旧查不到，且把原本正常的英文检索搞成灾难性误报；parallel_recall 超时只修了一半（不崩了，但 still 阻塞 3s，且引入结果重复收集的新 bug）；pyproject 构建仍因包发现配置缺失而失败。</p>
+</section>
+
+<section>
+  <h2>二、逐项核对</h2>
+  <table>
+    <tr><th>#</th><th>修复总结声称</th><th>实测结果</th><th>状态</th></tr>
+    <tr><td>1</td><td>L2 建表含 vector 列 + 写入生成 embedding + 无 vector 列跳过 embedding</td><td>建表 OK（5 列含 vector）、无 embedding 时写入正常（vector=NULL）、文本降级检索命中、伪造 embedding 时向量搜索返回 0 条</td><td class="warn">⚠️ 部分</td></tr>
+    <tr><td>2</td><td>parallel_recall 超时优雅降级（不崩溃）</td><td>不崩溃 ✅；但耗时仍 3.00s（配置 0.5s，with 阻塞未解）；且超时后已完成结果被重复收集（FAST×2）</td><td class="warn">⚠️ 部分</td></tr>
+    <tr><td>3</td><td>pyproject backend 改 setuptools.build_meta + vector 可选依赖</td><td>backend 路径正确 ✅；但构建仍失败：flat-layout 发现 config/plugin 两个顶层包，拒绝构建</td><td class="warn">⚠️ 部分</td></tr>
+    <tr><td>4</td><td>FTS5 中文：无空格时逐字符 prefix 匹配</td><td>「记得」「咖啡」仍 0 hits；英文 "coffee" 命中 cat/orange 等无关内容（3/6 条），"python" 命中 4/6 条</td><td class="bad">❌ 无效+误报</td></tr>
+    <tr><td>5</td><td>L2 score = 1.0 - min(_distance, 1.0)</td><td>公式正确（距离小→score 高）</td><td class="ok">✅ 有效</td></tr>
+    <tr><td>6</td><td>L2 text 评分 = 0.5 + match_count × 0.1</td><td>有区分度且封顶 1.0，正确</td><td class="ok">✅ 有效</td></tr>
+  </table>
+</section>
+
+<section>
+  <h2>三、仍存在的问题</h2>
+
+  <div class="issue red">
+    <div class="title"><span class="bad">严重</span>FTS5 中文修复无效，且英文检索被搞坏</div>
+    <div class="loc">_recall.py :: _build_fts_query（逐字符 prefix：'"c"* OR "o"* OR ...'）</div>
+    <div class="detail">
+      <b>中文依旧查不到</b>：FTS5 默认分词器把中文整句当单个 token，「记得」→ <code>"记"* OR "得"*</code> 只匹配以「记/得」<b>开头</b>的 token，句子「我记得用户喜欢喝咖啡」不以「记」开头 → 0 hits。逐字符 prefix 只能命中「查询词恰好是句子开头」的情况。<br><br>
+      <b>英文灾难性误报</b>：查询 "coffee" 展开为 <code>"c"* OR "o"* OR "f"* OR "f"* OR "e"* OR "e"*</code>，任何以 c/o/f/e 开头的 token 都命中——"cat"、"orange" 全被召回。实测 6 条库中 "coffee" 命中 3 条（2 条无关），"python" 命中 4 条（3 条无关）。<b>原本精确的英文检索被这个改动破坏了。</b>
+    </div>
+    <div class="evidence">实测：
+query='记得'    -> 0 hits
+query='咖啡'    -> 0 hits
+query='coffee'  -> 3 hits: ['The cat sat on the', 'I drank coffee yes', 'Orange juice is he']
+query='cat'     -> 3 hits: ['The cat sat on the', 'Python is a progra', 'I drank coffee yes']</div>
+  </div>
+
+  <div class="issue red">
+    <div class="title"><span class="bad">严重</span>parallel_recall 超时只修了一半 + 新 bug</div>
+    <div class="loc">_recall.py :: parallel_recall</div>
+    <div class="detail">
+      ① TimeoutError 已捕获，不再崩溃 ✅<br>
+      ② 但 <code>with ThreadPoolExecutor(...)</code> 退出时 <code>shutdown(wait=True)</code> 仍阻塞等待慢任务完成——实测配置 0.5s 总耗时 3.00s，超时配置依然无效。<br>
+      ③ <b>新 bug</b>：超时后 <code>for future, layer in futures.items(): if future.done()</code> 把已完成 future 的结果与 as_completed 已收集的结果<b>重复合并</b>——实测 FAST 结果出现 2 次。
+    </div>
+    <div class="evidence">实测：parallel_timeout_seconds=0.5，慢 L2 3s
+返回 ['FAST', 'FAST']，耗时 3.00s（重复收集 + 阻塞确认）</div>
+  </div>
+
+  <div class="issue red">
+    <div class="title"><span class="bad">严重</span>pyproject 构建仍失败（backend 已修，包发现未配）</div>
+    <div class="loc">pyproject.toml</div>
+    <div class="detail">
+      backend 改为 <code>setuptools.build_meta</code> 正确，但 setuptools flat-layout 检测到 <code>config</code> 和 <code>plugin</code> 两个顶层包目录，拒绝自动发现。需要显式配置：
+      <code>[tool.setuptools.packages.find] include = ["plugin*"]</code> 或 <code>[tool.setuptools] packages = ["plugin", "plugin.memory_governed"]</code>。
+    </div>
+    <div class="evidence">实测：pip install . --no-deps --dry-run
+error: Multiple top-level packages discovered in a flat-layout: ['config', 'plugin'].</div>
+  </div>
+
+  <div class="issue orange">
+    <div class="title"><span class="warn">高</span>L2 数据一致性：无 embedding 时写入的数据，装 embedding 后不可见</div>
+    <div class="loc">_sync.py :: _index_l2 · _recall.py :: _search_l2_vector</div>
+    <div class="detail">
+      无 sentence-transformers 时写入的事实 vector 列为 NULL；之后安装 embedding 依赖，向量搜索对 NULL vector 行静默返回空——<b>旧数据在语义检索模式下全部消失</b>（文本降级仍可查到，但一旦启用向量模式就看不到）。升级 embedding 时需要给存量数据补向量（迁移脚本）。
+    </div>
+    <div class="evidence">实测：写入 1 条（vector=None），伪造 embed_fn 后 search('python') -> 0 条</div>
+  </div>
+</section>
+
+<section>
+  <h2>四、剩余修复建议</h2>
+  <table>
+    <tr><th>优先级</th><th>事项</th><th>方案</th></tr>
+    <tr><td>P0</td><td>FTS5 查询重构</td><td>英文：恢复 OR of quoted terms（逐字符 prefix 只用于 CJK 场景也要先确认有效）；中文：jieba 分词（写入+查询两侧）或 FTS5 trigram（SQLite 3.34+，≥3 字符查询），或 LIKE 子串兜底</td></tr>
+    <tr><td>P0</td><td>parallel_recall 超时彻底修复</td><td>不用 with 管理线程池（手动 shutdown(wait=False)），或用 dict 记录已收集 future 避免重复</td></tr>
+    <tr><td>P0</td><td>pyproject 包发现配置</td><td>加 [tool.setuptools.packages.find] include=["plugin*"]，验证 pip install .</td></tr>
+    <tr><td>P1</td><td>L2 embedding 迁移</td><td>提供 re-embed 脚本为存量 NULL vector 行补向量</td></tr>
+    <tr><td>P2</td><td>测试补盲区</td><td>FTS5 中文/英文精确性、超时重复收集、pip 构建验证</td></tr>
+  </table>
+  <p class="note">注：28 个测试全部通过（0.79s），但依旧未覆盖上述任何问题——测试保护仍缺失。</p>
+</section>
+
+</div>
+</body>
+</html>

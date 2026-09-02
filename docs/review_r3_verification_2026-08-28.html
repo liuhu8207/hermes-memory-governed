@@ -1,0 +1,128 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>hermes-memory-governed 第三轮修复验证报告</title>
+<style>
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body { font-family: -apple-system, "Segoe UI", "Microsoft YaHei", sans-serif; background: #f6f7f9; color: #1f2933; line-height: 1.7; padding: 32px 16px; }
+  .wrap { max-width: 960px; margin: 0 auto; }
+  header { background: linear-gradient(135deg, #1e3a5f, #2d6a9f); color: #fff; border-radius: 16px; padding: 36px 40px; margin-bottom: 28px; }
+  header h1 { font-size: 26px; margin-bottom: 8px; }
+  header p { opacity: .85; font-size: 14px; }
+  .metrics { display: grid; grid-template-columns: repeat(auto-fit, minmax(160px, 1fr)); gap: 14px; margin: 22px 0 30px; }
+  .metric { background: #fff; border-radius: 12px; padding: 18px; border: 1px solid #e3e8ee; }
+  .metric .num { font-size: 30px; font-weight: 700; }
+  .metric .label { font-size: 13px; color: #64748b; margin-top: 4px; }
+  .metric.green .num { color: #16a34a; }
+  .metric.orange .num { color: #ea580c; }
+  .metric.red .num { color: #dc2626; }
+  section { background: #fff; border-radius: 16px; padding: 28px 32px; margin-bottom: 24px; border: 1px solid #e3e8ee; }
+  h2 { font-size: 20px; margin-bottom: 16px; padding-bottom: 10px; border-bottom: 2px solid #eef2f6; }
+  table { width: 100%; border-collapse: collapse; margin: 14px 0; font-size: 14px; }
+  th, td { padding: 10px 12px; text-align: left; border-bottom: 1px solid #eef2f6; vertical-align: top; }
+  th { background: #f8fafc; font-weight: 600; }
+  .ok { color: #16a34a; font-weight: 700; }
+  .bad { color: #dc2626; font-weight: 700; }
+  .warn { color: #ea580c; font-weight: 700; }
+  .issue { border-left: 4px solid #e2e8f0; padding: 12px 16px; margin-bottom: 14px; background: #fafbfc; border-radius: 0 10px 10px 0; }
+  .issue.red { border-left-color: #dc2626; }
+  .issue.orange { border-left-color: #ea580c; }
+  .issue.green { border-left-color: #16a34a; }
+  .issue .title { font-weight: 700; margin-bottom: 6px; }
+  .issue .loc { font-size: 12px; color: #64748b; font-family: Consolas, monospace; }
+  .issue .detail { font-size: 14px; color: #475569; }
+  .evidence { background: #f1f5f9; border-radius: 8px; padding: 10px 14px; font-family: Consolas, monospace; font-size: 12.5px; margin-top: 8px; white-space: pre-wrap; color: #334155; }
+  code { background: #f1f5f9; padding: 1px 6px; border-radius: 5px; font-family: Consolas, monospace; font-size: 13px; }
+  .note { font-size: 12.5px; color: #94a3b8; margin-top: 8px; }
+</style>
+</head>
+<body>
+<div class="wrap">
+
+<header>
+  <h1>hermes-memory-governed 第三轮修复验证报告</h1>
+  <p>对 2026-08-28 第三轮修复总结（4 项）的逐项实测核对 · 环境：Windows + Python 3.13 + lancedb 0.37.1 · 28/28 测试通过</p>
+</header>
+
+<div class="metrics">
+  <div class="metric green"><div class="num">1</div><div class="metric-label" style="font-size:13px;color:#64748b">完全有效</div></div>
+  <div class="metric orange"><div class="num">2</div><div class="metric-label" style="font-size:13px;color:#64748b">部分修复（有残留问题）</div></div>
+  <div class="metric red"><div class="num">1</div><div class="metric-label" style="font-size:13px;color:#64748b">未修复（新错误）</div></div>
+</div>
+
+<section>
+  <h2>一、总体结论</h2>
+  <p>第三轮方向正确：英文恢复精确匹配、中文走 LIKE 降级、超时去重、包发现配置都做了。实测确认：<b>纯英文、纯中文单段查询都已可用，重复收集已修复</b>。但仍有三个残留问题：带空格的中文/混合查询（「今天 天气」0 hits）、parallel_recall 超时阻塞依旧（3.00s）、pyproject 构建换了新错误（缺 wheel）。</p>
+</section>
+
+<section>
+  <h2>二、逐项核对</h2>
+  <table>
+    <tr><th>#</th><th>修复总结声称</th><th>实测结果</th><th>状态</th></tr>
+    <tr><td>1</td><td>FTS5 双路径：纯英文 FTS5 + CJK LIKE 降级</td><td>英文 "Python" 精确 2 hits ✅；中文「天气」LIKE 2 hits ✅；但「今天 天气」(带空格中文) 0 hits ❌、「Python 天气」(混合) 丢中文部分 ❌；LIKE 未转义 %/_ 通配符 ⚠️</td><td class="warn">⚠️ 部分</td></tr>
+    <tr><td>2</td><td>parallel_recall 去重（collected set）</td><td>实测 FAST 仅出现 1 次，无重复</td><td class="ok">✅ 有效</td></tr>
+    <tr><td>3</td><td>parallel_recall 非阻塞（result timeout=0）</td><td>不崩溃、去重正常；但总耗时仍 3.00s（配置 0.5s）——with 退出 shutdown(wait=True) 阻塞未解决</td><td class="warn">⚠️ 部分</td></tr>
+    <tr><td>4</td><td>pyproject packages.find + vector 可选依赖</td><td>包发现配置生效（metadata 生成成功），但构建 wheel 报 invalid command 'bdist_wheel'——build-system.requires 缺 "wheel"</td><td class="bad">❌ 未修复</td></tr>
+  </table>
+</section>
+
+<section>
+  <h2>三、仍存在的问题</h2>
+
+  <div class="issue orange">
+    <div class="title"><span class="warn">高</span>带空格的中文 / 中英混合查询仍失效</div>
+    <div class="loc">_recall.py :: _build_fts_query（CJK 检测只在 len(words) &lt;= 1 时生效）</div>
+    <div class="detail">
+      「今天 天气」split 后 2 个词 → 走 FTS5 OR of quoted terms → 中文 token 依然查不到 → <b>0 hits</b>。「Python 天气」→ FTS5 只命中 Python 相关，天气相关记忆全部丢失。CJK 检测应改为「查询串任意位置含 CJK 字符就整体走 LIKE（或按词拆分后分别匹配）」。
+    </div>
+    <div class="evidence">实测：
+query='今天 天气'  -> 0 hits（库中实际有「今天天气很好」「明天天气怎么样」）
+query='Python 天气' -> 2 hits，全部为英文内容，天气相关 0 条</div>
+  </div>
+
+  <div class="issue orange">
+    <div class="title"><span class="warn">高</span>LIKE 降级未转义通配符 % 和 _</div>
+    <div class="loc">_recall.py :: _search_l3_like（WHERE content LIKE ? 直接拼接）</div>
+    <div class="detail">
+      查询含 <code>%</code>（如「50%了」）或 <code>_</code>（如「a_b」）时，LIKE 通配符会把子串匹配变成模式匹配，产生误报。需用 <code>LIKE ? ESCAPE '\'</code> 并转义。
+    </div>
+  </div>
+
+  <div class="issue red">
+    <div class="title"><span class="bad">严重</span>parallel_recall 超时阻塞仍未解决</div>
+    <div class="loc">_recall.py :: parallel_recall（with ThreadPoolExecutor 退出 shutdown(wait=True)）</div>
+    <div class="detail">
+      修复 3 只改了 <code>future.result(timeout)</code>，但真正的阻塞源是 <code>with</code> 块退出时的 <code>shutdown(wait=True)</code>：即使超时后提前收集了已完成结果，退出 with 仍要等慢任务跑完。实测配置 0.5s 总耗时 3.00s。方案：不用 with（手动 shutdown(wait=False)），或把线程池设为 daemon。
+    </div>
+    <div class="evidence">实测：parallel_timeout_seconds=0.5，慢 L2 3s → 返回 1 条(FAST)，耗时 3.00s</div>
+  </div>
+
+  <div class="issue red">
+    <div class="title"><span class="bad">严重</span>pyproject 构建失败原因换了：缺 wheel</div>
+    <div class="loc">pyproject.toml :: build-system.requires</div>
+    <div class="detail">
+      包发现配置已生效（metadata 阶段通过），但 <code>build-system.requires = ["setuptools>=68.0,<69"]</code> 缺 <code>wheel</code>——setuptools 68 的 bdist_wheel 由独立 wheel 包提供，构建隔离环境里没有它 → <code>invalid command 'bdist_wheel'</code>。修复：requires 加 "wheel"。
+    </div>
+    <div class="evidence">实测：pip install . --no-deps --dry-run
+error: invalid command 'bdist_wheel'（metadata 生成成功，wheel 构建失败）</div>
+  </div>
+</section>
+
+<section>
+  <h2>四、剩余修复清单</h2>
+  <table>
+    <tr><th>优先级</th><th>事项</th><th>方案</th></tr>
+    <tr><td>P0</td><td>pyproject 加 wheel</td><td>build-system.requires 加 "wheel"，验证 pip install .</td></tr>
+    <tr><td>P0</td><td>超时阻塞</td><td>with 改手动 shutdown(wait=False) 或 daemon 线程池</td></tr>
+    <tr><td>P1</td><td>混合/多词中文查询</td><td>CJK 检测改为任意位置含 CJK 即整串走 LIKE；或按空格拆段分别 LIKE 后合并</td></tr>
+    <tr><td>P1</td><td>LIKE 通配符转义</td><td>ESCAPE '\' + 转义 % _</td></tr>
+    <tr><td>P2</td><td>测试补盲区</td><td>「今天 天气」混合查询、LIKE 通配符、超时耗时、pip 构建，全部补进测试</td></tr>
+  </table>
+  <p class="note">注：28 个测试全部通过（0.62s），依旧未覆盖上述残留问题。三轮修复累计：L2 链路、时间衰减、score 方向、去重、英文检索已正确；超时阻塞、构建、混合中文查询尚未闭环。</p>
+</section>
+
+</div>
+</body>
+</html>

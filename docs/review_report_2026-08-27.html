@@ -1,0 +1,208 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>hermes-memory-governed 代码审查报告</title>
+<style>
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body { font-family: -apple-system, "Segoe UI", "Microsoft YaHei", sans-serif; background: #f6f7f9; color: #1f2933; line-height: 1.7; padding: 32px 16px; }
+  .wrap { max-width: 960px; margin: 0 auto; }
+  header { background: linear-gradient(135deg, #1e3a5f, #2d6a9f); color: #fff; border-radius: 16px; padding: 36px 40px; margin-bottom: 28px; }
+  header h1 { font-size: 26px; margin-bottom: 8px; }
+  header p { opacity: .85; font-size: 14px; }
+  .metrics { display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 14px; margin: 22px 0 30px; }
+  .metric { background: #fff; border-radius: 12px; padding: 18px; border: 1px solid #e3e8ee; }
+  .metric .num { font-size: 30px; font-weight: 700; }
+  .metric .label { font-size: 13px; color: #64748b; margin-top: 4px; }
+  .metric.red .num { color: #dc2626; }
+  .metric.orange .num { color: #ea580c; }
+  .metric.blue .num { color: #2563eb; }
+  .metric.green .num { color: #16a34a; }
+  section { background: #fff; border-radius: 16px; padding: 28px 32px; margin-bottom: 24px; border: 1px solid #e3e8ee; }
+  h2 { font-size: 20px; margin-bottom: 16px; padding-bottom: 10px; border-bottom: 2px solid #eef2f6; }
+  .severity { display: inline-block; font-size: 12px; padding: 2px 10px; border-radius: 999px; font-weight: 600; margin-right: 8px; vertical-align: 2px; }
+  .sev-critical { background: #fee2e2; color: #b91c1c; }
+  .sev-high { background: #ffedd5; color: #c2410c; }
+  .sev-medium { background: #fef9c3; color: #a16207; }
+  .issue { border-left: 4px solid #e2e8f0; padding: 12px 16px; margin-bottom: 14px; background: #fafbfc; border-radius: 0 10px 10px 0; }
+  .issue.critical { border-left-color: #dc2626; }
+  .issue.high { border-left-color: #ea580c; }
+  .issue.medium { border-left-color: #eab308; }
+  .issue .title { font-weight: 700; margin-bottom: 6px; }
+  .issue .loc { font-size: 12px; color: #64748b; font-family: Consolas, monospace; }
+  .issue .detail { font-size: 14px; color: #475569; }
+  .evidence { background: #f1f5f9; border-radius: 8px; padding: 10px 14px; font-family: Consolas, monospace; font-size: 12.5px; margin-top: 8px; white-space: pre-wrap; color: #334155; }
+  table { width: 100%; border-collapse: collapse; margin: 14px 0; font-size: 14px; }
+  th, td { padding: 10px 12px; text-align: left; border-bottom: 1px solid #eef2f6; }
+  th { background: #f8fafc; font-weight: 600; }
+  .flow { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; font-size: 13px; margin: 10px 0; }
+  .flow .node { background: #eef2ff; border: 1px solid #c7d2fe; border-radius: 8px; padding: 6px 12px; }
+  .flow .arrow { color: #94a3b8; font-weight: 700; }
+  .flow .node.bad { background: #fee2e2; border-color: #fca5a5; }
+  .flow .node.ok { background: #dcfce7; border-color: #86efac; }
+  .roadmap .step { display: flex; gap: 14px; margin-bottom: 16px; }
+  .roadmap .num { width: 32px; height: 32px; min-width: 32px; border-radius: 50%; background: #2563eb; color: #fff; display: flex; align-items: center; justify-content: center; font-weight: 700; font-size: 14px; }
+  .roadmap .step h4 { font-size: 15px; margin-bottom: 4px; }
+  .roadmap .step p { font-size: 13.5px; color: #475569; }
+  .note { font-size: 12.5px; color: #94a3b8; margin-top: 8px; }
+  code { background: #f1f5f9; padding: 1px 6px; border-radius: 5px; font-family: Consolas, monospace; font-size: 13px; }
+</style>
+</head>
+<body>
+<div class="wrap">
+
+<header>
+  <h1>hermes-memory-governed 代码审查报告</h1>
+  <p>L1-L4 分层记忆插件 · 审查时间 2026-08-27 · 覆盖 6 个插件模块 + 5 个脚本 + 测试套件 · 28/28 测试通过但存在核心链路缺陷</p>
+</header>
+
+<div class="metrics">
+  <div class="metric red"><div class="num">4</div><div class="label">严重缺陷（实锤）</div></div>
+  <div class="metric orange"><div class="num">5</div><div class="label">中等问题</div></div>
+  <div class="metric blue"><div class="num">8</div><div class="label">轻微 / 一致性</div></div>
+  <div class="metric green"><div class="num">6</div><div class="label">优化建议</div></div>
+</div>
+
+<section>
+  <h2>一、项目概况</h2>
+  <p>Hermes Agent 的分层记忆 provider：L1 手写规则（MEMORY.md / USER.md）、L2 语义记忆（LanceDB）、L3 对话归档（SQLite FTS5）、L4 人格摘要（persona.md），外加 Bridge 人工审查门禁与 Mermaid 短期压缩。设计思路（异步预取读路径 + 非阻塞写路径）是合理的，但核心的 L2 语义层与 L3 时效排序实际不可用，构建配置也无法安装。</p>
+</section>
+
+<section>
+  <h2>二、核心链路现状</h2>
+  <div class="flow">
+    <span class="node ok">L1 手写规则</span><span class="arrow">→</span>
+    <span class="node bad">L2 语义检索（坏）</span><span class="arrow">→</span>
+    <span class="node ok">L3 归档（可写，检索弱）</span><span class="arrow">→</span>
+    <span class="node ok">L4 persona（可用）</span>
+  </div>
+  <table>
+    <tr><th>层</th><th>状态</th><th>问题</th></tr>
+    <tr><td>L1</td><td>✅ 可用</td><td>读取缓存 60s 刷新，逻辑正确；但 replace 语义未实现（与 add 相同，均为追加）</td></tr>
+    <tr><td>L2</td><td>❌ 完全失效</td><td>建表参数错误 + 检索 API 错误 + 无 embedding 向量列，三层错误全部被静默吞掉</td></tr>
+    <tr><td>L3</td><td>⚠️ 半可用</td><td>写入正常；时间衰减是死代码；中文检索基本失效；特殊字符导致查询崩溃</td></tr>
+    <tr><td>L4</td><td>✅ 可用</td><td>由 cron 脚本生成；refresh_l4_background 名不副实（只重读文件）</td></tr>
+    <tr><td>Bridge</td><td>✅ 可用</td><td>脱敏、目标白名单、审查门禁设计良好；但会话启发式提取误报偏多</td></tr>
+  </table>
+</section>
+
+<section>
+  <h2>三、严重缺陷（已实测验证）</h2>
+
+  <div class="issue critical">
+    <div class="title"><span class="severity sev-critical">严重</span>L2 语义层从创建到检索每一步都失败，且全部静默</div>
+    <div class="loc">plugin/memory_governed/_sync.py :: _init_l2 / _index_l2 · _recall.py :: _search_l2</div>
+    <div class="detail">
+      ① create_table(schema={...dict...}) — LanceDB 要求 pyarrow.Schema，dict 直接抛 TypeError；<br>
+      ② 即使表存在，search(query, limit=n) — 正确 API 是链式 .limit(n)，抛 TypeError；<br>
+      ③ 即使修好 API，表没有 vector 列（全项目无任何 embedding 配置），抛 ValueError: "There is no vector column"。<br>
+      三层异常全部被 except Exception 吞掉 → 运行时零感知，L2 写入永远失败、检索永远返回空。
+    </div>
+    <div class="evidence">实测 (lancedb 0.37.1)：
+create_table(schema=dict) FAILED: TypeError: Schema must be an instance of pyarrow.Schema
+search(q, limit=5) FAILED: TypeError: LanceTable.search() got an unexpected keyword argument 'limit'
+search(q).limit(5) FAILED: ValueError: There is no vector column in the data</div>
+  </div>
+
+  <div class="issue critical">
+    <div class="title"><span class="severity sev-critical">严重</span>L3 时间衰减是死代码，文档宣称的「7 天半衰期」从未生效</div>
+    <div class="loc">plugin/memory_governed/_recall.py :: _search_l3</div>
+    <div class="detail">
+      公式 math.exp(-0.693 * 0 / decay_hours) 恒等于 1.0；SQL 也从未查询 timestamp 列，衰减系数无从计算。旧对话与新对话排序完全一样。
+    </div>
+    <div class="evidence">实测：age_factor = 1.0（无论 decay_hours 取何值）</div>
+  </div>
+
+  <div class="issue critical">
+    <div class="title"><span class="severity sev-critical">严重</span>parallel_recall 超时保护双重失效</div>
+    <div class="loc">plugin/memory_governed/_recall.py :: parallel_recall</div>
+    <div class="detail">
+      ① as_completed(futures, timeout=0.5) 超时抛 TimeoutError，函数内部无捕获 — governed_search 工具调用直接崩；<br>
+      ② ThreadPoolExecutor 的 with 退出执行 shutdown(wait=True)，即使超时仍阻塞等待慢任务完成 — 配置 0.5s 实际耗时 3s+。
+    </div>
+    <div class="evidence">实测：parallel_timeout_seconds=0.5，模拟 L2 慢 3s → 3.00s 后抛 TimeoutError 未捕获</div>
+  </div>
+
+  <div class="issue critical">
+    <div class="title"><span class="severity sev-critical">严重</span>pyproject.toml 构建配置错误，项目无法 pip 安装</div>
+    <div class="loc">pyproject.toml :: build-system.backend</div>
+    <div class="detail">
+      setuptools.backends._legacy:_Backend 模块不存在（setuptools 68 无此路径）。正确写法是 setuptools.build_meta:__legacy__。
+    </div>
+    <div class="evidence">实测 (setuptools 68.2.2)：BackendUnavailable: Cannot import 'setuptools.backends._legacy'</div>
+  </div>
+</section>
+
+<section>
+  <h2>四、中等问题</h2>
+
+  <div class="issue high">
+    <div class="title"><span class="severity sev-high">高</span>FTS5 中文检索基本失效 + 特殊字符崩溃</div>
+    <div class="loc">_recall.py :: _search_l3（fts_query = " OR ".join(query.split())）</div>
+    <div class="detail">默认 unicode61 分词器按空格分词，中文整句被当单个 token：查询「记得」匹配不到「我记得用户喜欢喝咖啡」；含引号的查询直接 OperationalError（被静默吞掉返回空）。建议：jieba 分词 + AND 组合，或 FTS5 trigram tokenizer（SQLite 3.34+），并对查询做转义。</div>
+    <div class="evidence">实测：query='记得' → 0 hits；query='喜欢"咖啡' → OperationalError: unterminated string</div>
+  </div>
+
+  <div class="issue high">
+    <div class="title"><span class="severity sev-high">高</span>L2 / L3 分数量纲不可比，合并排序失真</div>
+    <div class="loc">_recall.py :: _search_l2 / _search_l3 / parallel_recall</div>
+    <div class="detail">L2 score 约 0~1（LanceDB 距离），L3 score 是 FTS5 rank 绝对值（可达几十）。混排后 L3 几乎永远压过 L2，L2 结果形同虚设。建议按层做 min-max 归一化或 rank 分位转换后再合并。</div>
+  </div>
+
+  <div class="issue medium">
+    <div class="title"><span class="severity sev-medium">中</span>on_memory_write 的 replace 分支与 add 完全相同</div>
+    <div class="loc">__init__.py :: on_memory_write</div>
+    <div class="detail">replace 语义应为「定位并替换已有内容」，当前实现只是再次追加（靠去重防重复），无法覆盖/修正已有记忆条目。</div>
+  </div>
+
+  <div class="issue medium">
+    <div class="title"><span class="severity sev-medium">中</span>health 脚本退出码过严：warning 即 FAIL</div>
+    <div class="loc">scripts/memory_health_report.py :: main（return 1 if warnings）</div>
+    <div class="detail">「lancedb 未安装」「无候选文件」这类 warning 会让脚本返回 1，导致 daily pipeline 整体报 FAIL，cron 收到误报警。建议 warnings 与 errors 分离，仅 errors 返回非 0。</div>
+  </div>
+
+  <div class="issue medium">
+    <div class="title"><span class="severity sev-medium">中</span>配置加载静默失败</div>
+    <div class="loc">_config.py :: load_governed_config</div>
+    <div class="detail">governed_memory.json 解析失败时 except Exception: pass 静默回退默认值，用户配错完全无感知。至少应 log warning 并记录错误详情。</div>
+  </div>
+
+  <div class="issue medium">
+    <div class="title"><span class="severity sev-medium">中</span>WriteQueue.stop() 存在竞态且不 join</div>
+    <div class="loc">_sync.py :: WriteQueue.stop</div>
+    <div class="detail">主线程 drain 剩余队列与 worker 线程并发 get 竞争，可能重复处理或漏处理；shutdown 不 join 线程，进程退出时可能丢最后一批 L2 写入。L3 为同步写不受影响。</div>
+  </div>
+</section>
+
+<section>
+  <h2>五、轻微问题与一致性</h2>
+  <table>
+    <tr><th>#</th><th>位置</th><th>问题</th></tr>
+    <tr><td>1</td><td>_recall.py</td><td>token 估算三处不一致：*3（_truncate_to_tokens）/*4（format_recall）/*4（compress），且未按 CJK/拉丁区分</td></tr>
+    <tr><td>2</td><td>_recall.py</td><td>_handle_audit 用语义搜索当审计查询，不精确；L1/L4 用 substring 匹配，长 ID 会误报</td></tr>
+    <tr><td>3</td><td>_sync.py</td><td>L3 主表与 FTS 表无外键关联；FTS 插入失败 except: pass → 记录在但永远搜不到；timestamp 类型不一致（REAL vs str）</td></tr>
+    <tr><td>4</td><td>__init__.py</td><td>会话事实启发式过宽（「记得」「以后」高频误报）；每轮 prefetch 新建线程，无线程池复用</td></tr>
+    <tr><td>5</td><td>docs/operations.md</td><td>引用不存在的脚本（wiki_nblm_daily.py 等）；cron 时间表与示例命令不一致；daily pipeline 实际不含 L4 persona 步骤</td></tr>
+    <tr><td>6</td><td>memory_pipeline.py</td><td>--with-notebooklm 指向不存在的脚本，启用即 FAIL</td></tr>
+    <tr><td>7</td><td>tests/</td><td>28 个测试全过但未覆盖 L2 建表/写入/检索、L3 时间衰减、parallel 超时、FTS 中文 — 核心链路无测试保护</td></tr>
+    <tr><td>8</td><td>仓库</td><td>目录无 .git（无法追溯提交历史），位于 github 目录下建议 git init</td></tr>
+  </table>
+</section>
+
+<section>
+  <h2>六、优化路线图</h2>
+  <div class="roadmap">
+    <div class="step"><div class="num">1</div><div><h4>修复构建（5 分钟）</h4><p>pyproject.toml backend 改为 setuptools.build_meta:__legacy__，验证 pip install .</p></div></div>
+    <div class="step"><div class="num">2</div><div><h4>重建 L2 语义层（1-2 天）</h4><p>接入 embedding（本地 sentence-transformers 或 LLM API）；schema 用 pyarrow 定义并含 vector 列；改用链式检索 API；错误改为记录日志而非静默吞掉</p></div></div>
+    <div class="step"><div class="num">3</div><div><h4>修复 L3 排序与中文检索（半天）</h4><p>SQL 取 timestamp 并实现真实时间衰减；查询转义；jieba 分词或 trigram tokenizer</p></div></div>
+    <div class="step"><div class="num">4</div><div><h4>修复 parallel_recall 超时（1 小时）</h4><p>捕获 TimeoutError；改用全局线程池 + shutdown(wait=False) 语义，或对慢层单独限时</p></div></div>
+    <div class="step"><div class="num">5</div><div><h4>分数归一化 + 分层预算</h4><p>L2/L3 各自归一化后合并；或按层固定配额，避免 L3 淹没 L2</p></div></div>
+    <div class="step"><div class="num">6</div><div><h4>补齐测试与文档</h4><p>为 L2 全链路、时间衰减、超时、中文检索补集成测试；修正 operations.md 与 pipeline 行为</p></div></div>
+  </div>
+  <p class="note">注：本次审查在 Windows + Python 3.13 + lancedb 0.37.1 + setuptools 68.2.2 环境实测验证；项目声明支持 lancedb 0.17~0.37，其中 create_table(dict) 与 search(limit=) 在 0.17 时代同样不是合法用法，结论跨版本成立。</p>
+</section>
+
+</div>
+</body>
+</html>

@@ -1,0 +1,250 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>hermes-memory-governed 项目全景报告</title>
+<style>
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body { font-family: -apple-system, "Segoe UI", "Microsoft YaHei", sans-serif; background: #f6f7f9; color: #1f2933; line-height: 1.75; padding: 32px 16px; }
+  .wrap { max-width: 980px; margin: 0 auto; }
+  header { background: linear-gradient(135deg, #0f172a, #1e40af); color: #fff; border-radius: 16px; padding: 36px 40px; margin-bottom: 26px; }
+  header h1 { font-size: 27px; margin-bottom: 8px; }
+  header p { opacity: .85; font-size: 14px; }
+  .badges { display: flex; gap: 10px; flex-wrap: wrap; margin-top: 16px; }
+  .badge { background: rgba(255,255,255,.14); border: 1px solid rgba(255,255,255,.25); border-radius: 999px; padding: 4px 14px; font-size: 13px; }
+  nav { background: #fff; border-radius: 16px; padding: 20px 28px; margin-bottom: 24px; border: 1px solid #e3e8ee; }
+  nav b { font-size: 15px; }
+  nav ol { margin: 10px 0 0 20px; font-size: 14px; color: #475569; columns: 2; column-gap: 40px; }
+  section { background: #fff; border-radius: 16px; padding: 28px 32px; margin-bottom: 22px; border: 1px solid #e3e8ee; }
+  h2 { font-size: 20px; margin-bottom: 14px; padding-bottom: 10px; border-bottom: 2px solid #eef2f6; }
+  h3 { font-size: 16px; margin: 18px 0 8px; color: #1e40af; }
+  p { margin: 8px 0; font-size: 14.5px; color: #334155; }
+  table { width: 100%; border-collapse: collapse; margin: 12px 0; font-size: 13.5px; }
+  th, td { padding: 9px 12px; text-align: left; border-bottom: 1px solid #eef2f6; vertical-align: top; }
+  th { background: #f8fafc; font-weight: 600; white-space: nowrap; }
+  .layer { display: flex; gap: 12px; margin: 12px 0; flex-wrap: wrap; }
+  .lcard { flex: 1; min-width: 200px; background: #f8fafc; border: 1px solid #e2e8f0; border-radius: 12px; padding: 14px 16px; }
+  .lcard b { display: block; font-size: 15px; margin-bottom: 4px; }
+  .lcard small { color: #64748b; font-size: 12.5px; line-height: 1.6; display: block; }
+  .lcard .tag { display: inline-block; font-size: 11px; background: #e0e7ff; color: #3730a3; border-radius: 5px; padding: 1px 8px; margin-top: 6px; }
+  .flow { background: #0f172a; color: #a5b4fc; border-radius: 10px; padding: 16px 18px; font-family: Consolas, monospace; font-size: 12.5px; line-height: 1.9; overflow-x: auto; white-space: pre; margin: 12px 0; }
+  .flow .hl { color: #34d399; }
+  .flow .warn { color: #fbbf24; }
+  .kv { display: grid; grid-template-columns: 180px 1fr; gap: 6px 16px; font-size: 14px; margin: 10px 0; }
+  .kv div:nth-child(odd) { color: #64748b; }
+  .ok { color: #16a34a; font-weight: 700; }
+  .warn { color: #ea580c; font-weight: 700; }
+  code { background: #f1f5f9; padding: 1px 6px; border-radius: 5px; font-family: Consolas, monospace; font-size: 12.5px; }
+  pre.code { background: #1f2933; color: #e5e7eb; border-radius: 10px; padding: 16px 18px; font-family: Consolas, monospace; font-size: 12.5px; overflow-x: auto; line-height: 1.7; margin: 10px 0; }
+  .decision { border-left: 4px solid #2563eb; padding: 10px 16px; background: #f8fafc; border-radius: 0 10px 10px 0; margin: 10px 0; }
+  .decision b { display: block; margin-bottom: 4px; }
+  .decision p { font-size: 13.5px; }
+  ul.tight { margin: 6px 0 6px 22px; font-size: 14px; color: #334155; }
+  ul.tight li { margin: 4px 0; }
+  .note { font-size: 12.5px; color: #94a3b8; margin-top: 10px; }
+  .status-pill { display: inline-block; font-size: 12px; padding: 2px 10px; border-radius: 999px; font-weight: 600; }
+  .st-ok { background: #dcfce7; color: #15803d; }
+  .st-warn { background: #fef3c7; color: #b45309; }
+</style>
+</head>
+<body>
+<div class="wrap">
+
+<header>
+  <h1>hermes-memory-governed 项目全景报告</h1>
+  <p>Hermes Agent 的受治理分层记忆插件 · 版本 0.1.0 · 报告生成于 2026-08-28（基于当前代码最终形态）</p>
+  <div class="badges">
+    <span class="badge">Python ≥3.10</span>
+    <span class="badge">SQLite FTS5 + LanceDB + sentence-transformers（可选）</span>
+    <span class="badge">测试 45/45 通过</span>
+    <span class="badge">pip 构建通过</span>
+    <span class="badge">独立自检 11/11</span>
+  </div>
+</header>
+
+<nav>
+  <b>目录</b>
+  <ol>
+    <li>项目定位与设计理念</li>
+    <li>分层记忆架构总览</li>
+    <li>三条数据流（读 / 写 / 维护）</li>
+    <li>核心模块详解</li>
+    <li>关键设计决策与权衡</li>
+    <li>配置与使用方式</li>
+    <li>当前健康状态</li>
+    <li>已知边界与后续建议</li>
+    <li>文件清单</li>
+  </ol>
+</nav>
+
+<section>
+  <h2>一、项目定位与设计理念</h2>
+  <p><b>hermes-memory-governed</b> 是 Hermes Agent 的记忆 provider 插件（memory-provider kind），把「AI 长期记忆」拆成五个信任层级，并给自动提取的内容加一道<b>人工审查门禁</b>。它解决的问题：</p>
+  <ul class="tight">
+    <li>AI 上下文有限 → 手写规则（L1）始终注入、语义记忆（L2）按相关度召回、对话归档（L3）全文可检索、人格摘要（L4）进系统提示</li>
+    <li>自动提取的记忆不可靠 → 低置信内容进入 Bridge（JSONL + review-required 标签），人工确认后才导入</li>
+    <li>长对话压缩丢信息 → 压缩前把关键决策/工具输出转成 Mermaid 任务画布（可选）</li>
+    <li>检索延迟影响响应 → 异步预取（本轮结束后就为下一轮准备记忆），缓存命中 &lt;1ms</li>
+  </ul>
+  <h3>四条设计原则</h3>
+  <ul class="tight">
+    <li><b>信任分层</b>：人工手写 &gt; 审查通过 &gt; 自动提取，每层有明确信任级别和注入方式</li>
+    <li><b>读写分离</b>：L3 归档同步写（WAL，&lt;10ms 保数据安全），L2 索引异步写（不阻塞对话）</li>
+    <li><b>优雅降级</b>：任何依赖缺失（lancedb / sentence-transformers / pandas）都降级到可用路径，绝不崩溃</li>
+    <li><b>确定性维护</b>：记忆的长期整理（人格生成、候选导出、健康报告）由 cron 跑确定性脚本，不靠 LLM</li>
+  </ul>
+</section>
+
+<section>
+  <h2>二、分层记忆架构总览</h2>
+  <div class="layer">
+    <div class="lcard"><b>L1 · 手写规则</b><small>MEMORY.md / USER.md，人工维护，最高信任。60s 缓存刷新，始终注入（固定预算 800 tokens）。支持 add / replace / remove 三种写入语义。</small><span class="tag">始终注入</span></div>
+    <div class="lcard"><b>L2 · 语义记忆</b><small>LanceDB 向量库。双路径：有 embedding 模型（sentence-transformers, 384 维）→ 向量搜索；没有 → 文本子串扫描。自动提取的事实经异步队列写入。</small><span class="tag">按相关度</span></div>
+    <div class="lcard"><b>L3 · 对话归档</b><small>SQLite + FTS5 全文索引。英文走 FTS5，中文走 LIKE 降级，混合查询双路径合并去重。带 7 天半衰期时间衰减与组内 min-max 归一化。</small><span class="tag">可检索</span></div>
+    <div class="lcard"><b>L4 · 人格摘要</b><small>persona.md，由 cron 每日从 L1/L2/L3 汇总生成，注入系统提示（User Profile 区块），30 分钟缓存。</small><span class="tag">固定注入</span></div>
+  </div>
+  <div class="layer">
+    <div class="lcard"><b>Bridge · 审查门禁</b><small>自动提取的持久记忆候选 → candidates.jsonl（追加 + id 去重 + 500 行自动归档），secret 模式拦截 + 目标白名单，review-required 标签，人工确认后导入。</small><span class="tag">人工把关</span></div>
+    <div class="lcard"><b>Mermaid 压缩（可选）</b><small>上下文压缩前把最近 20 个关键事件（决策 / 工具输出 / 用户意图）转成 Mermaid 流程图文本，保住关键信息。</small><span class="tag">默认关闭</span></div>
+  </div>
+</section>
+
+<section>
+  <h2>三、三条数据流</h2>
+  <h3>读路径（异步预取，&lt;1ms 命中）</h3>
+  <div class="flow">Turn N 结束
+  └─ queue_prefetch(下一轮查询)
+       └─ 后台线程 → parallel_recall()          <span class="hl">独立临时线程池，超时 0.5s~2s 不阻塞</span>
+            ├─ L2 向量搜索 / 文本扫描            <span class="warn">视 embedding 可用性自动选择</span>
+            ├─ L3 FTS5(英文) + LIKE(中文) 合并    <span class="hl">CJK 按段拆分，双路径去重</span>
+            └─ L4 persona（固定 1.0）
+       └─ 结果写入 _prefetch_cache
+Turn N+1 开始
+  └─ prefetch(查询) → 缓存命中 &lt;1ms；未命中回退 L1-only</div>
+  <h3>写路径（L3 同步，L2 异步）</h3>
+  <div class="flow">sync_turn(messages)
+  ├─ L3Writer.write()  <span class="hl">同步，SQLite WAL，&lt;10ms（数据安全优先）</span>
+  │    └─ messages 主表 + messages_fts（timestamp 类型统一 REAL）
+  └─ WriteQueue.enqueue()  <span class="warn">异步后台（体验优先）</span>
+       └─ worker 线程 → 提取原子事实 → 有模型则生成 384 维向量 → LanceDB add
+            └─ 模型首次可用时 → _migrate_null_vectors() 存量 NULL 行 delete+re-add 补向量</div>
+  <h3>维护路径（cron，确定性脚本）</h3>
+  <div class="flow">每日 cron（hermes cron add）
+  ├─ 09:10  l4_persona_daily.py      <span class="hl">L1+L2+L3 → persona.md（secret 脱敏）</span>
+  ├─ 09:15  scope_recall_bridge.py   <span class="hl">persona/归纳/wiki → candidates.jsonl（追加去重+归档）</span>
+  └─ 09:45  memory_health_report.py  <span class="hl">全层健康检查 → health_report.md/json</span>
+统一入口：memory_pipeline.py daily | bridge | health | persona</div>
+</section>
+
+<section>
+  <h2>四、核心模块详解</h2>
+
+  <h3>4.1 plugin/memory_governed/_recall.py — RecallEngine（召回引擎，读路径核心）</h3>
+  <table>
+    <tr><th>能力</th><th>实现要点</th></tr>
+    <tr><td>L1 检索</td><td>MEMORY.md + USER.md 合并文本，60s 缓存；provider 层支持 add/replace/remove 回写与缓存失效</td></tr>
+    <tr><td>L2 检索</td><td>三路径：向量搜索（有模型且表有 vector 列）→ 文本子串扫描（无模型，score=0.5+命中数×0.1）→ 空表禁用；score = 1.0 − min(距离, 1.0)，越大越相似</td></tr>
+    <tr><td>L3 检索</td><td>英文 FTS5（转义特殊字符）/ 中文 LIKE（ESCAPE 转义 %_）/ 混合双路合并去重；分数链路：<code>abs(rank)/(1+abs(rank))</code> × 时间衰减（7 天半衰期）→ 组内 min-max 归一化（最强=1.0）</td></tr>
+    <tr><td>L4 检索</td><td>persona.md 30 分钟缓存，固定 score=1.0</td></tr>
+    <tr><td>parallel_recall</td><td>每次调用独立临时线程池（max_workers=3，池间隔离无排队退化）；as_completed 超时收集已完成层，TimeoutError 捕获不崩；shutdown 后降级 _sequential_recall 串行执行</td></tr>
+    <tr><td>format_recall</td><td>L1 固定预算 + L2/L3 共享 1200 tokens 预算；MIN_SCORE=0.1 过滤低相关（L3 归一化后与 L2 同量纲，安全）</td></tr>
+  </table>
+
+  <h3>4.2 plugin/memory_governed/_sync.py — 写路径</h3>
+  <table>
+    <tr><th>组件</th><th>实现要点</th></tr>
+    <tr><td>WriteQueue</td><td>单 worker 后台线程（daemon），队列满丢最旧；stats 带锁；_embed_model 在 __init__ 即初始化为 None（消除 AttributeError 路径）</td></tr>
+    <tr><td>L2 索引</td><td>PyArrow schema（content/category/source/timestamp/vector:float32[384]）；有模型生成向量，无模型写 NULL；_migrate_null_vectors 存量 NULL 行 delete+re-add 补向量（pyarrow as_py 判定，无 pandas 依赖）</td></tr>
+    <tr><td>L3Writer</td><td>SQLite WAL；主表 + FTS5 表（timestamp REAL 类型一致）；双重 shutdown 幂等</td></tr>
+  </table>
+
+  <h3>4.3 plugin/memory_governed/_bridge.py — BridgeExporter（审查门禁）</h3>
+  <table>
+    <tr><th>能力</th><th>实现要点</th></tr>
+    <tr><td>导出</td><td>追加模式（并发不覆盖）+ 已有 id 去重（id=sha256(content+source_path)，稳定）+ 超过 500 行自动轮转到 archive/candidates_时间戳.jsonl</td></tr>
+    <tr><td>安全</td><td>写前 secret 检测（sk-/ghp_/api_key= 等模式），命中直接跳过；再 redact 兜底；target 白名单 {user, memory, project, ops}</td></tr>
+    <tr><td>状态</td><td>get_status：文件存在性 / 大小 / 行数 / 最近导出报告</td></tr>
+  </table>
+
+  <h3>4.4 __init__.py — GovernedMemoryProvider（宿主接入层）</h3>
+  <p>实现 MemoryProvider 契约的 11 个生命周期方法：<code>initialize / is_available / system_prompt_block / prefetch / queue_prefetch / recall_status / sync_turn / on_pre_compress / on_session_end / on_memory_write / shutdown / handle_tool_call</code>。暴露 3 个 agent 工具：governed_search（跨层检索）、governed_audit（记忆溯源，L1/L4 word-boundary 精确匹配 + L2/L3 语义检索）、governed_health（全层健康）。会话结束时提取持久记忆候选进 Bridge（启发式：偏好关键词 + CJK 加权长度 ≥15 + 排除问句/清单）。通过 entry point <code>hermes.memory_provider = governed</code> 注册。</p>
+
+  <h3>4.5 scripts/ — 维护脚本（cron 用）</h3>
+  <table>
+    <tr><th>脚本</th><th>职责</th></tr>
+    <tr><td>l4_persona_daily.py</td><td>L1+L2+L3 → persona.json + persona.md（secret 脱敏）</td></tr>
+    <tr><td>scope_recall_bridge.py</td><td>从 persona / 归纳产物 / wiki 收集候选导出 Bridge（export/status/validate）</td></tr>
+    <tr><td>memory_health_report.py</td><td>L1-L4 + Bridge 全层健康检查 → markdown + json</td></tr>
+    <tr><td>memory_pipeline.py</td><td>统一入口：daily（bridge+health）/ bridge / health / persona</td></tr>
+  </table>
+</section>
+
+<section>
+  <h2>五、关键设计决策与权衡</h2>
+  <div class="decision"><b>① 为什么 L3 同步写、L2 异步写？</b><p>L3 是"事实源"（source of truth），丢了无法重建；SQLite WAL 写入 &lt;10ms 不影响对话节奏。L2 是"派生索引"（可由 L3 重建），异步丢一批可接受。</p></div>
+  <div class="decision"><b>② 为什么 L3 分数要组内 min-max 归一化？</b><p>FTS5 bm25 rank 是负数且量级随语料变化（实测 1e-6），与 L2 的 0~1 分数相差 6 个数量级。直接用统一阈值会把 L3 全灭（实际发生过）。归一化后：组内最强恒为 1.0（必过阈值）、组内相对差异保留（时间衰减仍在起作用）、与 L2 可比。</p></div>
+  <div class="decision"><b>③ 为什么每次召回用独立临时池 + shutdown(wait=False)？</b><p>共享池会被慢任务占满导致重叠召回排队超时（返回空）；固定 with 语句会 shutdown(wait=True) 阻塞等待慢任务（2s）。独立池 + wait=False 同时满足：池间隔离、不阻塞调用方、线程在任务完成后自行退出（实测 0 泄漏）。代价：进程退出时若有运行中任务会短暂等待。</p></div>
+  <div class="decision"><b>④ 为什么中文检索走 LIKE 而不是 FTS5？</b><p>SQLite FTS5 默认分词器把中文整句当一个 token，子串永远匹配不到（已实测）。LIKE '%…%' 子串匹配是中文场景唯一不依赖分词器的可靠方案；英文仍走 FTS5（精确且快）。混合查询双路合并 + 按 content 去重。</p></div>
+  <div class="decision"><b>⑤ 为什么 L1 用文件、L2 用向量库、L3 用 SQLite？</b><p>L1 是人工编辑的规则，文件最透明可 git 管理；L2 需要相似度检索，向量库是唯一解；L3 是追加型时序归档，SQLite FTS5 零运维且全文检索快。各取所长。</p></div>
+</section>
+
+<section>
+  <h2>六、配置与使用方式</h2>
+  <div class="kv">
+    <div>安装</div><div><code>powershell -ExecutionPolicy Bypass -File install.ps1</code> 或 <code>pip install .</code>（vector extra：pip install ".[vector]" 启用 L2 向量）</div>
+    <div>插件注册</div><div>entry point <code>hermes.memory_provider = plugin.memory_governed:register</code>，宿主自动发现；或在 config.yaml 设 <code>memory.provider: governed</code></div>
+    <div>配置文件</div><div><code>$HERMES_HOME/governed_memory.json</code>（JSON 解析失败会 warning 并回退默认值），支持 GOVERNED_* 环境变量覆盖</div>
+    <div>默认路径</div><div>memory/MEMORY.md、USER.md（L1）· memory/l2（LanceDB）· memory/l3/l3.db（L3）· memory/persona.md（L4）· cron/output/scope_recall_bridge（Bridge）</div>
+    <div>关键调参</div><div>recall.l1_budget_tokens=800 / l23_budget_tokens=1200 / parallel_timeout_seconds=2.0 / l3_time_decay_hours=168 · sync.write_queue_maxsize=100 · mermaid_compress.enabled=false</div>
+    <div>日常运维</div><div><code>python scripts/memory_pipeline.py daily</code>（或 health / bridge / persona 单独跑）；Bridge 候选人工审查后 import</div>
+    <div>Agent 工具</div><div>governed_search（跨层检索）/ governed_audit（记忆溯源）/ governed_health（健康诊断）</div>
+  </div>
+</section>
+
+<section>
+  <h2>七、当前健康状态（2026-08-28 自检）</h2>
+  <table>
+    <tr><th>检查</th><th>结果</th></tr>
+    <tr><td>测试套件</td><td class="ok">45/45 通过</td></tr>
+    <tr><td>pip 构建（含 entry-points）</td><td class="ok">Would install 成功，wheel 内 entry_points.txt 正确</td></tr>
+    <tr><td>独立自检 11 项（并发/去重/归档/降级/方向等）</td><td class="ok">11/11 PASS</td></tr>
+    <tr><td>L2 三路径（向量 / 文本降级 / NULL 迁移）</td><td class="ok">全部可用（迁移判定 as_py 已修复）</td></tr>
+    <tr><td>L3 五类查询 + 分数链路</td><td class="ok">全部符合预期</td></tr>
+    <tr><td>并行召回四项（不阻塞 / 隔离 / 无泄漏 / 降级）</td><td class="ok">全过</td></tr>
+  </table>
+</section>
+
+<section>
+  <h2>八、已知边界与后续建议</h2>
+  <table>
+    <tr><th>类型</th><th>事项</th><th>说明 / 建议</th></tr>
+    <tr><td><span class="warn">边缘</span></td><td>「50%了」类 CJK+数字混合查询 0 hits</td><td>LIKE 去空格匹配与内容空格不对齐，极边缘；可 LIKE 同时尝试原串与去空格串</td></tr>
+    <tr><td><span class="warn">边缘</span></td><td>health 脚本 warning 即退出码 1</td><td>daily pipeline 会误报 FAIL；建议 warnings/errors 分离</td></tr>
+    <tr><td><span class="warn">边缘</span></td><td>memory_pipeline 引用不存在的 wiki_nblm_daily.py</td><td>--with-notebooklm 启用即 FAIL；补脚本或移除选项</td></tr>
+    <tr><td><span class="warn">轻微</span></td><td>WriteQueue.stop() drain 与 worker 并发 get 竞态</td><td>建议 stop 先置标志 → join worker（带超时）→ 再 drain</td></tr>
+    <tr><td><span class="warn">运维</span></td><td>L2 启用向量前需迁移存量数据</td><td>装 sentence-transformers 后首次 _init_l2 会自动触发 _migrate_null_vectors（已实现）；建议迁移失败日志从 debug 升 warning</td></tr>
+    <tr><td><span class="warn">测试</span></td><td>并发 / 构建场景无测试覆盖</td><td>建议补：重叠召回不为空、LIKE 转义、pip 构建、「50%了」回归</td></tr>
+  </table>
+</section>
+
+<section>
+  <h2>九、文件清单</h2>
+  <table>
+    <tr><th>文件</th><th>行数级</th><th>职责</th></tr>
+    <tr><td>plugin/memory_governed/__init__.py</td><td>~500</td><td>GovernedMemoryProvider（宿主接入层）+ 工具 schema + register</td></tr>
+    <tr><td>plugin/memory_governed/_recall.py</td><td>~530</td><td>RecallEngine：L1-L4 检索 + 并行召回 + 分数链路</td></tr>
+    <tr><td>plugin/memory_governed/_sync.py</td><td>~330</td><td>WriteQueue（L2 异步索引 + 迁移）+ L3Writer（同步归档）</td></tr>
+    <tr><td>plugin/memory_governed/_bridge.py</td><td>~270</td><td>BridgeExporter：候选导出 / 去重 / 归档 / 安全</td></tr>
+    <tr><td>plugin/memory_governed/_config.py</td><td>~170</td><td>dataclass 配置 + env 覆盖</td></tr>
+    <tr><td>plugin/memory_governed/_compress.py</td><td>~140</td><td>MermaidCompressor（可选短期压缩）</td></tr>
+    <tr><td>scripts/*.py</td><td>5 个</td><td>cron 维护脚本（persona / bridge / health / pipeline / env）</td></tr>
+    <tr><td>tests/test_memory_governed.py</td><td>45 项</td><td>配置 / 检索 / 写入 / 压缩 / Bridge / Provider 全覆盖</td></tr>
+    <tr><td>install.ps1 / pyproject.toml / plugin.yaml</td><td>—</td><td>安装脚本 / 打包与 entry-points / 插件元数据</td></tr>
+  </table>
+  <p class="note">本报告基于当前代码最终形态生成，历史修复过程详见 docs/ 下各轮 review_*.html 报告。</p>
+</section>
+
+</div>
+</body>
+</html>

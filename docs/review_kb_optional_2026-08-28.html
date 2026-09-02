@@ -1,0 +1,110 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>知识库管线迁移：Obsidian 可选化</title>
+<style>
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body { font-family: -apple-system, "Segoe UI", "Microsoft YaHei", sans-serif; background: #f6f7f9; color: #1f2933; line-height: 1.7; padding: 32px 16px; }
+  .wrap { max-width: 940px; margin: 0 auto; }
+  header { background: linear-gradient(135deg, #14532d, #16a34a); color: #fff; border-radius: 16px; padding: 32px 36px; margin-bottom: 24px; }
+  header h1 { font-size: 24px; margin-bottom: 6px; }
+  header p { opacity: .85; font-size: 14px; }
+  .metrics { display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 12px; margin: 20px 0 26px; }
+  .metric { background: #fff; border-radius: 12px; padding: 16px; border: 1px solid #e3e8ee; }
+  .metric .num { font-size: 24px; font-weight: 700; color: #16a34a; }
+  .metric .label { font-size: 13px; color: #64748b; margin-top: 2px; }
+  section { background: #fff; border-radius: 16px; padding: 26px 30px; margin-bottom: 20px; border: 1px solid #e3e8ee; }
+  h2 { font-size: 19px; margin-bottom: 14px; padding-bottom: 8px; border-bottom: 2px solid #eef2f6; }
+  table { width: 100%; border-collapse: collapse; font-size: 13.5px; }
+  th, td { padding: 9px 12px; text-align: left; border-bottom: 1px solid #eef2f6; vertical-align: top; }
+  th { background: #f8fafc; font-weight: 600; }
+  .ok { color: #16a34a; font-weight: 700; }
+  .bad { color: #dc2626; font-weight: 700; }
+  .warn { color: #ea580c; font-weight: 700; }
+  .flow { background: #0f172a; color: #a5b4fc; border-radius: 10px; padding: 16px 18px; font-family: Consolas, monospace; font-size: 12.5px; line-height: 1.9; overflow-x: auto; white-space: pre; margin: 12px 0; }
+  .flow .hl { color: #34d399; }
+  .flow .miss { color: #f87171; }
+  code { background: #f1f5f9; padding: 1px 6px; border-radius: 5px; font-family: Consolas, monospace; font-size: 12.5px; }
+  .note { font-size: 12.5px; color: #94a3b8; margin-top: 10px; }
+</style>
+</head>
+<body>
+<div class="wrap">
+
+<header>
+  <h1>知识库管线迁移：Obsidian 可选化</h1>
+  <p>2026-08-28 15:14–15:35 · 「可用可不用 Obsidian」落地 · 端到端实测 PASS · 59/59 测试</p>
+</header>
+
+<div class="metrics">
+  <div class="metric"><div class="num">4</div><div class="label">脚本迁移/改造</div></div>
+  <div class="metric"><div class="num">1</div><div class="label">关键兼容修复（runpy）</div></div>
+  <div class="metric"><div class="num">1</div><div class="label">依赖补齐（httpx/env_int/retry/load_log）</div></div>
+  <div class="metric"><div class="num">59/59</div><div class="label">测试 + 构建</div></div>
+</div>
+
+<section>
+  <h2>一、结论：知识库本来就不依赖 Obsidian</h2>
+  <p>审计旧版后发现：<code>obsidian_sync.py</code> 里的「Obsidian」只是<b>输出格式</b>（markdown + frontmatter 写到 knowledge/ 目录）——它本身没有任何 vault 路径引用，是个纯编排器。知识库存的是普通 markdown，<b>任何 markdown 编辑器都能看</b>；把 <code>WIKI_DIR</code> 指向 Obsidian vault 目录，笔记就自然出现在 Obsidian 里——仅此而已。</p>
+</section>
+
+<section>
+  <h2>二、迁移内容</h2>
+  <table>
+    <tr><th>文件</th><th>处理</th></tr>
+    <tr><td>scripts/knowledge_sync.py（原 obsidian_sync）</td><td><b>改名 + Obsidian 可选化</b>：docstring 说明「有/无 Obsidian 均可」；run_script 对未迁移的可选子脚本（clipper/feishu/graph）返回 skipped 而非失败，full_sync 不中断</td></tr>
+    <tr><td>scripts/meeting_recap.py</td><td><b>迁移 + L3 schema 适配</b>（conversations 双表 → 扁平 messages 按 session_id 分组；会议判定改 session_id/消息内容关键词；unix float 时间戳适配）；LLM 可选（无 key 走 basic 降级）；补 import time</td></tr>
+    <tr><td>scripts/dashboard_gen.py</td><td>原样迁移（只读 knowledge 目录生成 HTML 复盘页）</td></tr>
+    <tr><td>scripts/wiki_utils.py</td><td>补齐 retry / load_log（meeting_recap / dashboard_gen 依赖）</td></tr>
+    <tr><td>scripts/hermes_env.py</td><td>此前已补 env_int</td></tr>
+  </table>
+</section>
+
+<section>
+  <h2>三、无 Obsidian 管线全貌（实测通过）</h2>
+  <div class="flow">L3 对话归档（SQLite）
+  ├─ chat_extractor     → wiki/knowledge/chats/*.md    <span class="hl">知识型会话提取（关键词 + CJK 加权长度）</span>
+  ├─ meeting_recap      → wiki/knowledge/meetings/*.md  <span class="hl">会议会话识别 + 纪要（LLM 可选，basic 降级）</span>
+  ├─ dashboard_gen      → HERMES_HOME/dashboard/dashboard.html  <span class="hl">周复盘 HTML</span>
+  └─ (可选) clipper_sync / feishu_sync / knowledge_graph
+       → 未迁移时 <span class="miss">skipped</span>，不影响主流程
+
+统一入口：python scripts/knowledge_sync.py（--chats-only / --meetings-only / --dashboard / full）</div>
+  <table>
+    <tr><th>实测项</th><th>结果</th></tr>
+    <tr><td>full_sync（无 Obsidian、无 LLM key、WIKI_DIR 指向普通目录）</td><td class="ok">ok=True，chats 1 + meetings 1 + dashboard 生成</td></tr>
+    <tr><td>知识型会话提取（含"部署方案"）</td><td class="ok">✅ 正确提取</td></tr>
+    <tr><td>会议纪要（basic 降级，无 LLM）</td><td class="ok">✅ 生成（含周会关键词识别）</td></tr>
+    <tr><td>寒暄 / 无关键词会话</td><td class="ok">✅ 未误提取</td></tr>
+    <tr><td>未迁移子脚本（graph/clipper）</td><td class="ok">✅ 优雅跳过，full_sync 不失败</td></tr>
+    <tr><td>二次运行去重（StateManager）</td><td class="ok">✅ 笔记数不变</td></tr>
+  </table>
+</section>
+
+<section>
+  <h2>四、过程中发现并修复的关键兼容问题</h2>
+  <table>
+    <tr><th>问题</th><th>根因</th><th>修复</th></tr>
+    <tr><td><span class="bad">编排器 subprocess 调子脚本全部静默失败</span></td><td>AutoClaw 的 embedded Python（._pth 隔离）里 <code>python script.py</code> 无法 import 同目录模块——chat_extractor/meeting_recap 全部崩</td><td>run_script 改为 <code>python -c</code> + runpy 包装（注入 SCRIPT_DIR 到 sys.path + 注入 sys.argv）——embedded 与标准 Python 通用</td></tr>
+    <tr><td><span class="bad">meeting_recap 缺 import time</span></td><td>L3 适配引入了 time.time() 但未加导入</td><td>补 import time</td></tr>
+    <tr><td><span class="bad">httpx 未安装</span></td><td>pyproject 声明了依赖但本机环境未装（范围版本安装触发 pip 环境 bug）</td><td>精确版本安装 httpx==0.28.1</td></tr>
+  </table>
+</section>
+
+<section>
+  <h2>五、用法与回归</h2>
+  <table>
+    <tr><th>场景</th><th>结果</th></tr>
+    <tr><td>python scripts/knowledge_sync.py（默认 full）</td><td class="ok">✅ 跑通</td></tr>
+    <tr><td>--chats-only / --meetings-only / --dashboard</td><td class="ok">✅ 各子命令可用（缺失依赖子脚本跳过）</td></tr>
+    <tr><td>测试套件</td><td class="ok">59/59 通过</td></tr>
+    <tr><td>pip 构建</td><td class="ok">Would install 成功</td></tr>
+  </table>
+  <p class="note">用 Obsidian：只需把 WIKI_DIR 指到 vault 目录（或软链 knowledge 到 vault 下），笔记自动出现在 Obsidian；不用则保持普通目录，功能完全一致。</p>
+</section>
+
+</div>
+</body>
+</html>

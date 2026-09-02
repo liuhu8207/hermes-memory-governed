@@ -1,0 +1,96 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>记忆模块优化建议（第三轮审视）</title>
+<style>
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body { font-family: -apple-system, "Segoe UI", "Microsoft YaHei", sans-serif; background: #f6f7f9; color: #1f2933; line-height: 1.7; padding: 32px 16px; }
+  .wrap { max-width: 960px; margin: 0 auto; }
+  header { background: linear-gradient(135deg, #1e3a5f, #2d6a9f); color: #fff; border-radius: 16px; padding: 32px 36px; margin-bottom: 24px; }
+  header h1 { font-size: 24px; margin-bottom: 6px; }
+  header p { opacity: .85; font-size: 14px; }
+  .metrics { display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 12px; margin: 20px 0 26px; }
+  .metric { background: #fff; border-radius: 12px; padding: 16px; border: 1px solid #e3e8ee; }
+  .metric .num { font-size: 24px; font-weight: 700; }
+  .metric .label { font-size: 13px; color: #64748b; margin-top: 2px; }
+  .metric.p1 .num { color: #dc2626; }
+  .metric.p2 .num { color: #ea580c; }
+  .metric.p3 .num { color: #2563eb; }
+  section { background: #fff; border-radius: 16px; padding: 26px 30px; margin-bottom: 20px; border: 1px solid #e3e8ee; }
+  h2 { font-size: 19px; margin-bottom: 14px; padding-bottom: 8px; border-bottom: 2px solid #eef2f6; }
+  table { width: 100%; border-collapse: collapse; font-size: 13.5px; }
+  th, td { padding: 9px 12px; text-align: left; border-bottom: 1px solid #eef2f6; vertical-align: top; }
+  th { background: #f8fafc; font-weight: 600; }
+  .ok { color: #16a34a; font-weight: 700; }
+  .bad { color: #dc2626; font-weight: 700; }
+  .warn { color: #ea580c; font-weight: 700; }
+  .pill { display: inline-block; font-size: 11.5px; padding: 1px 8px; border-radius: 5px; font-weight: 600; }
+  .p-p1 { background: #fee2e2; color: #b91c1c; }
+  .p-p2 { background: #ffedd5; color: #c2410c; }
+  .p-p3 { background: #dbeafe; color: #1d4ed8; }
+  code { background: #f1f5f9; padding: 1px 6px; border-radius: 5px; font-family: Consolas, monospace; font-size: 12.5px; }
+  .note { font-size: 12.5px; color: #94a3b8; margin-top: 10px; }
+</style>
+</head>
+<body>
+<div class="wrap">
+
+<header>
+  <h1>记忆模块优化建议（第三轮审视）</h1>
+  <p>2026-08-30 · 基于当前代码与压测结论 · 10 项优化：4×P1 + 3×P2 + 3×P3</p>
+</header>
+
+<div class="metrics">
+  <div class="metric p1"><div class="num">4</div><div class="label">P1 检索质量（小改动高收益）</div></div>
+  <div class="metric p2"><div class="num">3</div><div class="label">P2 生命周期 / 一致性</div></div>
+  <div class="metric p3"><div class="num">3</div><div class="label">P3 打磨项</div></div>
+  <div class="metric"><div class="num">0</div><div class="label">需要回退的既有设计</div></div>
+</div>
+
+<section>
+  <h2>一、P1 · 检索质量（最值得做，都是小改动）</h2>
+  <table>
+    <tr><th>#</th><th>优化点</th><th>现状与问题</th><th>方案与收益</th></tr>
+    <tr><td><span class="pill p-p1">1</span></td><td>L2 内容级去重（写入 + 检索）</td><td>压测确认：同内容跨 session 各写一条 L2 fact（source_rowid 不同）；检索时重复内容重复注入、白白占 L23 预算</td><td>写入期按 content 查重（保留首次 source_rowid）；检索期按 content 去重保留最高分。预算使用率立涨</td></tr>
+    <tr><td><span class="pill p-p1">2</span></td><td>L2 双路径分数语义统一</td><td>向量路径 score=1.0−距离（相似度语义）；文本降级 score=0.5+命中数×0.1（匹配度语义）——两种分数混排后排序失真</td><td>统一为相似度语义，或各自归一化后再合并。修复排序失真</td></tr>
+    <tr><td><span class="pill p-p1">3</span></td><td>promote 已批准模式跳过</td><td>候选被 import_approved 落地 L1 后，下次 promote 仍会生成相同候选（只查 L3 重复，不查已批准记录）——重复推荐</td><td>import_approved 记录已晋升模式（content 归一化指纹），promote 时跳过</td></tr>
+    <tr><td><span class="pill p-p1">4</span></td><td>L2 空结果跨层补偿</td><td>L2 无命中直接空，不利用 L3 的相关检索兜底（L3 只在并行召回里并列检索）</td><td>低价值，可跳过（并行召回已天然覆盖）</td></tr>
+  </table>
+</section>
+
+<section>
+  <h2>二、P2 · 生命周期 / 数据一致性</h2>
+  <table>
+    <tr><th>#</th><th>优化点</th><th>现状与问题</th><th>方案与收益</th></tr>
+    <tr><td><span class="pill p-p2">1</span></td><td>启动时增量索引自愈</td><td>L3 是事实源、L2 是派生索引；进程退出前异步队列未处理完 → L2 缺数据且无人知晓（只能手动 l2_rebuild）</td><td>启动时对比 L3 最大 rowid vs L2 最大 source_rowid，有缺口打 warning + 提示/自动增量补索引。最大的数据一致性缺口</td></tr>
+    <tr><td><span class="pill p-p2">2</span></td><td>基于使用反馈的排名</td><td>排名靠「重复次数」（promote）和静态分数，没有「agent 是否真的用到这条记忆」的反馈闭环</td><td>recall 注入后记录被引用信号（输出中出现记忆关键词），累计 usage 计数参与排序加权——用得多的记忆自动浮上来（OpenSquilla 浮现机制的实质）</td></tr>
+    <tr><td><span class="pill p-p2">3</span></td><td>L1 大小治理</td><td>import_approved 不断向 MEMORY.md 追加、无预算管控；超预算只截断注入、文件本身无人治理</td><td>health 报告加 L1 字节/token 数与超预算告警，配合定期人工精简提示</td></tr>
+  </table>
+</section>
+
+<section>
+  <h2>三、P3 · 打磨项</h2>
+  <table>
+    <tr><th>#</th><th>优化点</th><th>说明</th></tr>
+    <tr><td><span class="pill p-p3">1</span></td><td>FTS5 trigram tokenizer</td><td>SQLite 3.34+：中文检索从 LIKE 升级 trigram，性能与精确度提升（需重建 FTS 表——migrations 机制可挂）</td></tr>
+    <tr><td><span class="pill p-p3">2</span></td><td>dream 空闲触发</td><td>会话空闲时自动跑 dry-run 预览（现在是纯 cron）</td></tr>
+    <tr><td><span class="pill p-p3">3</span></td><td>L2/L3 混排权重微调</td><td>L3 组内最强恒 1.0 与 L2 绝对分混排；可给 L3 加 0.9 层权重上限（历史归档略低于语义记忆的语义表达）</td></tr>
+  </table>
+</section>
+
+<section>
+  <h2>四、建议与理由</h2>
+  <table>
+    <tr><th>优先级</th><th>事项</th><th>理由</th></tr>
+    <tr><td>先做</td><td>P1 的 ① 内容去重 ② 分数语义统一 ③ promote 防重复</td><td>都是小改动，直接提升「上下文预算利用率和推荐质量」，且有压测场景可回归</td></tr>
+    <tr><td>规划</td><td>P2 的 ① 启动自愈 ② 使用反馈排名</td><td>记忆系统从「好用」到「会进化」的分水岭；使用反馈排名是 OpenSquilla 浮现机制的本地化实现</td></tr>
+    <tr><td>按需</td><td>P3 全部</td><td>性能/体验打磨，不阻塞使用</td></tr>
+  </table>
+  <p class="note">备注：L2 缺数据自愈与使用反馈排名若落地，建议都先以「dry-run / 预览 + warning」形式上线（延续项目一贯的 safety-first 风格），确认行为后再自动化。</p>
+</section>
+
+</div>
+</body>
+</html>

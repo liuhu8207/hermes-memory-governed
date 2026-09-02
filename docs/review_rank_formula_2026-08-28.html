@@ -1,0 +1,109 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>L3 score 公式核对：1/(1+rank) 方向颠倒与区分度丧失</title>
+<style>
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body { font-family: -apple-system, "Segoe UI", "Microsoft YaHei", sans-serif; background: #f6f7f9; color: #1f2933; line-height: 1.7; padding: 32px 16px; }
+  .wrap { max-width: 920px; margin: 0 auto; }
+  header { background: linear-gradient(135deg, #7c2d12, #ea580c); color: #fff; border-radius: 16px; padding: 32px 36px; margin-bottom: 24px; }
+  header h1 { font-size: 24px; margin-bottom: 6px; }
+  header p { opacity: .85; font-size: 14px; }
+  .metrics { display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 12px; margin: 20px 0 26px; }
+  .metric { background: #fff; border-radius: 12px; padding: 16px; border: 1px solid #e3e8ee; }
+  .metric .num { font-size: 24px; font-weight: 700; }
+  .metric .label { font-size: 13px; color: #64748b; margin-top: 2px; }
+  .metric.green .num { color: #16a34a; }
+  .metric.red .num { color: #dc2626; }
+  section { background: #fff; border-radius: 16px; padding: 26px 30px; margin-bottom: 20px; border: 1px solid #e3e8ee; }
+  h2 { font-size: 19px; margin-bottom: 14px; padding-bottom: 8px; border-bottom: 2px solid #eef2f6; }
+  table { width: 100%; border-collapse: collapse; font-size: 14px; }
+  th, td { padding: 9px 12px; text-align: left; border-bottom: 1px solid #eef2f6; vertical-align: top; }
+  th { background: #f8fafc; font-weight: 600; }
+  .ok { color: #16a34a; font-weight: 700; }
+  .bad { color: #dc2626; font-weight: 700; }
+  .warn { color: #ea580c; font-weight: 700; }
+  .issue { border-left: 4px solid #dc2626; padding: 12px 16px; margin-bottom: 14px; background: #fafbfc; border-radius: 0 10px 10px 0; }
+  .issue.green { border-left-color: #16a34a; }
+  .issue .title { font-weight: 700; margin-bottom: 6px; }
+  .issue .loc { font-size: 12px; color: #64748b; font-family: Consolas, monospace; }
+  .issue .detail { font-size: 14px; color: #475569; }
+  .evidence { background: #f1f5f9; border-radius: 8px; padding: 10px 14px; font-family: Consolas, monospace; font-size: 12.5px; margin-top: 8px; white-space: pre-wrap; color: #334155; }
+  code { background: #f1f5f9; padding: 1px 6px; border-radius: 5px; font-family: Consolas, monospace; font-size: 13px; }
+  .note { font-size: 12.5px; color: #94a3b8; margin-top: 10px; }
+</style>
+</head>
+<body>
+<div class="wrap">
+
+<header>
+  <h1>L3 score 公式核对：1/(1+rank) 方向颠倒与区分度丧失</h1>
+  <p>2026-08-28 11:35 · 实测发现公式两个问题（已修复为单调递增映射）· 45/45 测试 + 召回回归全过</p>
+</header>
+
+<div class="metrics">
+  <div class="metric red"><div class="num">2</div><div class="label">公式问题（方向颠倒 + 无区分度）</div></div>
+  <div class="metric green"><div class="num">✅</div><div class="label">已修复：强匹配 1.0 vs 弱匹配 0.63</div></div>
+  <div class="metric green"><div class="num">45/45</div><div class="label">测试 + 召回回归</div></div>
+</div>
+
+<section>
+  <h2>一、FTS5 rank 语义澄清（修复描述与事实不符）</h2>
+  <p>修复总结的示例表格把「rank 0.001 → 0.999 保留 / rank 10 → 0.091 正确过滤」当作正确行为，但 <b>FTS5 bm25 的语义是：rank 是负数，绝对值越大 = 匹配越好（越相关）</b>。SQL <code>ORDER BY rank</code> 升序就是最相关在前。所以「rank 绝对值 10」代表<b>高度相关</b>的内容，恰恰最不应该被过滤；而 0.001 的弱命中给 0.999 高分反而是错的。此外注释「smaller absolute = more relevant」同样写反了。</p>
+</section>
+
+<section>
+  <h2>二、实测发现的两个问题</h2>
+
+  <div class="issue">
+    <div class="title"><span class="bad">问题 1</span>1/(1+x) 是递减函数，与「越相关分应越高」方向相反</div>
+    <div class="loc">_recall.py :: _search_l3（score = 1.0 / (1.0 + raw_rank)）</div>
+    <div class="detail">
+      abs(rank) 越大代表越相关，而 1/(1+x) 随 x 增大而减小 → <b>越相关分越低</b>。当前量级下该问题被掩盖（见问题 2），但语料变大、rank 绝对值到 1~30 时会显现：强相关内容 0.09 分、弱相关 0.99 分。
+    </div>
+  </div>
+
+  <div class="issue">
+    <div class="title"><span class="bad">问题 2（实测确认）</span>真实 rank 量级 1e-6 下，所有结果被映射到 ≈1.0，MIN_SCORE 对 L3 完全失效</div>
+    <div class="loc">同上</div>
+    <div class="detail">
+      实测库中强匹配（python×4）rank=-1.648e-06、弱匹配（python×1）rank=-1.032e-06。1/(1+1.648e-06) ≈ 1/(1+1.032e-06) ≈ 1.0000——<b>两者都约等于 1，强弱的区分度完全丧失</b>，MIN_SCORE=0.1 对 L3 既不误杀也不过滤（形同虚设）。测试表格里「0.001/0.01/0.1」的示例量级与真实 FTS5 rank 相差 3~6 个数量级，方案验证用的假设数据不成立。
+    </div>
+    <div class="evidence">实测（强匹配 vs 弱匹配，原始公式）：
+rank=-1.648e-06 'python python python python deep dive' → score=1.0000
+rank=-1.032e-06 'python mentioned once here'           → score=1.0000
+方向判定: 弱匹配分 0.9999989 略高于强匹配 0.9999984（颠倒，但被 1.0 饱和掩盖）</div>
+  </div>
+</section>
+
+<section>
+  <h2>三、已落地的修复（本轮代码改动）</h2>
+  <div class="issue green">
+    <div class="title"><span class="ok">修复</span>单调递增映射 rank/(1+rank)，方向正确且区分度保留</div>
+    <div class="loc">_recall.py :: _search_l3（score = raw_rank / (1.0 + raw_rank)）</div>
+    <div class="detail">
+      abs(rank) 越大（越相关）分数越高，映射 (0,∞)→(0,1) 有界；与尾部 max 归一化叠加后组内最强恒为 1.0、组内相对差异保留（本例强 1.0 / 弱 0.63）。MIN_SCORE=0.1 从此对 L3 有实际过滤意义（rank≈0 的勉强命中 → score≈0 → 被过滤）。LIKE fallback base 0.5→0.8 的改动保留（精确匹配得分高于模糊匹配，合理）。
+    </div>
+    <div class="evidence">实测（修复后）：
+强匹配 'python python python python deep dive' → score=1.0000
+弱匹配 'python mentioned once here'            → score=0.6264
+方向判定: ✅ 正确；MIN_SCORE: 两条均保留（都含 python，合理）</div>
+  </div>
+</section>
+
+<section>
+  <h2>四、回归确认</h2>
+  <table>
+    <tr><th>场景</th><th>结果</th></tr>
+    <tr><td>测试套件</td><td class="ok">45/45 通过</td></tr>
+    <tr><td>并行召回四项（不阻塞 / 池间隔离 / 无泄漏 / shutdown 降级）</td><td class="ok">全过</td></tr>
+    <tr><td>MIN_SCORE 对 L2（0.9 保留 / 0.05 过滤）</td><td class="ok">行为不变</td></tr>
+  </table>
+  <p class="note">注：方案演进到本版后，L3 分数链路为 raw_rank/(1+rank) × age_factor → max 归一化（组内最强 1.0）→ MIN_SCORE 过滤。跨查询的绝对可比性由 max 归一化保证组内最强可见；若需要跨查询绝对阈值语义，可在后续版本引入固定基准，但当前对记忆注入场景，组内最强可见已满足需求。</p>
+</section>
+
+</div>
+</body>
+</html>

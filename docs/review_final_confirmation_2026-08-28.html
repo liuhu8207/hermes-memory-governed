@@ -1,0 +1,79 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>hermes-memory-governed 收尾验证确认</title>
+<style>
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body { font-family: -apple-system, "Segoe UI", "Microsoft YaHei", sans-serif; background: #f6f7f9; color: #1f2933; line-height: 1.7; padding: 32px 16px; }
+  .wrap { max-width: 860px; margin: 0 auto; }
+  header { background: linear-gradient(135deg, #14532d, #16a34a); color: #fff; border-radius: 16px; padding: 32px 36px; margin-bottom: 24px; }
+  header h1 { font-size: 24px; margin-bottom: 6px; }
+  header p { opacity: .85; font-size: 14px; }
+  section { background: #fff; border-radius: 16px; padding: 26px 30px; margin-bottom: 20px; border: 1px solid #e3e8ee; }
+  h2 { font-size: 18px; margin-bottom: 14px; padding-bottom: 8px; border-bottom: 2px solid #eef2f6; }
+  table { width: 100%; border-collapse: collapse; font-size: 14px; }
+  th, td { padding: 9px 12px; text-align: left; border-bottom: 1px solid #eef2f6; vertical-align: top; }
+  th { background: #f8fafc; font-weight: 600; }
+  .ok { color: #16a34a; font-weight: 700; }
+  .warn { color: #ea580c; font-weight: 700; }
+  .metrics { display: grid; grid-template-columns: repeat(auto-fit, minmax(140px, 1fr)); gap: 12px; margin-bottom: 20px; }
+  .metric { background: #fff; border-radius: 12px; padding: 16px; border: 1px solid #e3e8ee; }
+  .metric .num { font-size: 26px; font-weight: 700; color: #16a34a; }
+  .metric .label { font-size: 13px; color: #64748b; margin-top: 2px; }
+  code { background: #f1f5f9; padding: 1px 6px; border-radius: 5px; font-family: Consolas, monospace; font-size: 13px; }
+  .note { font-size: 12.5px; color: #94a3b8; margin-top: 10px; }
+</style>
+</head>
+<body>
+<div class="wrap">
+
+<header>
+  <h1>hermes-memory-governed 收尾验证确认</h1>
+  <p>2026-08-28 · 对最终状态声明（CJK 段拆分 + 死代码移除）的实测核对 · 28/28 测试通过</p>
+</header>
+
+<div class="metrics">
+  <div class="metric"><div class="num">✅</div><div class="label">收尾两项全部生效</div></div>
+  <div class="metric"><div class="num">0.51s</div><div class="label">超时实测（配置 0.5s）</div></div>
+  <div class="metric"><div class="num">0</div><div class="label">线程泄漏（10 次调用）</div></div>
+  <div class="metric"><div class="num">28/28</div><div class="label">测试通过</div></div>
+</div>
+
+<section>
+  <h2>收尾项验证</h2>
+  <table>
+    <tr><th>#</th><th>声称</th><th>实测结果</th><th>状态</th></tr>
+    <tr><td>1</td><td>混合查询 CJK 段拆分搜索</td><td>「Python 天气」→ 5 hits（3 条英文 + <b>2 条纯中文天气</b>，上轮丢的「今天天气很好」「明天天气怎么样」已召回）；「今天 天气」→ 1 hit；「天气」→ 3 hits</td><td class="ok">✅ 生效</td></tr>
+    <tr><td>2</td><td>移除 daemon 死代码</td><td><code>for t in pool._threads</code> 循环与 <code>initializer</code> 已删除；10 次调用线程数 4 → 2，无泄漏；超时 0.51s 不阻塞</td><td class="ok">✅ 生效</td></tr>
+  </table>
+</section>
+
+<section>
+  <h2>遗留边缘问题确认</h2>
+  <table>
+    <tr><th>问题</th><th>实测</th><th>影响评估</th></tr>
+    <tr><td>「50%了」0 hits</td><td>确认仍 0 hits（CJK+数字+% 混合，内容「完成度 50% 了」带空格不匹配）</td><td class="warn">极边缘，个人记忆检索场景几乎不触发</td></tr>
+    <tr><td>线程依赖 GC 清理</td><td>线程实测非 daemon，靠 pool 对象 GC 时 <code>__del__ → shutdown(wait=False)</code> 清理</td><td class="warn">无实际影响；如需彻底加固：initializer 设 daemon + 显式 shutdown(wait=False)</td></tr>
+  </table>
+  <p class="note">注：L2 向量模式启用前，建议为存量 vector=NULL 数据写 re-embed 迁移脚本；测试套件仍未覆盖混合查询/通配符转义/超时耗时/线程泄漏/pip 构建五类场景，建议补测防回归。</p>
+</section>
+
+<section>
+  <h2>四轮修复闭环总览</h2>
+  <table>
+    <tr><th>模块</th><th>状态</th><th>关键修复</th></tr>
+    <tr><td>L1 手写层</td><td class="ok">✅</td><td>缓存 + replace/remove 语义</td></tr>
+    <tr><td>L2 语义层</td><td class="ok">✅</td><td>PyArrow schema + vector 列 + 向量/文本双路径 + score 方向</td></tr>
+    <tr><td>L3 归档层</td><td class="ok">✅</td><td>FTS5 英文 + LIKE 中文 + CJK 段拆分 + 混合合并 + 时间衰减 + 通配符转义</td></tr>
+    <tr><td>L4 画像层</td><td class="ok">✅</td><td>缓存 + 后台刷新</td></tr>
+    <tr><td>并行召回</td><td class="ok">✅</td><td>非阻塞 + 去重 + 超时降级</td></tr>
+    <tr><td>Bridge 审核</td><td class="ok">✅</td><td>secret 检测 + 安全目标验证</td></tr>
+    <tr><td>构建</td><td class="ok">✅</td><td>setuptools + wheel + package find，pip install 通过</td></tr>
+  </table>
+</section>
+
+</div>
+</body>
+</html>

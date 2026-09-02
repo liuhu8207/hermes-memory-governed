@@ -1,0 +1,113 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>两版对比：知识库管线去哪了</title>
+<style>
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body { font-family: -apple-system, "Segoe UI", "Microsoft YaHei", sans-serif; background: #f6f7f9; color: #1f2933; line-height: 1.7; padding: 32px 16px; }
+  .wrap { max-width: 980px; margin: 0 auto; }
+  header { background: linear-gradient(135deg, #4c1d95, #7c3aed); color: #fff; border-radius: 16px; padding: 32px 36px; margin-bottom: 24px; }
+  header h1 { font-size: 24px; margin-bottom: 6px; }
+  header p { opacity: .85; font-size: 14px; }
+  section { background: #fff; border-radius: 16px; padding: 26px 30px; margin-bottom: 20px; border: 1px solid #e3e8ee; }
+  h2 { font-size: 19px; margin-bottom: 14px; padding-bottom: 8px; border-bottom: 2px solid #eef2f6; }
+  table { width: 100%; border-collapse: collapse; font-size: 13.5px; }
+  th, td { padding: 9px 12px; text-align: left; border-bottom: 1px solid #eef2f6; vertical-align: top; }
+  th { background: #f8fafc; font-weight: 600; white-space: nowrap; }
+  .ok { color: #16a34a; font-weight: 700; }
+  .bad { color: #dc2626; font-weight: 700; }
+  .warn { color: #ea580c; font-weight: 700; }
+  .cat { display: inline-block; font-size: 11.5px; padding: 1px 8px; border-radius: 5px; margin-right: 6px; vertical-align: 1px; }
+  .c-kb { background: #ede9fe; color: #6d28d9; }
+  .c-mem { background: #dcfce7; color: #15803d; }
+  .c-ops { background: #dbeafe; color: #1d4ed8; }
+  .c-sync { background: #ffedd5; color: #c2410c; }
+  .flow { background: #0f172a; color: #a5b4fc; border-radius: 10px; padding: 16px 18px; font-family: Consolas, monospace; font-size: 12.5px; line-height: 1.9; overflow-x: auto; white-space: pre; margin: 12px 0; }
+  .flow .hl { color: #34d399; }
+  .flow .miss { color: #f87171; }
+  code { background: #f1f5f9; padding: 1px 6px; border-radius: 5px; font-family: Consolas, monospace; font-size: 12.5px; }
+  .note { font-size: 12.5px; color: #94a3b8; margin-top: 10px; }
+  .opt { border-left: 4px solid #7c3aed; padding: 10px 16px; background: #faf5ff; border-radius: 0 10px 10px 0; margin: 10px 0; }
+  .opt b { display: block; margin-bottom: 4px; }
+  .opt p { font-size: 13.5px; color: #475569; }
+</style>
+</head>
+<body>
+<div class="wrap">
+
+<header>
+  <h1>两版对比：知识库管线去哪了</h1>
+  <p>hermes-memory-system（旧版）→ hermes-memory-governed（新版）功能迁移审计 · 2026-08-28</p>
+</header>
+
+<section>
+  <h2>一、结论先行</h2>
+  <p><b>你的记忆是对的</b>：旧版有一条完整的「知识库管线」（12 个脚本），覆盖多源收集 → LLM 分类 → 知识图谱 → Wiki/NotebookLM 深化 → Obsidian 同步 → L3 知识提取 → 会议纪要 → 仪表盘。<b>新版重构时只迁移了 5 个记忆治理核心脚本，整条知识库管线（12 个脚本）没有迁过来</b>。新版把定位从「知识治理层」收窄成了「记忆治理层」——知识库功能是被裁掉的，不是丢了。</p>
+</section>
+
+<section>
+  <h2>二、17 个脚本迁移审计</h2>
+  <table>
+    <tr><th>脚本</th><th>分类</th><th>功能（旧版）</th><th>新版</th></tr>
+    <tr><td>knowledge_collector.py</td><td><span class="cat c-kb">知识库</span></td><td>多源知识收集（Obsidian 集成）</td><td class="bad">未迁移</td></tr>
+    <tr><td>knowledge_processor.py</td><td><span class="cat c-kb">知识库</span></td><td>LLM 分类与链接生成</td><td class="bad">未迁移</td></tr>
+    <tr><td>knowledge_graph.py</td><td><span class="cat c-kb">知识库</span></td><td>知识图谱构建（概念链接可视化）</td><td class="bad">未迁移</td></tr>
+    <tr><td>wiki_nblm_daily.py</td><td><span class="cat c-kb">知识库</span></td><td>Wiki 页面 → NotebookLM 逐页深化 → 写入 L2</td><td class="bad">未迁移</td></tr>
+    <tr><td>wiki_nblm_induction.py</td><td><span class="cat c-kb">知识库</span></td><td>多页 Wiki 主题 → NotebookLM 归纳 → 写入 L2</td><td class="bad">未迁移</td></tr>
+    <tr><td>wiki_utils.py</td><td><span class="cat c-kb">知识库</span></td><td>wiki 处理共享工具（重试 / 原子写 / StateManager）</td><td class="bad">未迁移</td></tr>
+    <tr><td>chat_extractor.py</td><td><span class="cat c-kb">知识库</span></td><td>从 L3 对话归档提取知识（只读）</td><td class="bad">未迁移</td></tr>
+    <tr><td>obsidian_sync.py</td><td><span class="cat c-sync">同步</span></td><td>Obsidian 全管线同步（收集 / 处理 / 会议 / 剪藏 / 图谱 / 仪表盘）</td><td class="bad">未迁移</td></tr>
+    <tr><td>clipper_sync.py</td><td><span class="cat c-sync">同步</span></td><td>Obsidian Web Clipper 剪藏同步</td><td class="bad">未迁移</td></tr>
+    <tr><td>feishu_sync.py</td><td><span class="cat c-sync">同步</span></td><td>飞书文档 → 知识库导入</td><td class="bad">未迁移</td></tr>
+    <tr><td>meeting_recap.py</td><td><span class="cat c-kb">知识库</span></td><td>从 L3 提取并总结会议纪要</td><td class="bad">未迁移</td></tr>
+    <tr><td>dashboard_gen.py</td><td><span class="cat c-kb">知识库</span></td><td>HTML 复盘仪表盘生成</td><td class="bad">未迁移</td></tr>
+    <tr><td>l4_persona_daily.py</td><td><span class="cat c-mem">记忆</span></td><td>L4 persona 生成</td><td class="ok">已迁移</td></tr>
+    <tr><td>scope_recall_bridge.py</td><td><span class="cat c-mem">记忆</span></td><td>持久记忆候选导出（Scope Recall bridge）</td><td class="ok">已迁移</td></tr>
+    <tr><td>memory_health_report.py</td><td><span class="cat c-ops">运维</span></td><td>健康报告</td><td class="ok">已迁移</td></tr>
+    <tr><td>memory_pipeline.py</td><td><span class="cat c-ops">运维</span></td><td>统一维护管线（旧版含 daily/bridge/notebooklm/ingest/obsidian/health 六个子命令）</td><td class="warn">部分迁移（只保留 daily/bridge/health/persona）</td></tr>
+    <tr><td>hermes_env.py</td><td><span class="cat c-ops">运维</span></td><td>共享环境工具</td><td class="ok">已迁移</td></tr>
+  </table>
+</section>
+
+<section>
+  <h2>三、旧版知识库数据流（供参照）</h2>
+  <div class="flow">多源输入                     知识库管线                      记忆接入
+<span class="hl">Obsidian / Web Clipper / 飞书</span>
+  └─ knowledge_collector      <span class="hl">收集</span>
+       └─ knowledge_processor <span class="hl">LLM 分类 + 链接生成</span>
+            └─ knowledge_graph <span class="hl">知识图谱可视化</span>
+            └─ obsidian_sync   <span class="hl">回写 Obsidian（会议/剪藏/仪表盘）</span>
+Wiki (~/wiki/knowledge)
+  └─ wiki_nblm_daily     <span class="hl">逐页 NotebookLM 深化（增量 state）</span>
+  └─ wiki_nblm_induction <span class="hl">多页主题归纳</span>
+       └─ 归纳产物 cron/output/nblm_induction_*.md
+            └─ scope_recall_bridge <span class="hl">收集为 Bridge 候选</span>
+L3 对话归档
+  └─ chat_extractor / meeting_recap <span class="hl">知识提取 / 会议纪要</span></div>
+  <p>新版的数据流只保留了右下角一段：persona / 归纳产物 / wiki knowledge 目录 → Bridge 候选——而上游的生产者（nblm 脚本、collector）全部缺席。</p>
+</section>
+
+<section>
+  <h2>四、新版里的「管线遗迹」（你记忆的来源）</h2>
+  <ul class="tight" style="font-size:14px">
+    <li><code>memory_pipeline.py --with-notebooklm</code> 参数仍引用 <code>wiki_nblm_daily.py</code>——脚本不存在，启用即 FAIL（此前审查列为遗留项）</li>
+    <li><code>scope_recall_bridge.py collect_candidates()</code> 仍收集 <code>nblm_induction_*.md</code> 归纳产物——生产者缺席，这类候选永远为空</li>
+    <li>配置里 <code>wiki_dir</code>（默认 ~/wiki/knowledge/{concepts,categories}）仍在消费——旧版 wiki 工作流的输出目录</li>
+    <li><code>docs/operations.md</code> 仍写着 09:40 的 wiki_nblm 两条 cron 任务（此前审查列为文档不一致）</li>
+  </ul>
+  <p>这些遗迹说明：新版的骨架就是从旧版拆出来的，知识库管线是「没搬」而不是「从未存在」。</p>
+</section>
+
+<section>
+  <h2>五、三个选项</h2>
+  <div class="opt"><b>选项 A：整条迁回（工作量中）</b><p>把 12 个脚本 + wiki_utils 迁入新项目，依赖旧版 wiki 目录约定（~/wiki/knowledge）与 NotebookLM 非官方集成本地适配器（wiki_nblm_daily 是可移植模板，需要 per-machine 的 notebooklm client）。适合你仍在用 Obsidian/飞书/NotebookLM 工作流的情况。</p></div>
+  <div class="opt"><b>选项 B：保持现状（工作量零）</b><p>新版定位收窄为「记忆治理 + L1-L4 分层 + Bridge」，知识库继续留在旧版仓库按需手动跑（两个仓库的 hermes_env / bridge 目录结构兼容，旧版产物 candidates.jsonl 可直接被新版 Bridge 流程消费）。</p></div>
+  <div class="opt"><b>选项 C：高价值子集迁移（工作量小）</b><p>优先迁 <code>chat_extractor.py</code>（从 L3 提取知识，与新版 L3 完美衔接）和 <code>obsidian_sync.py</code>（若你用 Obsidian），其余（NotebookLM、图谱、仪表盘）按需再说。同时清理 memory_pipeline 的 --with-notebooklm 死引用。</p></div>
+  <p class="note">建议：如果近期不用 NotebookLM/Obsidian 工作流，选 C——chat_extractor 是唯一与新版 L3 数据天然衔接的知识库脚本，其余在旧仓库里跑并不受影响。</p>
+</section>
+
+</div>
+</body>
+</html>

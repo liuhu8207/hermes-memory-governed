@@ -1,0 +1,44 @@
+__pycache__/
+*.pyc
+*.pyo
+build/
+*.egg-info/
+.pytest_cache/
+.ruff_cache/
+.coverage
+build/
+*.egg-info/
+.workbuddy/
+.opensquilla/
+.env
+*.db
+*.sqlite3
+l2/
+memory/
+cron/output/
+*.lance
+.pytest_tmp/
+health_report.*
+persona.md
+persona_meta.json
+governed_memory.json
+
+# --- Python 虚拟环境（务必忽略：本仓 .venv 有 513MB / 7494 个文件）---
+.venv/
+venv/
+env/
+ENV/
+
+# --- 向量库数据目录 ---
+memories.lance/
+
+# --- 编辑器 / 系统 ---
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# --- 临时验证输出 ---
+docs/_chk.txt
+docs/_verify_out.txt

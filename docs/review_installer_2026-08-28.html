@@ -1,0 +1,82 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>安装器 + health 防护修复核对</title>
+<style>
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body { font-family: -apple-system, "Segoe UI", "Microsoft YaHei", sans-serif; background: #f6f7f9; color: #1f2933; line-height: 1.7; padding: 32px 16px; }
+  .wrap { max-width: 920px; margin: 0 auto; }
+  header { background: linear-gradient(135deg, #14532d, #16a34a); color: #fff; border-radius: 16px; padding: 32px 36px; margin-bottom: 24px; }
+  header h1 { font-size: 24px; margin-bottom: 6px; }
+  header p { opacity: .85; font-size: 14px; }
+  .metrics { display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 12px; margin: 20px 0 26px; }
+  .metric { background: #fff; border-radius: 12px; padding: 16px; border: 1px solid #e3e8ee; }
+  .metric .num { font-size: 24px; font-weight: 700; color: #16a34a; }
+  .metric .label { font-size: 13px; color: #64748b; margin-top: 2px; }
+  section { background: #fff; border-radius: 16px; padding: 26px 30px; margin-bottom: 20px; border: 1px solid #e3e8ee; }
+  h2 { font-size: 19px; margin-bottom: 14px; padding-bottom: 8px; border-bottom: 2px solid #eef2f6; }
+  table { width: 100%; border-collapse: collapse; font-size: 13.5px; }
+  th, td { padding: 9px 12px; text-align: left; border-bottom: 1px solid #eef2f6; vertical-align: top; }
+  th { background: #f8fafc; font-weight: 600; }
+  .ok { color: #16a34a; font-weight: 700; }
+  .bad { color: #dc2626; font-weight: 700; }
+  code { background: #f1f5f9; padding: 1px 6px; border-radius: 5px; font-family: Consolas, monospace; font-size: 12.5px; }
+  .evidence { background: #f1f5f9; border-radius: 8px; padding: 10px 14px; font-family: Consolas, monospace; font-size: 12.5px; margin: 8px 0; white-space: pre-wrap; color: #334155; }
+  .note { font-size: 12.5px; color: #94a3b8; margin-top: 10px; }
+</style>
+</head>
+<body>
+<div class="wrap">
+
+<header>
+  <h1>安装器 + health 防护修复核对</h1>
+  <p>2026-08-28 19:58 · install.sh 实测安装 + _handle_health 防护验证 · 59/59 测试 + 构建全过</p>
+</header>
+
+<div class="metrics">
+  <div class="metric"><div class="num">2</div><div class="label">修复项全部有效</div></div>
+  <div class="metric"><div class="num">✅</div><div class="label">install.sh 真机安装实测</div></div>
+  <div class="metric"><div class="num">✅</div><div class="label">未初始化防护实测</div></div>
+  <div class="metric"><div class="num">59/59</div><div class="label">测试回归</div></div>
+</div>
+
+<section>
+  <h2>一、逐项核对</h2>
+  <table>
+    <tr><th>#</th><th>声称修复</th><th>核对结果</th><th>状态</th></tr>
+    <tr><td>1</td><td>install.sh 添加 vector 安装选项（交互式 + --with-vector / --without-vector / --yes）</td><td>Git Bash <code>bash -n</code> 语法检查通过；<b>非交互模式真机安装实测</b>：<code>--yes --hermes-home … --wiki-dir …</code> 走完 6 步（目录/插件/脚本/L1/config/依赖），产物完整；vector 默认跳过并提示后续安装命令</td><td class="ok">✅ 有效</td></tr>
+    <tr><td>2</td><td>_handle_health 的 _config=None 防护（total 未定义根因）</td><td>未 initialize 的 provider 调用 <code>_handle_health()</code> 返回 <code>{"error": "Provider not initialized", "available": false}</code>，不再 AttributeError；initialize 后正常返回完整 health JSON（含 prefetch_cache 命中率）</td><td class="ok">✅ 有效</td></tr>
+    <tr><td>—</td><td>recall_status 命中率口径</td><td>实测 2 hits / 1 miss → hit_rate 0.667（hits/total 正确）</td><td class="ok">✅</td></tr>
+  </table>
+</section>
+
+<section>
+  <h2>二、install.sh 实测细节</h2>
+  <table>
+    <tr><th>步骤</th><th>结果</th></tr>
+    <tr><td>[1/6] 目录创建</td><td class="ok">memory/l2、l3、scripts、plugins、cron/output、wiki 全部创建</td></tr>
+    <tr><td>[2/6] 插件安装</td><td class="ok">plugin/memory_governed 7 个文件复制到位</td></tr>
+    <tr><td>[3/6] 脚本安装</td><td class="ok">9 个脚本复制到位（含本轮新增的 chat_extractor / knowledge_sync / l2_rebuild / l3_retention / knowledge_links / wiki_utils）</td></tr>
+    <tr><td>[4/6] L1 默认文件</td><td class="ok">MEMORY.md / USER.md 模板生成（已存在则跳过）</td></tr>
+    <tr><td>[5/6] config 生成</td><td class="ok">governed_memory.json（scripts_dir + wiki_dir）</td></tr>
+    <tr><td>[6/6] 依赖安装</td><td class="ok">httpx 必装；vector 按 --with-vector 分支安装/跳过（默认跳过 + 提示后续命令）</td></tr>
+  </table>
+  <p class="note">边界说明：install.sh 面向 Linux/macOS（bash）；在 Windows Git Bash 下实测可用，但生成的 config 内路径为 POSIX 风格（/c/Users/...），Windows 部署请用 install.ps1。--configure-cron 仅打印 crontab 指令（与旧版行为一致）。</p>
+</section>
+
+<section>
+  <h2>三、回归确认</h2>
+  <table>
+    <tr><th>场景</th><th>结果</th></tr>
+    <tr><td>测试套件</td><td class="ok">59/59 通过</td></tr>
+    <tr><td>pip wheel 构建</td><td class="ok">Would install 成功</td></tr>
+    <tr><td>既有功能（L1-L4 / 并行召回 / Bridge / 知识库）</td><td class="ok">无回归</td></tr>
+  </table>
+  <p class="note">注：install.sh 与 install.ps1 的功能对齐（目录/插件/脚本/L1/config 五步一致 + vector 选项），两平台安装体验现在对称。Windows 侧 install.ps1 未加 vector 交互提示（可在后续版本对齐）。</p>
+</section>
+
+</div>
+</body>
+</html>

@@ -1,0 +1,114 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>hermes-memory-governed 并发修复核对报告</title>
+<style>
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body { font-family: -apple-system, "Segoe UI", "Microsoft YaHei", sans-serif; background: #f6f7f9; color: #1f2933; line-height: 1.7; padding: 32px 16px; }
+  .wrap { max-width: 960px; margin: 0 auto; }
+  header { background: linear-gradient(135deg, #1e3a5f, #2d6a9f); color: #fff; border-radius: 16px; padding: 32px 36px; margin-bottom: 24px; }
+  header h1 { font-size: 24px; margin-bottom: 6px; }
+  header p { opacity: .85; font-size: 14px; }
+  .metrics { display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 12px; margin: 20px 0 26px; }
+  .metric { background: #fff; border-radius: 12px; padding: 16px; border: 1px solid #e3e8ee; }
+  .metric .num { font-size: 26px; font-weight: 700; }
+  .metric .label { font-size: 13px; color: #64748b; margin-top: 2px; }
+  .metric.green .num { color: #16a34a; }
+  .metric.red .num { color: #dc2626; }
+  section { background: #fff; border-radius: 16px; padding: 26px 30px; margin-bottom: 20px; border: 1px solid #e3e8ee; }
+  h2 { font-size: 19px; margin-bottom: 14px; padding-bottom: 8px; border-bottom: 2px solid #eef2f6; }
+  table { width: 100%; border-collapse: collapse; font-size: 14px; }
+  th, td { padding: 9px 12px; text-align: left; border-bottom: 1px solid #eef2f6; vertical-align: top; }
+  th { background: #f8fafc; font-weight: 600; }
+  .ok { color: #16a34a; font-weight: 700; }
+  .bad { color: #dc2626; font-weight: 700; }
+  .warn { color: #ea580c; font-weight: 700; }
+  .issue { border-left: 4px solid #dc2626; padding: 12px 16px; margin-bottom: 14px; background: #fafbfc; border-radius: 0 10px 10px 0; }
+  .issue .title { font-weight: 700; margin-bottom: 6px; }
+  .issue .loc { font-size: 12px; color: #64748b; font-family: Consolas, monospace; }
+  .issue .detail { font-size: 14px; color: #475569; }
+  .evidence { background: #f1f5f9; border-radius: 8px; padding: 10px 14px; font-family: Consolas, monospace; font-size: 12.5px; margin-top: 8px; white-space: pre-wrap; color: #334155; }
+  code { background: #f1f5f9; padding: 1px 6px; border-radius: 5px; font-family: Consolas, monospace; font-size: 13px; }
+  .note { font-size: 12.5px; color: #94a3b8; margin-top: 10px; }
+</style>
+</head>
+<body>
+<div class="wrap">
+
+<header>
+  <h1>hermes-memory-governed 并发修复核对报告</h1>
+  <p>2026-08-28 · 核对「并发问题修复详情」声称的 2 个问题修复 + 6 项自查清理 · 38/38 测试通过</p>
+</header>
+
+<div class="metrics">
+  <div class="metric green"><div class="num">5</div><div class="label">修复确认有效</div></div>
+  <div class="metric red"><div class="num">1</div><div class="label">无效修复（退化仍在）</div></div>
+  <div class="metric green"><div class="num">38/38</div><div class="label">测试通过</div></div>
+  <div class="metric red"><div class="num">0</div><div class="label">退化场景测试覆盖</div></div>
+</div>
+
+<section>
+  <h2>一、总体结论</h2>
+  <p><b>shutdown 降级、CJK 加权、import 清理都修对了</b>，但<b>并发退化的修复是无效的</b>：DCL（双重检查锁定）解决的是「池的懒创建竞态」，而真正的退化根因是「3 个 worker 被慢任务占满 → 重叠召回的任务排队 → 超时窗口内跑不完 → 空结果」——max_workers 依然是 3，实测第 2 次重叠召回仍返回空。修复描述里自己写了「导致排队等待甚至死锁」，但 DCL 与排队问题无关。</p>
+</section>
+
+<section>
+  <h2>二、逐项核对</h2>
+  <table>
+    <tr><th>#</th><th>声称修复</th><th>实测结果</th><th>状态</th></tr>
+    <tr><td>1</td><td>共享池并发退化 → _get_pool() DCL 懒创建</td><td>实测慢任务 2s + 超时 0.5s：第 2 次重叠召回仍返回 []。DCL 只保证池只创建一次，未触及「任务排队」根因；max_workers 仍为 3</td><td class="bad">❌ 无效</td></tr>
+    <tr><td>2</td><td>shutdown 后崩溃 → _shutdown 标志 + _sequential_recall 串行降级</td><td>实测 shutdown 后召回正常返回全部 3 层结果（4.00s，串行跑满）；不再 AttributeError</td><td class="ok">✅ 有效</td></tr>
+    <tr><td>3</td><td>_recall.py 缺 import threading（上轮引入的 NameError）</td><td>已补上，模块级 threading 可用</td><td class="ok">✅ 有效</td></tr>
+    <tr><td>4</td><td>refresh_l4_background 冗余 import 清理</td><td>已清理</td><td class="ok">✅ 有效</td></tr>
+    <tr><td>5</td><td>_init_l2 has_vector 重复赋值 / 未使用导入清理</td><td>已清理（Tuple、os、Optional、Any、Dict）</td><td class="ok">✅ 有效</td></tr>
+    <tr><td>6</td><td>_looks_like_durable_fact CJK 加权（len → CJK×3）</td><td>实测 5/5 用例符合预期：「以后都用中文」通过、「hi」排除、问句排除、清单排除、「不要再去那个地方了」通过</td><td class="ok">✅ 有效</td></tr>
+  </table>
+</section>
+
+<section>
+  <h2>三、无效修复的根因与正确方案</h2>
+
+  <div class="issue">
+    <div class="title"><span class="bad">仍在</span>并发退化：慢任务占满 worker → 重叠召回空结果</div>
+    <div class="loc">_recall.py :: _get_pool（DCL）/ parallel_recall（max_workers=3）</div>
+    <div class="detail">
+      时间线：第 1 次召回提交 3 个慢任务（各 2s）→ 超时 0.5s 后主线程返回，但 3 个 worker 仍被占用 1.5s → 第 2 次召回 submit 3 个新任务 → 全部排队 → as_completed 从 submit 起算 0.5s 超时 → 一个都没跑完 → 空结果。<br>
+      DCL 保证的是「两个线程同时 _get_pool() 不会创建两个池」——这与排队无关（池在首次使用后就一直存在，不存在重复创建）。max_workers=3 意味着任何时刻最多 3 个任务在跑，第二轮召回的任务必须等第一轮的任务结束。
+    </div>
+    <div class="evidence">实测（慢任务 2s，超时 0.5s）：
+第1次召回: 0.52s, ['P4']
+第2次召回(重叠): 0.51s, []          ← 退化仍在
+(等待 2.5s 后) 第3次召回: 正常</div>
+    <div class="detail">
+      <b>正确方案（三选一）</b>：<br>
+      ① max_workers 提到 6+：两轮重叠召回各有独立 worker，互不挤占（最简单）；<br>
+      ② 放弃共享池，每次召回新建池 + <code>pool.shutdown(wait=False)</code>：池间隔离，已实测无线程泄漏、无阻塞（GC __del__ 兜底）；<br>
+      ③ 提交前检查池活跃任务数，忙时直接走 <code>_sequential_recall()</code>。
+    </div>
+  </div>
+
+  <div class="issue" style="border-left-color:#ea580c">
+    <div class="title"><span class="warn">注意</span>串行降级无超时限制</div>
+    <div class="loc">_recall.py :: _sequential_recall</div>
+    <div class="detail">
+      shutdown 后的召回会串行跑满全部层（实测 4.00s，parallel_timeout_seconds 不生效）。shutdown 后本不该有调用，可接受；但若宿主关停顺序异常，关停过程会被拖长。
+    </div>
+  </div>
+</section>
+
+<section>
+  <h2>四、测试覆盖状况</h2>
+  <table>
+    <tr><th>项目</th><th>状态</th></tr>
+    <tr><td>测试数量</td><td class="ok">28 → 38（新增 10 个：pool lifecycle / concurrent get_pool / bridge dedup / config bad json / fts timestamp / heuristic / __all__ 等）</td></tr>
+    <tr><td>新增测试的盲区</td><td class="warn">test_concurrent_get_pool 只测「池创建竞态」，<b>没有测试「重叠召回任务堆积 → 空结果」这一真实退化场景</b>——这正是本轮无效修复漏网的原因。建议补：两个线程间隔 0.2s 各调一次 parallel_recall（慢 L2），断言第二次召回不返回空。</td></tr>
+    <tr><td>测试位置</td><td class="warn">新测试放在 tests/_tmp/test_fixes.py（临时目录），建议合入正式测试文件或至少改名去掉 _tmp</td></tr>
+  </table>
+  <p class="note">注：L3 检索回归与上轮一致（无破坏）；38/38 通过。</p>
+</section>
+
+</div>
+</body>
+</html>

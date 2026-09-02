@@ -1,0 +1,106 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>hermes-memory-governed 第四轮修复验证报告</title>
+<style>
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body { font-family: -apple-system, "Segoe UI", "Microsoft YaHei", sans-serif; background: #f6f7f9; color: #1f2933; line-height: 1.7; padding: 32px 16px; }
+  .wrap { max-width: 960px; margin: 0 auto; }
+  header { background: linear-gradient(135deg, #14532d, #16a34a); color: #fff; border-radius: 16px; padding: 36px 40px; margin-bottom: 28px; }
+  header h1 { font-size: 26px; margin-bottom: 8px; }
+  header p { opacity: .85; font-size: 14px; }
+  .metrics { display: grid; grid-template-columns: repeat(auto-fit, minmax(160px, 1fr)); gap: 14px; margin: 22px 0 30px; }
+  .metric { background: #fff; border-radius: 12px; padding: 18px; border: 1px solid #e3e8ee; }
+  .metric .num { font-size: 30px; font-weight: 700; }
+  .metric .label { font-size: 13px; color: #64748b; margin-top: 4px; }
+  .metric.green .num { color: #16a34a; }
+  .metric.orange .num { color: #ea580c; }
+  section { background: #fff; border-radius: 16px; padding: 28px 32px; margin-bottom: 24px; border: 1px solid #e3e8ee; }
+  h2 { font-size: 20px; margin-bottom: 16px; padding-bottom: 10px; border-bottom: 2px solid #eef2f6; }
+  table { width: 100%; border-collapse: collapse; margin: 14px 0; font-size: 14px; }
+  th, td { padding: 10px 12px; text-align: left; border-bottom: 1px solid #eef2f6; vertical-align: top; }
+  th { background: #f8fafc; font-weight: 600; }
+  .ok { color: #16a34a; font-weight: 700; }
+  .warn { color: #ea580c; font-weight: 700; }
+  .issue { border-left: 4px solid #e2e8f0; padding: 12px 16px; margin-bottom: 14px; background: #fafbfc; border-radius: 0 10px 10px 0; }
+  .issue.orange { border-left-color: #ea580c; }
+  .issue .title { font-weight: 700; margin-bottom: 6px; }
+  .issue .loc { font-size: 12px; color: #64748b; font-family: Consolas, monospace; }
+  .issue .detail { font-size: 14px; color: #475569; }
+  .evidence { background: #f1f5f9; border-radius: 8px; padding: 10px 14px; font-family: Consolas, monospace; font-size: 12.5px; margin-top: 8px; white-space: pre-wrap; color: #334155; }
+  code { background: #f1f5f9; padding: 1px 6px; border-radius: 5px; font-family: Consolas, monospace; font-size: 13px; }
+  .note { font-size: 12.5px; color: #94a3b8; margin-top: 8px; }
+</style>
+</head>
+<body>
+<div class="wrap">
+
+<header>
+  <h1>hermes-memory-governed 第四轮修复验证报告</h1>
+  <p>对 2026-08-28 第四轮修复总结（3 项）的逐项实测核对 · 环境：Windows + Python 3.13 + lancedb 0.37.1 · 28/28 测试通过</p>
+</header>
+
+<div class="metrics">
+  <div class="metric green"><div class="num">3</div><div class="metric-label" style="font-size:13px;color:#64748b">修复目标全部达成</div></div>
+  <div class="metric orange"><div class="num">2</div><div class="metric-label" style="font-size:13px;color:#64748b">遗留问题（1 个缺陷 + 1 个实现隐患）</div></div>
+</div>
+
+<section>
+  <h2>一、总体结论</h2>
+  <p>第四轮是四轮里最扎实的：<b>3 项修复全部达到目标</b>——L3 检索（英文 FTS5 / 中文 LIKE / 混合合并 / 通配符转义）完整可用，超时阻塞从 3.00s 降到 0.51s，pyproject 构建配置验证通过（pip install 成功）。遗留两个非阻塞问题：混合查询的 LIKE 匹配范围偏窄（纯中文记忆可能漏召回）、线程池 daemon 设置是死代码（依赖 GC 隐式 shutdown，存在脆弱性）。</p>
+</section>
+
+<section>
+  <h2>二、逐项核对</h2>
+  <table>
+    <tr><th>#</th><th>修复总结声称</th><th>实测结果</th><th>状态</th></tr>
+    <tr><td>1</td><td>FTS5 英文 + LIKE CJK + 混合合并去重 + 通配符转义</td><td>"Python" 3 hits ✅；「天气」3 hits ✅；「今天 天气」1 hit（之前 0）✅；「Python 天气」3 hits 合并去重 ✅；「50%进度」「a_b」「100%」精确命中、不崩溃 ✅；「50%了」0 hits（内容带空格，极边缘）⚠️</td><td class="ok">✅ 达成（1 边缘缺陷）</td></tr>
+    <tr><td>2</td><td>parallel_recall 非阻塞（不用 with + daemon + 不 shutdown）</td><td>耗时 0.51s（配置 0.5s），阻塞解决 ✅；结果 ['P4','FAST'] 去重正常 ✅；10 次调用线程数无增长 ✅；但 daemon 设置是死代码（submit 前 _threads 为空），实测线程 daemon=False ⚠️</td><td class="ok">✅ 功能达成（1 实现隐患）</td></tr>
+    <tr><td>3</td><td>pyproject 加 wheel + 包发现</td><td>pip install . --dry-run → Would install hermes-memory-governed-0.1.0 ✅（含 build isolation）</td><td class="ok">✅ 达成</td></tr>
+  </table>
+</section>
+
+<section>
+  <h2>三、遗留问题</h2>
+
+  <div class="issue orange">
+    <div class="title"><span class="warn">中</span>混合查询的 LIKE 匹配范围偏窄：纯中文记忆可能漏召回</div>
+    <div class="loc">_recall.py :: _search_l3 / _search_l3_like（LIKE 用去空格后的完整查询串）</div>
+    <div class="detail">
+      「Python 天气」的 LIKE 部分用的是整串去空格后的 <code>%Python天气%</code>——只能命中同时含「Python」和「天气」的内容，纯中文的「今天天气很好」「明天天气怎么样」不会被召回。实测返回 3 条里 2 条是纯英文 Python 内容，中文天气记忆丢失。建议：LIKE 部分只取查询串中的 CJK 字符段（如「天气」），与 FTS5 的英文部分互补。
+    </div>
+    <div class="evidence">实测：query='Python 天气' -> 3 hits:
+['Python 天气 python 脚本', 'Python is a programming ', 'I use Python for scripti']
+（「今天天气很好」「明天天气怎么样」未召回）</div>
+  </div>
+
+  <div class="issue orange">
+    <div class="title"><span class="warn">中</span>线程池 daemon 设置是死代码，依赖 GC 隐式清理</div>
+    <div class="loc">_recall.py :: parallel_recall（for t in pool._threads: t.daemon = True）</div>
+    <div class="detail">
+      <code>pool._threads</code> 在 submit 之前是空集合，这段循环实际什么都没做（实测线程 daemon=False）。当前不阻塞是因为线程池对象被 GC 时 <code>__del__</code> 隐式调用 <code>shutdown(wait=False)</code>——这是隐式依赖，一旦 pool 被外部引用住就会失效；且进程退出时若慢任务线程存活（非 daemon）会阻塞退出。建议：在 initializer 里设 <code>threading.current_thread().daemon = True</code>，并显式 <code>pool.shutdown(wait=False)</code>。
+    </div>
+  </div>
+</section>
+
+<section>
+  <h2>四、四轮累计状态</h2>
+  <table>
+    <tr><th>模块</th><th>状态</th><th>说明</th></tr>
+    <tr><td>L1 手写层</td><td class="ok">✅</td><td>缓存 + replace/remove 语义</td></tr>
+    <tr><td>L2 语义层</td><td class="ok">✅</td><td>向量搜索（需 embedding）+ 文本降级 + PyArrow schema；注意旧数据 vector=NULL 在向量模式下不可见（需迁移）</td></tr>
+    <tr><td>L3 归档层</td><td class="ok">✅</td><td>FTS5 英文 + LIKE 中文 + 混合合并 + 时间衰减 + 通配符转义</td></tr>
+    <tr><td>L4 画像层</td><td class="ok">✅</td><td>缓存 + 后台刷新</td></tr>
+    <tr><td>并行召回</td><td class="ok">✅</td><td>非阻塞 + 去重 + 超时降级（daemon 实现建议加固）</td></tr>
+    <tr><td>Bridge 审核</td><td class="ok">✅</td><td>secret 检测 + 安全目标验证</td></tr>
+    <tr><td>Mermaid 压缩</td><td class="ok">✅</td><td>可选启用</td></tr>
+    <tr><td>pyproject</td><td class="ok">✅</td><td>setuptools + wheel + package find，pip install 通过</td></tr>
+  </table>
+  <p class="note">注：28/28 测试通过。测试仍未覆盖 L3 混合查询、LIKE 转义、超时耗时、线程泄漏、pip 构建——建议把这五类场景补进测试套件，防止回归。L2 向量模式依赖 sentence-transformers（optional vector 依赖），无模型时自动走文本降级。</p>
+</section>
+
+</div>
+</body>
+</html>

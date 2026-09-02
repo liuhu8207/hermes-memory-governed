@@ -1,0 +1,104 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>架构优化落地报告</title>
+<style>
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body { font-family: -apple-system, "Segoe UI", "Microsoft YaHei", sans-serif; background: #f6f7f9; color: #1f2933; line-height: 1.7; padding: 32px 16px; }
+  .wrap { max-width: 960px; margin: 0 auto; }
+  header { background: linear-gradient(135deg, #14532d, #16a34a); color: #fff; border-radius: 16px; padding: 32px 36px; margin-bottom: 24px; }
+  header h1 { font-size: 24px; margin-bottom: 6px; }
+  header p { opacity: .85; font-size: 14px; }
+  .metrics { display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 12px; margin: 20px 0 26px; }
+  .metric { background: #fff; border-radius: 12px; padding: 16px; border: 1px solid #e3e8ee; }
+  .metric .num { font-size: 24px; font-weight: 700; color: #16a34a; }
+  .metric .label { font-size: 13px; color: #64748b; margin-top: 2px; }
+  section { background: #fff; border-radius: 16px; padding: 26px 30px; margin-bottom: 20px; border: 1px solid #e3e8ee; }
+  h2 { font-size: 19px; margin-bottom: 14px; padding-bottom: 8px; border-bottom: 2px solid #eef2f6; }
+  table { width: 100%; border-collapse: collapse; font-size: 13.5px; }
+  th, td { padding: 9px 12px; text-align: left; border-bottom: 1px solid #eef2f6; vertical-align: top; }
+  th { background: #f8fafc; font-weight: 600; }
+  .ok { color: #16a34a; font-weight: 700; }
+  .pill { display: inline-block; font-size: 11.5px; padding: 1px 8px; border-radius: 5px; font-weight: 600; }
+  .p-p1 { background: #fee2e2; color: #b91c1c; }
+  .p-p2 { background: #ffedd5; color: #c2410c; }
+  .p-p3 { background: #dbeafe; color: #1d4ed8; }
+  code { background: #f1f5f9; padding: 1px 6px; border-radius: 5px; font-family: Consolas, monospace; font-size: 12.5px; }
+  .evidence { background: #f1f5f9; border-radius: 8px; padding: 10px 14px; font-family: Consolas, monospace; font-size: 12.5px; margin: 8px 0; white-space: pre-wrap; color: #334155; }
+  .note { font-size: 12.5px; color: #94a3b8; margin-top: 10px; }
+</style>
+</head>
+<body>
+<div class="wrap">
+
+<header>
+  <h1>架构优化落地报告</h1>
+  <p>2026-08-28 14:06–14:45 · 8 项优化全部落地并实测 · 45/45 测试 + 召回四项回归 + 构建全过</p>
+</header>
+
+<div class="metrics">
+  <div class="metric"><div class="num">8</div><div class="label">优化项全部落地</div></div>
+  <div class="metric"><div class="num">2</div><div class="label">新增维护脚本</div></div>
+  <div class="metric"><div class="num">1</div><div class="label">新增依赖函数（env_int）</div></div>
+  <div class="metric"><div class="num">45/45</div><div class="label">测试回归</div></div>
+</div>
+
+<section>
+  <h2>一、落地清单与实测结果</h2>
+  <table>
+    <tr><th>#</th><th>优化项</th><th>实现</th><th>实测结果</th></tr>
+    <tr><td><span class="pill p-p1">P1①</span></td><td>L2 ↔ L3 关联 + audit 下钻</td><td>L2 schema 加 <code>source_rowid</code> 列（新表建表自带，旧表 add_columns 兜底）；_index_l2 从 rowid_map 附加引用；audit 命中 L2 时经 <code>_drill_l3_rowid</code> 读回原始消息</td><td class="ok">✅ audit 返回 l3_message（role/content/timestamp）</td></tr>
+    <tr><td><span class="pill p-p1">P1②</span></td><td>L2 全量重建脚本</td><td><code>scripts/l2_rebuild.py</code>：L3 全量 → 原子事实 → 重嵌入 → 删表重建（新 schema）；--dry-run / --yes；模型与维度读 config</td><td class="ok">✅ dry-run 2 facts 带 rowid 引用</td></tr>
+    <tr><td><span class="pill p-p1">P1③</span></td><td>Bridge 审查闭环落地</td><td><code>import_approved(l1_path, auto_approve)</code>：approved 候选追加到 L1（带 bridge 来源注释），JSONL 重写标记 imported=true；未审查候选跳过</td><td class="ok">✅ approved 落 L1、未审查不落、标记 [True, False]</td></tr>
+    <tr><td><span class="pill p-p2">P2①</span></td><td>Embedding config 化</td><td>新增 <code>VectorConfig(model, dim)</code>；_sync 建表用 dim、加载用 model；_recall 同步</td><td class="ok">✅ 配置驱动（bge-small-zh/512 实测生效）</td></tr>
+    <tr><td><span class="pill p-p2">P2②</span></td><td>L3 保留策略</td><td><code>scripts/l3_retention.py</code>：超龄 messages + messages_fts 同步清理；--dry-run / --yes / --days</td><td class="ok">✅ 180 天清理实测（messages 与 FTS 同步）</td></tr>
+    <tr><td><span class="pill p-p2">P2③</span></td><td>L3 写入幂等</td><td>L3Writer 建表加 hash 列（旧表 ALTER 兼容）；写入前 (session_id, content_hash) 查重；write 返回 content→rowid 映射</td><td class="ok">✅ 重复 sync_turn 行数不变</td></tr>
+    <tr><td><span class="pill p-p3">P3</span></td><td>prefetch 命中率统计</td><td>_cache_hits/_cache_misses 计数；recall_status 返回 hits/misses/hit_rate；governed_health 输出 prefetch_cache</td><td class="ok">✅ hits=2/misses=1 实测</td></tr>
+    <tr><td><span class="pill p-p3">P3</span></td><td>配置数值类型校验</td><td>load_governed_config 对 10 个数值字段校验：类型错误 → warning + 强制转换或回退默认</td><td class="ok">✅ "800" → 800 实测（带 warning）</td></tr>
+  </table>
+</section>
+
+<section>
+  <h2>二、改动文件</h2>
+  <table>
+    <tr><th>文件</th><th>改动</th></tr>
+    <tr><td>plugin/memory_governed/_config.py</td><td>+VectorConfig、+vector 字段、+_validate_numeric_fields</td></tr>
+    <tr><td>plugin/memory_governed/_sync.py</td><td>L3Writer 幂等 + hash 列 + rowid_map 返回；_init_l2 config 化 + source_rowid 列 + 旧表回填；_index_l2 附加引用；enqueue/_process_item 透传</td></tr>
+    <tr><td>plugin/memory_governed/_recall.py</td><td>_search_l2_vector/_text metadata 携带 source_rowid；向量模型走 config</td></tr>
+    <tr><td>plugin/memory_governed/_bridge.py</td><td>+import_approved（审查落地闭环）；import_to_scope_recall 半成品移除</td></tr>
+    <tr><td>plugin/memory_governed/__init__.py</td><td>sync_turn 接 rowid_map；prefetch 命中率；recall_status 扩展；governed_health 输出 prefetch_cache；audit L2→L3 下钻（+_drill_l3_rowid）</td></tr>
+    <tr><td>scripts/l2_rebuild.py</td><td><b>新增</b>：L2 全量重建（dry-run/yes/config 驱动）</td></tr>
+    <tr><td>scripts/l3_retention.py</td><td><b>新增</b>：L3 保留策略（messages + FTS 同步清理）</td></tr>
+    <tr><td>scripts/memory_pipeline.py</td><td>清理 --with-notebooklm 死引用（分支 + 参数）</td></tr>
+    <tr><td>scripts/hermes_env.py</td><td>+env_int（l2_rebuild 依赖）</td></tr>
+  </table>
+</section>
+
+<section>
+  <h2>三、实施过程中的坑（已绕过/修复）</h2>
+  <table>
+    <tr><th>坑</th><th>处理</th></tr>
+    <tr><td>L2 旧表无 source_rowid 列，直接写入带新字段的行会失败</td><td>_init_l2 打开旧表时 best-effort add_columns 回填；_index_l2 写前检查列存在</td></tr>
+    <tr><td>L3 旧表无 hash 列，幂等查重会崩</td><td>_get_conn 里 ALTER TABLE ADD COLUMN（已存在则吞掉）</td></tr>
+    <tr><td>l2_rebuild 依赖旧版 hermes_env.env_int（新版精简时没带）</td><td>hermes_env 补 env_int</td></tr>
+    <tr><td>本机 AutoClaw embedded Python 无法 import 同目录模块（sys.path 隔离）</td><td>验证用 sys.path 注入方式完成；标准 Python 部署无此问题（已在报告标注）</td></tr>
+  </table>
+</section>
+
+<section>
+  <h2>四、回归确认</h2>
+  <table>
+    <tr><th>场景</th><th>结果</th></tr>
+    <tr><td>测试套件</td><td class="ok">45/45 通过</td></tr>
+    <tr><td>并行召回四项（不阻塞 0.50s / 池间隔离 / 0 泄漏 / shutdown 降级）</td><td class="ok">全过</td></tr>
+    <tr><td>pip wheel 构建（含 entry-points）</td><td class="ok">Would install 成功</td></tr>
+    <tr><td>既有功能（L1/L2/L3/Bridge/归档/去重/检索）</td><td class="ok">无回归</td></tr>
+  </table>
+  <p class="note">建议下一步：给新功能补测试（幂等写入、source_ref 下钻、import_approved、归档、retention、config 校验）；health 脚本 warning/errors 分离仍为遗留项。</p>
+</section>
+
+</div>
+</body>
+</html>

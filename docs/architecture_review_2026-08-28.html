@@ -1,0 +1,143 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>hermes-memory-governed 架构优化建议</title>
+<style>
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body { font-family: -apple-system, "Segoe UI", "Microsoft YaHei", sans-serif; background: #f6f7f9; color: #1f2933; line-height: 1.7; padding: 32px 16px; }
+  .wrap { max-width: 960px; margin: 0 auto; }
+  header { background: linear-gradient(135deg, #1e3a5f, #2d6a9f); color: #fff; border-radius: 16px; padding: 32px 36px; margin-bottom: 24px; }
+  header h1 { font-size: 24px; margin-bottom: 6px; }
+  header p { opacity: .85; font-size: 14px; }
+  .metrics { display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 12px; margin: 20px 0 26px; }
+  .metric { background: #fff; border-radius: 12px; padding: 16px; border: 1px solid #e3e8ee; }
+  .metric .num { font-size: 24px; font-weight: 700; }
+  .metric .label { font-size: 13px; color: #64748b; margin-top: 2px; }
+  .metric.p1 .num { color: #dc2626; }
+  .metric.p2 .num { color: #ea580c; }
+  .metric.p3 .num { color: #2563eb; }
+  section { background: #fff; border-radius: 16px; padding: 26px 30px; margin-bottom: 20px; border: 1px solid #e3e8ee; }
+  h2 { font-size: 19px; margin-bottom: 14px; padding-bottom: 8px; border-bottom: 2px solid #eef2f6; }
+  h3 { font-size: 15.5px; margin: 16px 0 8px; }
+  table { width: 100%; border-collapse: collapse; font-size: 13.5px; }
+  th, td { padding: 9px 12px; text-align: left; border-bottom: 1px solid #eef2f6; vertical-align: top; }
+  th { background: #f8fafc; font-weight: 600; }
+  .pill { display: inline-block; font-size: 11.5px; padding: 1px 8px; border-radius: 5px; font-weight: 600; }
+  .p-p1 { background: #fee2e2; color: #b91c1c; }
+  .p-p2 { background: #ffedd5; color: #c2410c; }
+  .p-p3 { background: #dbeafe; color: #1d4ed8; }
+  .issue { border-left: 4px solid #e2e8f0; padding: 12px 16px; margin-bottom: 12px; background: #fafbfc; border-radius: 0 10px 10px 0; }
+  .issue.p1 { border-left-color: #dc2626; }
+  .issue.p2 { border-left-color: #ea580c; }
+  .issue .title { font-weight: 700; margin-bottom: 4px; }
+  .issue .loc { font-size: 12px; color: #64748b; font-family: Consolas, monospace; margin-bottom: 4px; }
+  .issue .detail { font-size: 13.5px; color: #475569; }
+  code { background: #f1f5f9; padding: 1px 6px; border-radius: 5px; font-family: Consolas, monospace; font-size: 12.5px; }
+  .note { font-size: 12.5px; color: #94a3b8; margin-top: 10px; }
+  .keep { border-left: 4px solid #16a34a; padding: 12px 16px; margin-bottom: 12px; background: #f0fdf4; border-radius: 0 10px 10px 0; }
+  .keep .title { font-weight: 700; margin-bottom: 4px; color: #15803d; }
+  .keep .detail { font-size: 13.5px; color: #475569; }
+</style>
+</head>
+<body>
+<div class="wrap">
+
+<header>
+  <h1>hermes-memory-governed 架构优化建议</h1>
+  <p>2026-08-28 · 基于当前代码最终形态的架构审视 · 3 个闭环缺口 + 3 项可靠性/演进 + 2 项观测性</p>
+</header>
+
+<div class="metrics">
+  <div class="metric p1"><div class="num">3</div><div class="label">架构闭环缺口（P1）</div></div>
+  <div class="metric p2"><div class="num">3</div><div class="label">可靠性 / 演进（P2）</div></div>
+  <div class="metric p3"><div class="num">2</div><div class="label">观测性（P3）</div></div>
+  <div class="metric p1"><div class="num">0</div><div class="label">需要回退的既有设计</div></div>
+</div>
+
+<section>
+  <h2>一、P1 · 架构闭环缺口（最值得先做）</h2>
+
+  <div class="issue p1">
+    <div class="title">① L2 ↔ L3 关联缺失：audit 溯源断链</div>
+    <div class="loc">_sync.py :: _extract_atomic_facts / _recall.py :: audit 链路</div>
+    <div class="detail">
+      L2 记录只有 content/category/source/timestamp，<b>没有指向 L3 消息的引用</b>。governed_audit 查到 L2 后无法下钻到原始对话——「这条记忆是哪次对话提取的」不可追溯。<br>
+      <b>建议</b>：L2 schema 加 <code>source_ref</code>（L3 消息 id + session_id），audit 工具支持 L2 → L3 下钻。改动小（建表 + 写入 + audit 各一处）。
+    </div>
+  </div>
+
+  <div class="issue p1">
+    <div class="title">② L2 无重建机制：事实源与派生索引脱钩</div>
+    <div class="loc">scripts/（无 l2_rebuild）</div>
+    <div class="detail">
+      L3 是事实源，L2 是派生索引——但只有 NULL vector 迁移，<b>没有从 L3 全量重建 L2 的入口</b>。L2 表损坏、模型更换、提取逻辑升级时无法恢复。<br>
+      <b>建议</b>：加 <code>scripts/l2_rebuild.py</code>（从 L3 重提取事实 → 重建表），可 cron 兜底。这也是「L2 坏了随时能回来」的架构保障。
+    </div>
+  </div>
+
+  <div class="issue p1">
+    <div class="title">③ Bridge 是死胡同：审查通过后无处落地</div>
+    <div class="loc">_bridge.py :: import_to_scope_recall（TODO，只计数不写）</div>
+    <div class="detail">
+      自动提取的记忆候选写入 candidates.jsonl 后<b>没有消费方</b>：import_to_scope_recall 只计数；审查通过的候选无法自动进入 L1 或 Scope Recall。整条「提取 → 审查 → 落地」闭环缺最后一环。<br>
+      <b>建议（二选一）</b>：① 实现 import（审查通过 → 写回 L1 文件或 Scope Recall 库）；② 明确「人工导出」定位，文档写明导出 → 手动入库流程，并把 import 方法标记为 not-implemented 而不是半成品。
+    </div>
+  </div>
+</section>
+
+<section>
+  <h2>二、P2 · 可靠性 / 演进</h2>
+
+  <div class="issue p2">
+    <div class="title">① Embedding 模型与维度硬编码（换模型 = 改 4 处 + 重建表）</div>
+    <div class="loc">_sync.py / _recall.py（all-MiniLM-L6-v2）· _sync.py 建表（384 固定）</div>
+    <div class="detail">
+      模型名硬编码两处、维度 384 硬编码在 PyArrow schema——换 embedding 模型要改 4 处，且旧表因维度不同不兼容（必须重建）。<br>
+      <b>建议</b>：config 化 <code>vector.model</code> + <code>vector.dim</code>；建表用 dim，加载用 model 名。未来换模型 = 改配置 + 重建索引（配合建议②）。
+    </div>
+  </div>
+
+  <div class="issue p2">
+    <div class="title">② L3 无限增长，无保留策略</div>
+    <div class="loc">_sync.py :: L3Writer（messages 只增不减）</div>
+    <div class="detail">
+      messages + messages_fts 只增不减，长期运行磁盘与检索性能都会恶化。<br>
+      <b>建议</b>：cron 保留策略——保留最近 N 天（如 180 天），更早的旧消息若已提取进 L2 可压缩为摘要或删除；与建议②的 l2_rebuild 配合，L3 清理不丢知识。
+    </div>
+  </div>
+
+  <div class="issue p2">
+    <div class="title">③ 写路径无幂等：重复 sync_turn 产生重复归档</div>
+    <div class="loc">_sync.py :: L3Writer.write（无消息级去重）</div>
+    <div class="detail">
+      同一 session 重复 sync_turn（对话重放、故障重试、宿主 bug）会重复写入 L3，FTS 检索时同内容多条命中。<br>
+      <b>建议</b>：messages 表加 <code>(session_id, content_hash)</code> 唯一约束或写入前去重（INSERT OR IGNORE）。
+    </div>
+  </div>
+</section>
+
+<section>
+  <h2>三、P3 · 观测性</h2>
+  <table>
+    <tr><th>事项</th><th>现状</th><th>建议</th></tr>
+    <tr><td>prefetch 缓存命中率无统计</td><td>recall_status 只报最后一次召回条数</td><td>加命中/未命中计数器——判断 TTL（30s）与预取查询是否有效，命中率过低说明预取策略要调</td></tr>
+    <tr><td>health 报告无趋势</td><td>单次快照</td><td>对比上次报告（L2/L3 行数增量、Bridge 候选增长、提取率）——让「记忆在增长还是停滞」可见</td></tr>
+    <tr><td>配置无类型校验</td><td>JSON 解析失败才 warning，类型错误（如 token 预算写成字符串）静默生效</td><td>启动时对关键数值字段做类型校验并 warning</td></tr>
+  </table>
+</section>
+
+<section>
+  <h2>四、不建议动的既有设计（多轮实测打磨的结果）</h2>
+  <div class="keep"><div class="title">L3 同步写 / L2 异步写</div><div class="detail">事实源必须同步保数据安全，派生索引异步可重建——数据丢失风险的架构级权衡，正确。</div></div>
+  <div class="keep"><div class="title">独立临时池 + shutdown(wait=False)</div><div class="detail">并发隔离 + 不阻塞 + 无泄漏，三目标同时满足（经历过共享池退化与 with 阻塞两轮教训）。</div></div>
+  <div class="keep"><div class="title">组内 min-max 归一化 + MIN_SCORE 阈值</div><div class="detail">L2/L3 量纲统一（差 6 个数量级），阈值安全、组内最强恒可见——方向修正后已稳定。</div></div>
+  <div class="keep"><div class="title">中文 LIKE 降级</div><div class="detail">FTS5 默认分词器不切中文（实测），LIKE 是唯一不依赖分词器的可靠方案；英文仍走 FTS5。</div></div>
+  <div class="keep"><div class="title">Bridge 追加 + 去重 + 归档</div><div class="detail">并发安全 + 防重复 + 防无限增长，三条同时满足。</div></div>
+  <p class="note">优先级建议：先做 P1 的 ①②（L2 关联与重建，小改动大保障）和 ③ 的定位明确（决定 Bridge 的未来）；P2 的 ①（模型 config 化）在下次换模型前做即可；其余按需。</p>
+</section>
+
+</div>
+</body>
+</html>

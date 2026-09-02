@@ -1,0 +1,102 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>C 方案迁移落地：chat_extractor + notebooklm 死引用清理</title>
+<style>
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body { font-family: -apple-system, "Segoe UI", "Microsoft YaHei", sans-serif; background: #f6f7f9; color: #1f2933; line-height: 1.7; padding: 32px 16px; }
+  .wrap { max-width: 920px; margin: 0 auto; }
+  header { background: linear-gradient(135deg, #14532d, #16a34a); color: #fff; border-radius: 16px; padding: 32px 36px; margin-bottom: 24px; }
+  header h1 { font-size: 24px; margin-bottom: 6px; }
+  header p { opacity: .85; font-size: 14px; }
+  .metrics { display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 12px; margin: 20px 0 26px; }
+  .metric { background: #fff; border-radius: 12px; padding: 16px; border: 1px solid #e3e8ee; }
+  .metric .num { font-size: 24px; font-weight: 700; color: #16a34a; }
+  .metric .label { font-size: 13px; color: #64748b; margin-top: 2px; }
+  section { background: #fff; border-radius: 16px; padding: 26px 30px; margin-bottom: 20px; border: 1px solid #e3e8ee; }
+  h2 { font-size: 19px; margin-bottom: 14px; padding-bottom: 8px; border-bottom: 2px solid #eef2f6; }
+  table { width: 100%; border-collapse: collapse; font-size: 14px; }
+  th, td { padding: 9px 12px; text-align: left; border-bottom: 1px solid #eef2f6; vertical-align: top; }
+  th { background: #f8fafc; font-weight: 600; }
+  .ok { color: #16a34a; font-weight: 700; }
+  .bad { color: #dc2626; font-weight: 700; }
+  .warn { color: #ea580c; font-weight: 700; }
+  .issue { border-left: 4px solid #16a34a; padding: 12px 16px; margin-bottom: 14px; background: #fafbfc; border-radius: 0 10px 10px 0; }
+  .issue .title { font-weight: 700; margin-bottom: 6px; }
+  .issue .loc { font-size: 12px; color: #64748b; font-family: Consolas, monospace; }
+  .issue .detail { font-size: 14px; color: #475569; }
+  .evidence { background: #f1f5f9; border-radius: 8px; padding: 10px 14px; font-family: Consolas, monospace; font-size: 12.5px; margin-top: 8px; white-space: pre-wrap; color: #334155; }
+  code { background: #f1f5f9; padding: 1px 6px; border-radius: 5px; font-family: Consolas, monospace; font-size: 13px; }
+  .note { font-size: 12.5px; color: #94a3b8; margin-top: 10px; }
+</style>
+</head>
+<body>
+<div class="wrap">
+
+<header>
+  <h1>C 方案迁移落地：chat_extractor + 死引用清理</h1>
+  <p>2026-08-28 13:38 · 知识库高价值子集迁移完成 · 端到端实测 PASS · 45/45 测试通过</p>
+</header>
+
+<div class="metrics">
+  <div class="metric"><div class="num">2</div><div class="label">新脚本迁移（chat_extractor + wiki_utils 精简版）</div></div>
+  <div class="metric"><div class="num">3</div><div class="label">死引用清理（--with-notebooklm）</div></div>
+  <div class="metric"><div class="num">1 处</div><div class="label">迁移适配（L3 schema + CJK 加权）</div></div>
+  <div class="metric"><div class="num">45/45</div><div class="label">测试回归</div></div>
+</div>
+
+<section>
+  <h2>一、迁移内容</h2>
+  <table>
+    <tr><th>文件</th><th>来源</th><th>改动</th></tr>
+    <tr><td><b>scripts/chat_extractor.py</b>（新增）</td><td>旧版 195 行 → 新版 ~210 行</td><td>① L3 schema 适配：旧版查 conversations/messages(conversation_id) 双表，新版改为扁平 messages 表按 session_id 分组（DISTINCT session_id → 逐会话读消息）；② timestamp 适配：unix REAL（cutoff 用 time.time()，输出用 fromtimestamp）；③ title 生成：新版无 title 列，用首条用户消息前 40 字；④ 过滤关键词补英文（implement/solution/deploy 等）；⑤ <b>CJK 加权长度</b>：min_length=50 按 ASCII 标准会误杀中文知识句（31 字中文 < 50），改为 non_cjk + cjk×3 加权（与 provider 启发式一致）</td></tr>
+    <tr><td><b>scripts/wiki_utils.py</b>（新增精简版）</td><td>旧版 257 行 → 新版 ~80 行</td><td>只保留 chat_extractor 依赖的 atomic_write_json（原子写）+ StateManager（状态去重）；标注来源与迁移日期</td></tr>
+    <tr><td><b>scripts/memory_pipeline.py</b>（清理）</td><td>—</td><td>删除 cmd_daily 的 notebooklm 分支 + --with-notebooklm 参数定义（引用未迁移的 wiki_nblm_daily.py，启用即 FAIL）；notebooklm/wiki_nblm 引用清零</td></tr>
+  </table>
+  <p class="note">未迁移：obsidian_sync（等你确认在用 Obsidian 再说，它还依赖 knowledge_collector/processor）；NotebookLM 集成（可移植模板 + 每机适配，收益最低）；其余知识库脚本按 C 方案留在旧仓库。</p>
+</section>
+
+<section>
+  <h2>二、端到端实测</h2>
+  <div class="issue">
+    <div class="title">实测场景：新版 L3 两会话（知识型 + 寒暄型），连跑两次验证去重</div>
+    <div class="evidence">构造：session-deploy（3 条消息，含「部署方案/配置/架构设计」知识型中文用户消息）
+        session-chat（2 条寒暄，不应提取）
+
+第一次运行：found 2 conversations → extracted 1 chat items → 生成笔记
+  输出: wiki/knowledge/chats/2026-08-28_我们项目的部署方案是什么？….md
+  frontmatter: source: session-deploy ✅  摘要含两条知识型消息 ✅
+第二次运行：笔记数 1（不变）——StateManager 去重生效 ✅
+寒暄会话 session-chat 未误提取 ✅</div>
+  </div>
+  <p>过程中发现并修复一个迁移适配 bug：初版直接迁移后 <b>0 条提取</b>——中文知识句（31 字）被 <code>min_length=50</code> 的 ASCII 标准误杀，与 provider 启发式此前踩过的坑相同，已用同样的 CJK×3 加权修复。</p>
+</section>
+
+<section>
+  <h2>三、回归与运行环境说明</h2>
+  <table>
+    <tr><th>场景</th><th>结果</th></tr>
+    <tr><td>测试套件</td><td class="ok">45/45 通过</td></tr>
+    <tr><td>memory_pipeline notebooklm/wiki_nblm 引用</td><td class="ok">清零</td></tr>
+    <tr><td>本机直接跑 scripts/*.py</td><td class="warn">AutoClaw 自带 embedded Python（python313._pth 隔离）无法 import 同目录模块——<b>环境特性，非代码问题</b>（旧版同样如此）；标准 Python 部署无此问题；本机验证用 sys.path 注入方式完成</td></tr>
+  </table>
+  <p class="note">用法：python scripts/chat_extractor.py --days 7 --limit 50（输出到 $WIKI_DIR/knowledge/chats/，状态文件 .chat_state.json 去重）。产出的 markdown 笔记可后续接 knowledge_processor 或手动入库。</p>
+</section>
+
+<section>
+  <h2>四、C 方案收尾状态</h2>
+  <table>
+    <tr><th>事项</th><th>状态</th></tr>
+    <tr><td>chat_extractor 迁移 + 适配 + 实测</td><td class="ok">✅ 完成</td></tr>
+    <tr><td>wiki_utils 精简版迁移</td><td class="ok">✅ 完成</td></tr>
+    <tr><td>memory_pipeline 死引用清理</td><td class="ok">✅ 完成（此前遗留项之一闭环）</td></tr>
+    <tr><td>obsidian_sync 迁移</td><td class="warn">挂起（等确认在用 Obsidian，且需连带 knowledge_collector/processor）</td></tr>
+    <tr><td>其余知识库脚本（NotebookLM/图谱/仪表盘/飞书/剪藏）</td><td class="warn">按 C 方案留在旧仓库</td></tr>
+  </table>
+</section>
+
+</div>
+</body>
+</html>

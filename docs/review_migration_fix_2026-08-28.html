@@ -1,0 +1,89 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>L2 迁移修复验证 + 遗留判定 bug 修复</title>
+<style>
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body { font-family: -apple-system, "Segoe UI", "Microsoft YaHei", sans-serif; background: #f6f7f9; color: #1f2933; line-height: 1.7; padding: 32px 16px; }
+  .wrap { max-width: 920px; margin: 0 auto; }
+  header { background: linear-gradient(135deg, #14532d, #16a34a); color: #fff; border-radius: 16px; padding: 32px 36px; margin-bottom: 24px; }
+  header h1 { font-size: 24px; margin-bottom: 6px; }
+  header p { opacity: .85; font-size: 14px; }
+  .metrics { display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 12px; margin: 20px 0 26px; }
+  .metric { background: #fff; border-radius: 12px; padding: 16px; border: 1px solid #e3e8ee; }
+  .metric .num { font-size: 24px; font-weight: 700; color: #16a34a; }
+  .metric .label { font-size: 13px; color: #64748b; margin-top: 2px; }
+  section { background: #fff; border-radius: 16px; padding: 26px 30px; margin-bottom: 20px; border: 1px solid #e3e8ee; }
+  h2 { font-size: 19px; margin-bottom: 14px; padding-bottom: 8px; border-bottom: 2px solid #eef2f6; }
+  table { width: 100%; border-collapse: collapse; font-size: 14px; }
+  th, td { padding: 9px 12px; text-align: left; border-bottom: 1px solid #eef2f6; vertical-align: top; }
+  th { background: #f8fafc; font-weight: 600; }
+  .ok { color: #16a34a; font-weight: 700; }
+  .bad { color: #dc2626; font-weight: 700; }
+  .warn { color: #ea580c; font-weight: 700; }
+  .issue { border-left: 4px solid #e2e8f0; padding: 12px 16px; margin-bottom: 14px; background: #fafbfc; border-radius: 0 10px 10px 0; }
+  .issue.orange { border-left-color: #ea580c; }
+  .issue .title { font-weight: 700; margin-bottom: 6px; }
+  .issue .loc { font-size: 12px; color: #64748b; font-family: Consolas, monospace; }
+  .issue .detail { font-size: 14px; color: #475569; }
+  .evidence { background: #f1f5f9; border-radius: 8px; padding: 10px 14px; font-family: Consolas, monospace; font-size: 12.5px; margin-top: 8px; white-space: pre-wrap; color: #334155; }
+  code { background: #f1f5f9; padding: 1px 6px; border-radius: 5px; font-family: Consolas, monospace; font-size: 13px; }
+  .note { font-size: 12.5px; color: #94a3b8; margin-top: 10px; }
+</style>
+</head>
+<body>
+<div class="wrap">
+
+<header>
+  <h1>L2 迁移修复验证 + 遗留判定 bug 修复</h1>
+  <p>2026-08-28 10:14 · 核对 delete + re-add 方案 · 发现并修复 1 个新判定 bug · 45/45 测试通过 · 召回四项回归全过</p>
+</header>
+
+<div class="metrics">
+  <div class="metric"><div class="num">✅</div><div class="label">delete + re-add 方案有效</div></div>
+  <div class="metric"><div class="num">✅</div><div class="label">迁移端到端实测：向量可搜</div></div>
+  <div class="metric"><div class="num">1</div><div class="label">新判定 bug（已由本轮修复）</div></div>
+  <div class="metric"><div class="num">45/45</div><div class="label">测试 + 召回回归全过</div></div>
+</div>
+
+<section>
+  <h2>一、总体结论</h2>
+  <p>delete + re-add 方案本身正确（replace_rows/update 的坑都绕开了，pandas 依赖也去掉了），但实现里 <b>NULL 判定写法有 bug</b>：<code>vec_col[i] is None</code> 对 pyarrow Scalar 包装永远为 False，导致迁移函数认为「没有 NULL 行」直接返回——<b>修复后迁移依然无效</b>。本轮已将判定改为 <code>vec_col[i].as_py() is None</code> 并实测迁移端到端工作。</p>
+</section>
+
+<section>
+  <h2>二、核对与修复过程</h2>
+  <table>
+    <tr><th>步骤</th><th>结果</th></tr>
+    <tr><td>① 方案核对</td><td class="ok">✅ delete + re-add 避开 replace_rows/update 的坑；pandas 依赖移除；rowid 分支因 to_arrow() 不含 rowid 列实际永远走 content 匹配 fallback（可工作，但 rowid 分支属死代码，可简化）</td></tr>
+    <tr><td>② 修复前实测</td><td class="bad">❌ 迁移后 vector 仍 NULL（1 行），向量搜索 0 hits——静默失败</td></tr>
+    <tr><td>③ 根因定位</td><td><code>vec_col[i]</code> 返回 pyarrow <code>FixedSizeListScalar</code> 包装对象，内部即使为 null，<code>is None</code> 也是 False → <code>null_indices</code> 恒为空 → 函数直接 return</td></tr>
+    <tr><td>④ 本轮修复</td><td class="ok">判定改为 <code>vec_col[i].as_py() is None</code>（1 处，plugin/memory_governed/_sync.py）</td></tr>
+    <tr><td>⑤ 修复后实测</td><td class="ok">迁移后 NULL: 0 / 已填充: 1，<b>向量搜索 1 hit</b>（distance 384，与伪造查询向量一致）</td></tr>
+  </table>
+  <div class="issue orange">
+    <div class="title"><span class="warn">建议</span>content 匹配 fallback 的两个小点</div>
+    <div class="detail">
+      ① 同 content 多行时 <code>delete content = '...'</code> 会删除所有匹配行（含有向量的行）——迁移场景可接受，但更精确的做法是用 <code>merge_insert</code> 按 rowid 匹配；② rowid 分支是死代码（to_arrow() 无 rowid 列），建议直接删除减少误导。
+    </div>
+  </div>
+</section>
+
+<section>
+  <h2>三、回归确认</h2>
+  <table>
+    <tr><th>场景</th><th>结果</th></tr>
+    <tr><td>测试套件</td><td class="ok">45/45 通过</td></tr>
+    <tr><td>并行召回：不阻塞</td><td class="ok">0.52s（配置 0.5s）</td></tr>
+    <tr><td>并行召回：池间隔离</td><td class="ok">重叠召回 A/B 均返回 P4</td></tr>
+    <tr><td>并行召回：线程泄漏</td><td class="ok">0 残留</td></tr>
+    <tr><td>并行召回：shutdown 降级</td><td class="ok">串行执行不崩溃</td></tr>
+  </table>
+  <p class="note">本轮代码改动：plugin/memory_governed/_sync.py 的 _migrate_null_vectors 判定 1 处（vec_col[i].as_py() is None）。迁移日志建议从 debug 升为 warning（本次静默失败正是被 debug 级别掩盖的）。</p>
+</section>
+
+</div>
+</body>
+</html>

@@ -1,0 +1,78 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>hermes-memory-governed 最终回归确认</title>
+<style>
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body { font-family: -apple-system, "Segoe UI", "Microsoft YaHei", sans-serif; background: #f6f7f9; color: #1f2933; line-height: 1.7; padding: 32px 16px; }
+  .wrap { max-width: 860px; margin: 0 auto; }
+  header { background: linear-gradient(135deg, #14532d, #16a34a); color: #fff; border-radius: 16px; padding: 32px 36px; margin-bottom: 24px; }
+  header h1 { font-size: 24px; margin-bottom: 6px; }
+  header p { opacity: .85; font-size: 14px; }
+  .metrics { display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 12px; margin: 20px 0 26px; }
+  .metric { background: #fff; border-radius: 12px; padding: 16px; border: 1px solid #e3e8ee; }
+  .metric .num { font-size: 24px; font-weight: 700; color: #16a34a; }
+  .metric .label { font-size: 13px; color: #64748b; margin-top: 2px; }
+  section { background: #fff; border-radius: 16px; padding: 26px 30px; margin-bottom: 20px; border: 1px solid #e3e8ee; }
+  h2 { font-size: 18px; margin-bottom: 14px; padding-bottom: 8px; border-bottom: 2px solid #eef2f6; }
+  table { width: 100%; border-collapse: collapse; font-size: 14px; }
+  th, td { padding: 9px 12px; text-align: left; border-bottom: 1px solid #eef2f6; vertical-align: top; }
+  th { background: #f8fafc; font-weight: 600; }
+  .ok { color: #16a34a; font-weight: 700; }
+  .warn { color: #ea580c; font-weight: 700; }
+  code { background: #f1f5f9; padding: 1px 6px; border-radius: 5px; font-family: Consolas, monospace; font-size: 13px; }
+  .note { font-size: 12.5px; color: #94a3b8; margin-top: 10px; }
+</style>
+</head>
+<body>
+<div class="wrap">
+
+<header>
+  <h1>hermes-memory-governed 最终回归确认</h1>
+  <p>2026-08-28 01:47 · 「手动池 + shutdown(wait=False)」落地验证 · 38/38 测试通过</p>
+</header>
+
+<div class="metrics">
+  <div class="metric"><div class="num">0.50s</div><div class="label">超时实测（配置 0.5s，不阻塞）</div></div>
+  <div class="metric"><div class="num">✅</div><div class="label">重叠召回池间隔离</div></div>
+  <div class="metric"><div class="num">0</div><div class="label">线程泄漏</div></div>
+  <div class="metric"><div class="num">38/38</div><div class="label">测试通过（已修复 1 个过时测试）</div></div>
+</div>
+
+<section>
+  <h2>一、回归实测</h2>
+  <table>
+    <tr><th>场景</th><th>实测</th><th>结论</th></tr>
+    <tr><td>单次召回（慢任务 2s，超时 0.5s）</td><td>0.50s 返回 ['P4']</td><td class="ok">✅ 不阻塞</td></tr>
+    <tr><td>重叠召回（两个后台线程间隔 0.3s）</td><td>A: ['P4']，B: ['P4']，总 0.81s</td><td class="ok">✅ 池间隔离，无退化</td></tr>
+    <tr><td>线程泄漏（等慢任务完成后统计）</td><td>recall 线程残留 0</td><td class="ok">✅ 无泄漏</td></tr>
+    <tr><td>shutdown 后召回</td><td>串行降级正常，不崩溃</td><td class="ok">✅ 保持</td></tr>
+  </table>
+</section>
+
+<section>
+  <h2>二、本轮处理的一项遗留</h2>
+  <p><code>tests/_tmp/test_fixes.py::test_recall_pool_lifecycle</code> 是针对已删除的旧共享池实现写的（断言 <code>engine._pool</code> / <code>_get_pool()</code>），落地新方案后必然失败。已将其更新为匹配临时池新实现的版本（临时池召回 + shutdown 标志 + 串行降级），38/38 全绿。</p>
+  <p class="note">建议后续：tests/_tmp/ 目录改名合入正式测试集，并补充「重叠召回不为空」「LIKE 通配符转义」「pip 构建」三类场景的测试。</p>
+</section>
+
+<section>
+  <h2>三、项目最终状态</h2>
+  <table>
+    <tr><th>模块</th><th>状态</th></tr>
+    <tr><td>L1 手写层（缓存 + replace/remove）</td><td class="ok">✅</td></tr>
+    <tr><td>L2 语义层（向量 + 文本降级 + PyArrow schema + score 方向）</td><td class="ok">✅</td></tr>
+    <tr><td>L3 归档层（FTS5 英文 + LIKE 中文 + CJK 段拆分 + 混合合并 + 时间衰减 + 转义）</td><td class="ok">✅</td></tr>
+    <tr><td>L4 画像层（缓存 + 后台刷新）</td><td class="ok">✅</td></tr>
+    <tr><td>并行召回（独立池 + 非阻塞 + 去重 + 超时降级 + 串行兜底）</td><td class="ok">✅</td></tr>
+    <tr><td>Bridge 审核（追加去重 + secret 检测 + 白名单）</td><td class="ok">✅</td></tr>
+    <tr><td>构建（setuptools + wheel + package find）</td><td class="ok">✅</td></tr>
+  </table>
+  <p class="note">已知边缘（可接受）：「50%了」类 CJK+数字混合查询 0 hits；串行降级无超时限制（仅 shutdown 后触发）；L2 启用向量前需为存量 NULL vector 数据做 re-embed 迁移。</p>
+</section>
+
+</div>
+</body>
+</html>

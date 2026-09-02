@@ -1,0 +1,95 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>测试补全 + health 分离修复</title>
+<style>
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body { font-family: -apple-system, "Segoe UI", "Microsoft YaHei", sans-serif; background: #f6f7f9; color: #1f2933; line-height: 1.7; padding: 32px 16px; }
+  .wrap { max-width: 920px; margin: 0 auto; }
+  header { background: linear-gradient(135deg, #14532d, #16a34a); color: #fff; border-radius: 16px; padding: 32px 36px; margin-bottom: 24px; }
+  header h1 { font-size: 24px; margin-bottom: 6px; }
+  header p { opacity: .85; font-size: 14px; }
+  .metrics { display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 12px; margin: 20px 0 26px; }
+  .metric { background: #fff; border-radius: 12px; padding: 16px; border: 1px solid #e3e8ee; }
+  .metric .num { font-size: 24px; font-weight: 700; color: #16a34a; }
+  .metric .label { font-size: 13px; color: #64748b; margin-top: 2px; }
+  section { background: #fff; border-radius: 16px; padding: 26px 30px; margin-bottom: 20px; border: 1px solid #e3e8ee; }
+  h2 { font-size: 19px; margin-bottom: 14px; padding-bottom: 8px; border-bottom: 2px solid #eef2f6; }
+  table { width: 100%; border-collapse: collapse; font-size: 13.5px; }
+  th, td { padding: 9px 12px; text-align: left; border-bottom: 1px solid #eef2f6; vertical-align: top; }
+  th { background: #f8fafc; font-weight: 600; }
+  .ok { color: #16a34a; font-weight: 700; }
+  .bad { color: #dc2626; font-weight: 700; }
+  code { background: #f1f5f9; padding: 1px 6px; border-radius: 5px; font-family: Consolas, monospace; font-size: 12.5px; }
+  .note { font-size: 12.5px; color: #94a3b8; margin-top: 10px; }
+</style>
+</head>
+<body>
+<div class="wrap">
+
+<header>
+  <h1>测试补全 + health 分离修复</h1>
+  <p>2026-08-28 14:17–14:30 · 架构优化的「下一步」落地 · 59/59 测试全绿（新增 14 个）</p>
+</header>
+
+<div class="metrics">
+  <div class="metric"><div class="num">14</div><div class="label">新增架构回归测试</div></div>
+  <div class="metric"><div class="num">1</div><div class="label">遗留项闭环（health 分离）</div></div>
+  <div class="metric"><div class="num">1</div><div class="label">抓到 bug（命中率公式）</div></div>
+  <div class="metric"><div class="num">59/59</div><div class="label">测试全绿</div></div>
+</div>
+
+<section>
+  <h2>一、新增测试覆盖（tests/test_architecture.py，14 项）</h2>
+  <table>
+    <tr><th>类</th><th>测试</th><th>保护点</th></tr>
+    <tr><td>TestL3Idempotent</td><td>test_duplicate_sync_turn_archives_once / test_write_returns_rowid_map</td><td>L3 幂等写入（重复 sync_turn 不重复归档）+ hash 列填充 + rowid_map 返回</td></tr>
+    <tr><td>TestL2SourceRef</td><td>test_schema_has_source_rowid / test_config_driven_dim</td><td>L2 schema 含 source_rowid；向量维度由 config.vector.dim 驱动（128 维实测）</td></tr>
+    <tr><td>TestBridgeImport</td><td>test_approved_lands_in_l1 / test_import_skips_already_imported / test_auto_archive_at_limit</td><td>审查通过的候选落地 L1（未审查不落）；二次导入跳过；超限自动归档</td></tr>
+    <tr><td>TestConfigValidation</td><td>test_numeric_coercion / test_vector_config / test_vector_defaults</td><td>"800" → 800 强转；vector.model/dim 配置驱动；默认值</td></tr>
+    <tr><td>TestRecallStatus</td><td>test_hit_rate</td><td>prefetch 命中率计数（2 hits / 1 miss → 0.667）</td></tr>
+    <tr><td>TestL2Rebuild</td><td>test_dry_run</td><td>l2_rebuild --dry-run 从 L3 提取 facts 正常返回</td></tr>
+    <tr><td>TestL3Retention</td><td>test_prune_removes_old_and_keeps_fresh</td><td>超龄消息 + FTS 行同步清理，新鲜消息保留</td></tr>
+    <tr><td>TestL3ScoreDirection</td><td>test_strong_match_ranks_first</td><td>L3 min-max 方向（强匹配排第一）——防止第四次方向踩坑</td></tr>
+  </table>
+  <p class="note">说明：TestL2SourceRef 的两个测试使用 pytest.importorskip("lancedb")——无 lancedb 的环境（CI 基础环境）自动跳过，符合 lancedb 可选依赖的设计。</p>
+</section>
+
+<section>
+  <h2>二、health 脚本 warning/errors 分离（遗留项闭环）</h2>
+  <table>
+    <tr><th>改动</th><th>内容</th></tr>
+    <tr><td>HealthCheck</td><td>新增 errors 列表；check() 失败进 errors（不再混入 warnings）</td></tr>
+    <tr><td>summary()</td><td>JSON 报告新增 errors 计数字段</td></tr>
+    <tr><td>main() 退出码</td><td><code>return 1 if h.warnings else 0</code> → <code>return 1 if h.errors else 0</code>——warning（如 lancedb 未装、无候选文件）不再导致 daily pipeline 误报 FAIL</td></tr>
+    <tr><td>Config file 检查</td><td>配置文件不存在从「error」改为「warning」（项目用默认值可正常运行）</td></tr>
+  </table>
+  <p class="note">实测：构造 10 项检查 / 3 warnings / 0 errors 的场景 → exit 0（此前为 1）。cron 的 daily pipeline 不再因 warning 误报。</p>
+</section>
+
+<section>
+  <h2>三、测试过程中抓到的 bug（已修复）</h2>
+  <table>
+    <tr><th>bug</th><th>根因</th><th>修复</th></tr>
+    <tr><td><span class="bad">cache_hit_rate = 1.333（&gt;1）</span></td><td>recall_status 里公式写成 <code>hits / misses</code>（2/1=2.0），应为 <code>hits / total</code>（2/3=0.667）</td><td>修正公式 + 回归测试钉死（test_hit_rate 断言 2/3）</td></tr>
+    <tr><td><span class="bad">l2_rebuild 测试 SystemExit(2)</span></td><td>argparse 解析了 pytest 的全局 sys.argv</td><td>测试内设置 <code>sys.argv = ["l2_rebuild.py", "--dry-run"]</code> 并 finally 恢复</td></tr>
+  </table>
+  <p class="note">这正是补测试的价值：命中率公式是上一轮实施时的笔误，测试立刻暴露。</p>
+</section>
+
+<section>
+  <h2>四、最终状态</h2>
+  <table>
+    <tr><th>场景</th><th>结果</th></tr>
+    <tr><td>测试套件</td><td class="ok">59/59 通过（45 原有 + 14 新增）</td></tr>
+    <tr><td>并行召回四项 / L3 检索 / Bridge / 构建</td><td class="ok">无回归</td></tr>
+    <tr><td>架构优化 8 项</td><td class="ok">全部落地且有测试保护</td></tr>
+  </table>
+  <p class="note">剩余可选项：obsidian_sync 迁移（等确认在用 Obsidian）；「50%了」混合查询边缘场景。架构与测试层面暂无其他待办。</p>
+</section>
+
+</div>
+</body>
+</html>

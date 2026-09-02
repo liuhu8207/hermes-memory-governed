@@ -1,0 +1,5 @@
+# Hermes Memory Governed Plugin
+name: governed
+version: 0.1.0
+description: "Governed memory provider with L1-L4 layers, async recall, and Bridge review gate."
+kind: memory-provider

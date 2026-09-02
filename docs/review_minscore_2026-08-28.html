@@ -1,0 +1,110 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>MIN_SCORE 阈值核对：L3 全灭回归与归一化修复</title>
+<style>
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body { font-family: -apple-system, "Segoe UI", "Microsoft YaHei", sans-serif; background: #f6f7f9; color: #1f2933; line-height: 1.7; padding: 32px 16px; }
+  .wrap { max-width: 920px; margin: 0 auto; }
+  header { background: linear-gradient(135deg, #7c2d12, #ea580c); color: #fff; border-radius: 16px; padding: 32px 36px; margin-bottom: 24px; }
+  header h1 { font-size: 24px; margin-bottom: 6px; }
+  header p { opacity: .85; font-size: 14px; }
+  .metrics { display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 12px; margin: 20px 0 26px; }
+  .metric { background: #fff; border-radius: 12px; padding: 16px; border: 1px solid #e3e8ee; }
+  .metric .num { font-size: 24px; font-weight: 700; }
+  .metric .label { font-size: 13px; color: #64748b; margin-top: 2px; }
+  .metric.green .num { color: #16a34a; }
+  .metric.red .num { color: #dc2626; }
+  section { background: #fff; border-radius: 16px; padding: 26px 30px; margin-bottom: 20px; border: 1px solid #e3e8ee; }
+  h2 { font-size: 19px; margin-bottom: 14px; padding-bottom: 8px; border-bottom: 2px solid #eef2f6; }
+  table { width: 100%; border-collapse: collapse; font-size: 14px; }
+  th, td { padding: 9px 12px; text-align: left; border-bottom: 1px solid #eef2f6; vertical-align: top; }
+  th { background: #f8fafc; font-weight: 600; }
+  .ok { color: #16a34a; font-weight: 700; }
+  .bad { color: #dc2626; font-weight: 700; }
+  .warn { color: #ea580c; font-weight: 700; }
+  .issue { border-left: 4px solid #dc2626; padding: 12px 16px; margin-bottom: 14px; background: #fafbfc; border-radius: 0 10px 10px 0; }
+  .issue.green { border-left-color: #16a34a; }
+  .issue .title { font-weight: 700; margin-bottom: 6px; }
+  .issue .loc { font-size: 12px; color: #64748b; font-family: Consolas, monospace; }
+  .issue .detail { font-size: 14px; color: #475569; }
+  .evidence { background: #f1f5f9; border-radius: 8px; padding: 10px 14px; font-family: Consolas, monospace; font-size: 12.5px; margin-top: 8px; white-space: pre-wrap; color: #334155; }
+  code { background: #f1f5f9; padding: 1px 6px; border-radius: 5px; font-family: Consolas, monospace; font-size: 13px; }
+  .note { font-size: 12.5px; color: #94a3b8; margin-top: 10px; }
+</style>
+</head>
+<body>
+<div class="wrap">
+
+<header>
+  <h1>MIN_SCORE 阈值核对：L3 全灭回归与归一化修复</h1>
+  <p>2026-08-28 11:56 · 阈值对 L2 正确但对 L3 是严重回归 · 已修复（L3 归一化）· 45/45 测试 + 召回回归全过</p>
+</header>
+
+<div class="metrics">
+  <div class="metric red"><div class="num">❌</div><div class="label">修复前：L3 被 100% 过滤</div></div>
+  <div class="metric green"><div class="num">✅</div><div class="label">修复后：L3 2/2 保留</div></div>
+  <div class="metric green"><div class="num">45/45</div><div class="label">测试 + 召回回归</div></div>
+</div>
+
+<section>
+  <h2>一、核对结论</h2>
+  <p>MIN_SCORE 阈值对 L2 是正确的优化（实测 0.9 保留 / 0.05 过滤），但 <b>对 L3 是严重回归</b>：L3 分数是 FTS5 rank 绝对值 × 时间衰减，实测量级 1e-6~1e-7，全部低于 0.1 阈值 → <b>format_recall 输出直接变空，L3 历史记忆层被 100% 过滤</b>。混合场景下只剩 L2。已通过 L3 分数归一化修复（本轮代码改动），并顺带解决了此前遗留的「L2/L3 分数量纲不可比」问题。</p>
+</section>
+
+<section>
+  <h2>二、修复前 vs 修复后</h2>
+  <table>
+    <tr><th>场景</th><th>修复前</th><th>修复后</th></tr>
+    <tr><td>L3 原始分数</td><td>9.96e-07 / 8.95e-07（全部 &lt; 0.1）</td><td>归一化后 1.0 / 0.899（保留衰减相对差异：新 &gt; 旧）</td></tr>
+    <tr><td>format_recall L3 保留</td><td class="bad">0 / 2（输出为空）</td><td class="ok">2 / 2</td></tr>
+    <tr><td>混合场景（L2 + L3）</td><td class="bad">只剩 L2，L3 全灭</td><td class="ok">L2 + L3 共存</td></tr>
+    <tr><td>L2 阈值行为（0.9 过 / 0.05 滤）</td><td class="ok">正常</td><td class="ok">正常（不受影响）</td></tr>
+  </table>
+</section>
+
+<section>
+  <h2>三、根因与修复</h2>
+  <div class="issue">
+    <div class="title"><span class="bad">根因</span>L3 与 L2 分数量纲相差 6 个数量级</div>
+    <div class="loc">_recall.py :: _search_l3（FTS5 rank 绝对值）/ format_recall（统一 MIN_SCORE=0.1）</div>
+    <div class="detail">
+      FTS5 的 bm25 rank 对短文本是 1e-6 量级的负数，取绝对值乘时间衰减后更小；L2 的 score 是 0~1。统一阈值 0.1 必然把 L3 全部过滤。这个量纲问题此前已作为遗留项提出（「L2/L3 分数量纲不可比，合并排序失真」），本次阈值改动让它从「排序失真」升级为「整层丢失」。
+    </div>
+  </div>
+  <div class="issue green">
+    <div class="title"><span class="ok">修复（本轮已落地并实测）</span>_search_l3 返回前做 max 归一化</div>
+    <div class="loc">_recall.py :: _search_l3（results 返回前）</div>
+    <pre class="code" style="background:#1f2933;color:#e5e7eb;border-radius:8px;padding:14px 16px;font-family:Consolas,monospace;font-size:12.5px;"># Normalize scores to 0~1 (max -> 1.0) so L3 scores are
+# comparable with L2 scores and survive MIN_SCORE filtering.
+if results:
+    max_score = max(r.score for r in results)
+    if max_score &gt; 0:
+        for r in results:
+            r.score = r.score / max_score</pre>
+    <div class="detail">
+      归一化保留 FTS5 排序与时间衰减的相对差异（新消息 1.0 &gt; 旧消息 0.899），同时把 L3 映射到与 L2 可比的 0~1 区间——统一阈值从此安全，且 L2/L3 混排不再失真（顺带闭环了遗留的量纲问题）。
+    </div>
+  </div>
+  <div class="issue" style="border-left-color:#eab308">
+    <div class="title"><span class="warn">责任说明</span>此回归源于我此前建议的疏漏</div>
+    <div class="detail">上轮我建议「加 score 阈值过滤」时只考虑了 L2 的 0~1 分数，没有明确指出 L3 分数是 1e-6 量级、必须先归一化才能用统一阈值——这次回归是我建议不完整导致的，抱歉。本轮已把归一化补上，阈值方案现在是完整的。</div>
+  </div>
+</section>
+
+<section>
+  <h2>四、回归确认</h2>
+  <table>
+    <tr><th>场景</th><th>结果</th></tr>
+    <tr><td>测试套件</td><td class="ok">45/45 通过</td></tr>
+    <tr><td>并行召回：不阻塞 / 池间隔离 / 无泄漏 / shutdown 降级</td><td class="ok">四项全过</td></tr>
+    <tr><td>L3 五类查询</td><td class="ok">与上轮一致（3/3/1/5/0 hits）</td></tr>
+  </table>
+  <p class="note">注：_search_l3_like 路径分数为 0.5×衰减（约 0.5），在阈值之上不受影响；混合查询时 FTS5 归一化分数（最高 1.0）会排在 LIKE 分数（0.5）之前，属可接受的排序细节。建议给 format_recall 的阈值行为补一个「L3 真实分数不被过滤」的回归测试。</p>
+</section>
+
+</div>
+</body>
+</html>

@@ -1,0 +1,114 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>min-max 归一化方案核对：方向再次颠倒（已修复）</title>
+<style>
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body { font-family: -apple-system, "Segoe UI", "Microsoft YaHei", sans-serif; background: #f6f7f9; color: #1f2933; line-height: 1.7; padding: 32px 16px; }
+  .wrap { max-width: 920px; margin: 0 auto; }
+  header { background: linear-gradient(135deg, #7c2d12, #ea580c); color: #fff; border-radius: 16px; padding: 32px 36px; margin-bottom: 24px; }
+  header h1 { font-size: 24px; margin-bottom: 6px; }
+  header p { opacity: .85; font-size: 14px; }
+  .metrics { display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 12px; margin: 20px 0 26px; }
+  .metric { background: #fff; border-radius: 12px; padding: 16px; border: 1px solid #e3e8ee; }
+  .metric .num { font-size: 24px; font-weight: 700; }
+  .metric .label { font-size: 13px; color: #64748b; margin-top: 2px; }
+  .metric.green .num { color: #16a34a; }
+  .metric.red .num { color: #dc2626; }
+  section { background: #fff; border-radius: 16px; padding: 26px 30px; margin-bottom: 20px; border: 1px solid #e3e8ee; }
+  h2 { font-size: 19px; margin-bottom: 14px; padding-bottom: 8px; border-bottom: 2px solid #eef2f6; }
+  table { width: 100%; border-collapse: collapse; font-size: 14px; }
+  th, td { padding: 9px 12px; text-align: left; border-bottom: 1px solid #eef2f6; vertical-align: top; }
+  th { background: #f8fafc; font-weight: 600; }
+  .ok { color: #16a34a; font-weight: 700; }
+  .bad { color: #dc2626; font-weight: 700; }
+  .warn { color: #ea580c; font-weight: 700; }
+  .issue { border-left: 4px solid #dc2626; padding: 12px 16px; margin-bottom: 14px; background: #fafbfc; border-radius: 0 10px 10px 0; }
+  .issue.green { border-left-color: #16a34a; }
+  .issue .title { font-weight: 700; margin-bottom: 6px; }
+  .issue .loc { font-size: 12px; color: #64748b; font-family: Consolas, monospace; }
+  .issue .detail { font-size: 14px; color: #475569; }
+  .evidence { background: #f1f5f9; border-radius: 8px; padding: 10px 14px; font-family: Consolas, monospace; font-size: 12.5px; margin-top: 8px; white-space: pre-wrap; color: #334155; }
+  code { background: #f1f5f9; padding: 1px 6px; border-radius: 5px; font-family: Consolas, monospace; font-size: 13px; }
+  .note { font-size: 12.5px; color: #94a3b8; margin-top: 10px; }
+</style>
+</head>
+<body>
+<div class="wrap">
+
+<header>
+  <h1>min-max 归一化方案核对：方向再次颠倒（已修复）</h1>
+  <p>2026-08-28 12:27 · 识图确认修复内容 · 实测发现方向颠倒 + floor 位置错误 · 已直接修复 · 45/45 测试 + 召回回归全过</p>
+</header>
+
+<div class="metrics">
+  <div class="metric red"><div class="num">2</div><div class="label">实测问题（已修复）</div></div>
+  <div class="metric green"><div class="num">✅</div><div class="label">修复后：强匹配 1.0 排第一</div></div>
+  <div class="metric green"><div class="num">45/45</div><div class="label">测试 + 召回回归</div></div>
+</div>
+
+<section>
+  <h2>一、总体结论</h2>
+  <p>min-max 归一化的思路本身可行（组内相对比较、天然有界），但实现再次犯了方向错误：<code>score = 1.0 - (raw_rank - min_rank)/range</code> 让 abs(rank) <b>最大</b>（最相关）的得 0.0、<b>最小</b>（最不相关）的得 1.0——这是连续第三次在 FTS5 rank 方向上犯错（1/(1+x) 递减 → min-max 反向）。实测「新的弱匹配」压过「旧的强匹配」74000 倍。另有两处次要问题。已直接修复为 <code>score = (raw_rank - min_rank)/range</code>（最强=1.0）并移除位置错误的 floor。</p>
+</section>
+
+<section>
+  <h2>二、实测问题</h2>
+
+  <div class="issue">
+    <div class="title"><span class="bad">问题 1（严重）</span>方向颠倒：最相关得 0.0，最不相关得 1.0</div>
+    <div class="loc">_recall.py :: _search_l3（score = 1.0 - (raw_rank - min_rank) / rank_range）</div>
+    <div class="detail">
+      FTS5 bm25 语义：rank 为负，<b>绝对值越大越相关</b>。min_rank 是组内最小 abs（最不相关），公式却把「raw_rank = min」映射到 1.0、「raw_rank = max（最相关）」映射到 0.0——注释「best result (smallest |rank|)」同样写反。叠加尾部 max 归一化与 floor，实测「90 天前的强匹配」得分 0.000014，「现在的弱匹配」得分 1.0，<b>弱压强 74000 倍</b>。
+    </div>
+    <div class="evidence">修复前实测：
+[旧(90d) 强匹配(python×4)] score=0.000014
+[新(0d)  弱匹配(python×1)] score=1.000000
+弱/强 比: 74056.6x ← 排序颠倒</div>
+  </div>
+
+  <div class="issue">
+    <div class="title"><span class="bad">问题 2</span>floor 位置错误，破坏时间衰减语义</div>
+    <div class="loc">同上（score = max(score, 0.1) 在 score * age_factor 之前）</div>
+    <div class="detail">
+      floor 的目的是「保证组内最强能过 MIN_SCORE」，但尾部 max 归一化已经保证组内最强 → 1.0（必过阈值），floor 完全多余；且它把组内最差从 0.0 抬到 0.1，与 age_factor 相乘后再被 max 归一化，导致「新的 floor 噪音」压过「旧的强匹配」——衰减的相对语义被破坏。修复：删除该 floor。
+    </div>
+  </div>
+
+  <div class="issue" style="border-left-color:#eab308">
+    <div class="title"><span class="warn">轻微</span>单条命中 0.8 被尾部归一化覆盖为 1.0</div>
+    <div class="detail">rank_range=0 时设计给 0.8（等价命中中间分），但尾部 max 归一化把它拉到 1.0。单条命中给 1.0 语义上也说得通（组内最强），可接受；若要保留 0.8 意图，需跳过尾部归一化或改用固定分。</div>
+  </div>
+</section>
+
+<section>
+  <h2>三、已落地的修复（实测）</h2>
+  <div class="issue green">
+    <div class="title"><span class="ok">修复后</span>方向正确，强匹配重回首位</div>
+    <div class="evidence">修复后实测：
+[旧(90d) 强匹配(python×4)] score=1.000000 ← 排第一
+[新(0d)  弱匹配(python×1)] score=0.000000 ← 组内最差被裁剪
+单条命中 → 1.0</div>
+    <div class="detail">
+      修复内容：① 公式改为 <code>score = (raw_rank - min_rank) / rank_range</code>（最强=1.0，最弱=0.0）；② 删除 age_factor 前的 floor（尾部 max 归一化已兜底）。语义说明：min-max 是组内相对比较，「组内最差恒 0 分、被 MIN_SCORE 裁剪」是固有特性——每次查询过滤掉组内垫底的一条，影响可接受。
+    </div>
+  </div>
+</section>
+
+<section>
+  <h2>四、回归确认</h2>
+  <table>
+    <tr><th>场景</th><th>结果</th></tr>
+    <tr><td>测试套件</td><td class="ok">45/45 通过</td></tr>
+    <tr><td>并行召回四项（不阻塞 0.51s / 池间隔离 / 0 泄漏 / shutdown 降级）</td><td class="ok">全过</td></tr>
+    <tr><td>MIN_SCORE 对 L2（0.9 保留 / 0.05 过滤）</td><td class="ok">行为不变</td></tr>
+    <tr><td>L3 五类查询</td><td class="ok">功能正常（分数含义已变为组内相对分）</td></tr>
+  </table>
+  <p class="note">重要提醒：这是 FTS5 rank 方向第三次踩坑（1/(1+x) 递减 → min-max 反向公式 → 反向注释）。根本原因是「abs(rank) 越大越相关」与直觉相反。建议在 _recall.py 顶部加一条常量注释钉死这个语义，并为「强匹配排第一」补一个回归测试。</p>
+</section>
+
+</div>
+</body>
+</html>

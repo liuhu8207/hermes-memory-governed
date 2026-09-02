@@ -1,0 +1,71 @@
+{
+  "scripts_dir": "~/.hermes/scripts",
+  "wiki_dir": "~/wiki",
+  "recall": {
+    "l1_budget_tokens": 800,
+    "l23_budget_tokens": 1200,
+    "prefetch_ttl_seconds": 30,
+    "l3_time_decay_hours": 168,
+    "parallel_timeout_seconds": 2.0
+  },
+  "sync": {
+    "l3_write": "sync",
+    "l2_write": "async",
+    "extract_async": true
+  },
+  "persona": {
+    "incremental": true,
+    "incremental_interval_minutes": 30
+  },
+  "tencent_extract": {
+    "enabled": false,
+    "confidence_threshold": 0.5
+  },
+  "mermaid_compress": {
+    "enabled": false,
+    "canvas_max_tokens": 500
+  },
+  "vector": {
+    "backend": "auto",
+    "model": "BAAI/bge-small-zh-v1.5",
+    "dim": 512
+  },
+  "embedding": {
+    "provider": "",
+    "base_url": "",
+    "api_key_env": "",
+    "model": "",
+    "dimensions": 1024
+  },
+  "reranking": {
+    "provider": "siliconflow",
+    "api_key_env": "SILICONFLOW_API_KEY",
+    "base_url": "https://api.siliconflow.cn/v1",
+    "model": "BAAI/bge-reranker-v2-m3",
+    "top_n": 10
+  },
+  "kb": {
+    "top_k": 10,
+    "min_score": 0.0,
+    "semantic_enabled": true,
+    "keyword_enabled": true,
+    "confidence_threshold": 0.7,
+    "autolink_related": true
+  },
+  "asr": {
+    "provider": "siliconflow",
+    "api_key_env": "SILICONFLOW_API_KEY",
+    "base_url": "https://api.siliconflow.cn/v1",
+    "model": "XingChenAGI/XingChenASR-V3.2-Ultra",
+    "language": ""
+  },
+  "synthesis": {
+    "enabled": false,
+    "provider": "",
+    "base_url": "",
+    "api_key_env": "",
+    "model": "",
+    "max_candidates": 5,
+    "require_durable_signal": true
+  }
+}

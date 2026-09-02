@@ -1,0 +1,87 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>全链路压测报告：多轮生命周期 + bug 修复</title>
+<style>
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body { font-family: -apple-system, "Segoe UI", "Microsoft YaHei", sans-serif; background: #f6f7f9; color: #1f2933; line-height: 1.7; padding: 32px 16px; }
+  .wrap { max-width: 940px; margin: 0 auto; }
+  header { background: linear-gradient(135deg, #14532d, #16a34a); color: #fff; border-radius: 16px; padding: 32px 36px; margin-bottom: 24px; }
+  header h1 { font-size: 24px; margin-bottom: 6px; }
+  header p { opacity: .85; font-size: 14px; }
+  .metrics { display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 12px; margin: 20px 0 26px; }
+  .metric { background: #fff; border-radius: 12px; padding: 16px; border: 1px solid #e3e8ee; }
+  .metric .num { font-size: 24px; font-weight: 700; color: #16a34a; }
+  .metric .label { font-size: 13px; color: #64748b; margin-top: 2px; }
+  section { background: #fff; border-radius: 16px; padding: 26px 30px; margin-bottom: 20px; border: 1px solid #e3e8ee; }
+  h2 { font-size: 19px; margin-bottom: 14px; padding-bottom: 8px; border-bottom: 2px solid #eef2f6; }
+  h3 { font-size: 15.5px; margin: 16px 0 8px; }
+  table { width: 100%; border-collapse: collapse; font-size: 13.5px; }
+  th, td { padding: 9px 12px; text-align: left; border-bottom: 1px solid #eef2f6; vertical-align: top; }
+  th { background: #f8fafc; font-weight: 600; }
+  .ok { color: #16a34a; font-weight: 700; }
+  .bad { color: #dc2626; font-weight: 700; }
+  .warn { color: #ea580c; font-weight: 700; }
+  code { background: #f1f5f9; padding: 1px 6px; border-radius: 5px; font-family: Consolas, monospace; font-size: 12.5px; }
+  .note { font-size: 12.5px; color: #94a3b8; margin-top: 10px; }
+</style>
+</head>
+<body>
+<div class="wrap">
+
+<header>
+  <h1>全链路压测报告：多轮生命周期 × 3 + bug 修复</h1>
+  <p>2026-08-29 23:53 · 完整生命周期压测 3 轮 · 发现并修复 1 个真实 bug · 64/64 测试全绿</p>
+</header>
+
+<div class="metrics">
+  <div class="metric"><div class="num">7</div><div class="label">压测 Phase 全 PASS</div></div>
+  <div class="metric"><div class="num">1</div><div class="label">真实 bug 发现并修复</div></div>
+  <div class="metric"><div class="num">64/64</div><div class="label">测试回归</div></div>
+  <div class="metric"><div class="num">✅</div><div class="label">构建通过</div></div>
+</div>
+
+<section>
+  <h2>一、压测设计</h2>
+  <p>模拟真实使用：初始化（migrations 自动跑）→ 5 轮 sync_turn（含跨 session 重复内容、45 天前旧会话）→ promote ×2 → dream ×3 → knowledge_sync ×2 → retention → shutdown 后 recall/health。每 phase 独立 try/except + argv 隔离，数据一致性用独立连接复核（规避 LanceDB 快照隔离误判）。</p>
+</section>
+
+<section>
+  <h2>二、压测结果（7/7 Phase PASS）</h2>
+  <table>
+    <tr><th>Phase</th><th>场景</th><th>结果</th></tr>
+    <tr><td>0</td><td>初始化（migrations 自动跑）</td><td class="ok">✅ state 文件生成</td></tr>
+    <tr><td>1</td><td>5 轮 sync_turn（10 消息，含跨 session 重复）</td><td class="ok">✅ L3 全部归档</td></tr>
+    <tr><td>2</td><td>promote ×2（去重检查）</td><td class="ok">✅ 二次运行候选数不变（1→1）；重复模式正确晋升</td></tr>
+    <tr><td>3</td><td>dream ×3（去重检查）</td><td class="ok">✅ 修复后三次运行 dream facts 稳定 1 条（1→1→1）</td></tr>
+    <tr><td>4</td><td>knowledge_sync ×2（幂等 + 双向链接）</td><td class="ok">✅ 二次运行无新增笔记；链接区生成</td></tr>
+    <tr><td>5</td><td>retention 后 promote/dream</td><td class="ok">✅ 数据被删后不崩</td></tr>
+    <tr><td>6</td><td>shutdown 后 recall + health</td><td class="ok">✅ 串行降级正常</td></tr>
+  </table>
+</section>
+
+<section>
+  <h2>三、发现并修复的真实 bug</h2>
+  <table>
+    <tr><th>bug</th><th>根因</th><th>修复</th></tr>
+    <tr><td><span class="bad">dream 重复写入</span></td><td>memory_dream 无去重机制——同一旧会话每次运行 dream 都会重复写入一条 dream fact（0 → 2，第三次会变 4）。压测第 1 轮就抓到。</td><td>引入 StateManager 去重：每个 session 只写一次 dream fact（状态存 $HERMES_HOME/state/.dream_state.json）。修复后三次运行稳定 1 条。</td></tr>
+  </table>
+  <p class="note">附带确认的一个架构特性（非 bug）：L2 无内容级去重——跨 session 的相同内容会各写一条 L2 fact（session 不同，provenance 不同）。这是设计取舍（保留来源上下文），若未来需要可加归一化去重或检索期合并。</p>
+</section>
+
+<section>
+  <h2>四、回归确认</h2>
+  <table>
+    <tr><th>场景</th><th>结果</th></tr>
+    <tr><td>测试套件</td><td class="ok">64/64 通过（含本轮全部新功能测试）</td></tr>
+    <tr><td>并行召回四项（不阻塞 / 隔离 / 无泄漏 / 降级）</td><td class="ok">全过（上轮验证）</td></tr>
+    <tr><td>pip wheel 构建</td><td class="ok">Would install 成功</td></tr>
+  </table>
+  <p class="note">压测脚本本身的经验：LanceDB 表对象持有版本快照，跨连接写入后必须用新连接读取（否则读到旧视图误判为「写入失败」）；pytest 与独立脚本的 sys.argv 需隔离。</p>
+</section>
+
+</div>
+</body>
+</html>

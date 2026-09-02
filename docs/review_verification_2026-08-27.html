@@ -1,0 +1,153 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>hermes-memory-governed 修复验证报告</title>
+<style>
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body { font-family: -apple-system, "Segoe UI", "Microsoft YaHei", sans-serif; background: #f6f7f9; color: #1f2933; line-height: 1.7; padding: 32px 16px; }
+  .wrap { max-width: 960px; margin: 0 auto; }
+  header { background: linear-gradient(135deg, #14532d, #16a34a); color: #fff; border-radius: 16px; padding: 36px 40px; margin-bottom: 28px; }
+  header h1 { font-size: 26px; margin-bottom: 8px; }
+  header p { opacity: .85; font-size: 14px; }
+  .metrics { display: grid; grid-template-columns: repeat(auto-fit, minmax(160px, 1fr)); gap: 14px; margin: 22px 0 30px; }
+  .metric { background: #fff; border-radius: 12px; padding: 18px; border: 1px solid #e3e8ee; }
+  .metric .num { font-size: 30px; font-weight: 700; }
+  .metric .label { font-size: 13px; color: #64748b; margin-top: 4px; }
+  .metric.green .num { color: #16a34a; }
+  .metric.orange .num { color: #ea580c; }
+  .metric.red .num { color: #dc2626; }
+  .metric.blue .num { color: #2563eb; }
+  section { background: #fff; border-radius: 16px; padding: 28px 32px; margin-bottom: 24px; border: 1px solid #e3e8ee; }
+  h2 { font-size: 20px; margin-bottom: 16px; padding-bottom: 10px; border-bottom: 2px solid #eef2f6; }
+  table { width: 100%; border-collapse: collapse; margin: 14px 0; font-size: 14px; }
+  th, td { padding: 10px 12px; text-align: left; border-bottom: 1px solid #eef2f6; vertical-align: top; }
+  th { background: #f8fafc; font-weight: 600; }
+  .ok { color: #16a34a; font-weight: 700; }
+  .bad { color: #dc2626; font-weight: 700; }
+  .warn { color: #ea580c; font-weight: 700; }
+  .issue { border-left: 4px solid #e2e8f0; padding: 12px 16px; margin-bottom: 14px; background: #fafbfc; border-radius: 0 10px 10px 0; }
+  .issue.red { border-left-color: #dc2626; }
+  .issue.orange { border-left-color: #ea580c; }
+  .issue.green { border-left-color: #16a34a; }
+  .issue .title { font-weight: 700; margin-bottom: 6px; }
+  .issue .loc { font-size: 12px; color: #64748b; font-family: Consolas, monospace; }
+  .issue .detail { font-size: 14px; color: #475569; }
+  .evidence { background: #f1f5f9; border-radius: 8px; padding: 10px 14px; font-family: Consolas, monospace; font-size: 12.5px; margin-top: 8px; white-space: pre-wrap; color: #334155; }
+  code { background: #f1f5f9; padding: 1px 6px; border-radius: 5px; font-family: Consolas, monospace; font-size: 13px; }
+  .note { font-size: 12.5px; color: #94a3b8; margin-top: 8px; }
+</style>
+</head>
+<body>
+<div class="wrap">
+
+<header>
+  <h1>hermes-memory-governed 修复验证报告</h1>
+  <p>对 2026-08-27 修复总结的逐项实测核对 · 环境：Windows + Python 3.13 + lancedb 0.37.1 + setuptools 68.2.2 · 28/28 测试通过</p>
+</header>
+
+<div class="metrics">
+  <div class="metric green"><div class="num">6</div><div class="label">修复项验证有效</div></div>
+  <div class="metric orange"><div class="num">2</div><div class="label">修复不完整（仍不可用）</div></div>
+  <div class="metric red"><div class="num">2</div><div class="label">严重缺陷漏修</div></div>
+  <div class="metric blue"><div class="num">1</div><div class="label">新引入 bug</div></div>
+</div>
+
+<section>
+  <h2>一、总体结论</h2>
+  <p>修复总结声称「4 个严重缺陷全部修复」，但实测后发现：实际修复的 4 项与我此前报告中的 4 项严重缺陷并非同一组。修好的部分是真实有效的（L2 建表、L3 时间衰减、L1 replace 语义、FTS 转义），但 <b>parallel_recall 超时与 pyproject 构建配置这两个严重缺陷完全没动</b>，且 L2 向量搜索路径仍不可用、FTS5 中文检索的修复无效、还引入了一个排序方向反转的新 bug。28 个测试全过是因为测试仍未覆盖这些链路。</p>
+</section>
+
+<section>
+  <h2>二、逐项核对</h2>
+  <table>
+    <tr><th>#</th><th>修复总结声称</th><th>实测结果</th><th>状态</th></tr>
+    <tr><td>1</td><td>L2 建表改为 PyArrow schema</td><td>建表、写入、读取均正常</td><td class="ok">✅ 有效</td></tr>
+    <tr><td>2</td><td>L2 三级降级（无 embedding → 文本匹配）</td><td>文本降级检索实测命中（"python" → 1 条）</td><td class="ok">✅ 有效（部分）</td></tr>
+    <tr><td>3</td><td>L2 向量搜索（sentence-transformers）</td><td>表 schema 无 vector 列 → search 抛 ValueError 被吞；且装了 embedding 后不降级文本 → L2 全空</td><td class="bad">❌ 不可用</td></tr>
+    <tr><td>4</td><td>L3 时间衰减读取真实 timestamp</td><td>实测：新(1h) score 0.000001 &gt; 旧(30d) 0.000000，衰减生效</td><td class="ok">✅ 有效</td></tr>
+    <tr><td>5</td><td>FTS5 特殊字符转义</td><td>"、-、( 等不再崩溃</td><td class="ok">✅ 有效</td></tr>
+    <tr><td>6</td><td>FTS5 中文检索（双引号包裹对 CJK 更友好）</td><td>实测「记得」「咖啡」均 0 hits — 双引号是短语匹配，无法解决中文整句 token 问题</td><td class="bad">❌ 无效</td></tr>
+    <tr><td>7</td><td>L1 replace 语义（old_text 定位替换）</td><td>_replace_in_file / _remove_from_file 已实现，逻辑正确</td><td class="ok">✅ 有效</td></tr>
+    <tr><td>8</td><td>Bridge secret 先检查后 redact</td><td>当前顺序正确；但此顺序在审查时已是如此（总结描述与代码事实有出入）</td><td class="ok">✅ 现状正确</td></tr>
+    <tr><td>9</td><td>—（总结未提及）</td><td>parallel_recall 超时：实测仍抛未捕获 TimeoutError、配置 0.5s 实际阻塞 3s</td><td class="bad">❌ 漏修</td></tr>
+    <tr><td>10</td><td>—（总结未提及）</td><td>pyproject.toml 仍指向 setuptools.backends._legacy，pip install 实测 BackendUnavailable</td><td class="bad">❌ 漏修</td></tr>
+  </table>
+</section>
+
+<section>
+  <h2>三、仍存在的问题</h2>
+
+  <div class="issue red">
+    <div class="title"><span class="bad">严重</span>L2 向量搜索路径仍不可用，且「装了 embedding 反而更差」</div>
+    <div class="loc">_sync.py :: _init_l2（写入端 schema 无 vector 列）· _recall.py :: _search_l2 / _search_l2_vector</div>
+    <div class="detail">
+      写入端建表 schema 只有 content/category/source/timestamp 四个字符串列，没有 vector 列；<code>_index_l2</code> 写入时也不生成向量。<br>
+      <b>关键漏洞</b>：_search_l2 只在 <code>_embed_fn is None</code> 时走文本降级。一旦装了 sentence-transformers（_embed_fn 非 None），就走向量搜索 → 无 vector 列抛 ValueError → 被 except 吞掉返回空 → <b>且不会降级到文本</b> → L2 全空。
+    </div>
+    <div class="evidence">实测（伪造 embed_fn 模拟已装 embedding）：
+search('python') -> 0 条（表无 vector 列）
+→ 结论：安装 embedding 依赖后 L2 从「文本可用」变成「完全不可用」</div>
+  </div>
+
+  <div class="issue red">
+    <div class="title"><span class="bad">严重</span>parallel_recall 超时保护仍未修复（漏修）</div>
+    <div class="loc">_recall.py :: parallel_recall</div>
+    <div class="detail">
+      与审查时完全一致：as_completed 超时抛 TimeoutError 无捕获（governed_search 工具会崩）；ThreadPoolExecutor with 退出 shutdown(wait=True) 阻塞等慢任务。
+    </div>
+    <div class="evidence">实测：parallel_timeout_seconds=0.5，模拟 L2 慢 3s → 3.00s 后抛 TimeoutError 未捕获</div>
+  </div>
+
+  <div class="issue red">
+    <div class="title"><span class="bad">严重</span>pyproject.toml 构建配置仍未修复（漏修）</div>
+    <div class="loc">pyproject.toml :: build-system.backend</div>
+    <div class="detail">仍指向不存在的 <code>setuptools.backends._legacy:_Backend</code>，项目依然无法 pip 安装。</div>
+    <div class="evidence">实测：pip install . --dry-run → BackendUnavailable: Cannot import 'setuptools.backends._legacy'</div>
+  </div>
+
+  <div class="issue red">
+    <div class="title"><span class="bad">新 bug</span>L2 向量检索排序方向反转</div>
+    <div class="loc">_recall.py :: _search_l2_vector（score = r.get("_distance")）</div>
+    <div class="detail">
+      LanceDB 的 <code>_distance</code> 是距离：<b>越小越相似</b>。代码把 distance 直接当 score，而 parallel_recall 按 score <b>降序</b> → 最相似的结果排最后。应改为 <code>1/(1+distance)</code> 或 <code>-distance</code>。
+    </div>
+    <div class="evidence">实测：三条记录距离 0.000 / 0.320 / 8.000（LanceDB 返回已按距离升序）
+score 降序重排后 → 8.000（最不相似）排第一 → 顺序颠倒确认</div>
+  </div>
+
+  <div class="issue orange">
+    <div class="title"><span class="warn">高</span>FTS5 中文检索修复无效</div>
+    <div class="loc">_recall.py :: _build_fts_query</div>
+    <div class="detail">
+      双引号包裹每个 term 是「短语精确匹配」，FTS5 默认分词器把中文整句当单个 token，短语匹配仍无法命中子串。「咖啡」匹配不到「我记得用户喜欢喝咖啡」——与修复前结果完全一致。需要 jieba 分词或 FTS5 trigram tokenizer。
+    </div>
+    <div class="evidence">实测：query='记得' -> 0 hits；query='咖啡' -> 0 hits（库中含「我记得用户喜欢喝咖啡」）</div>
+  </div>
+
+  <div class="issue orange">
+    <div class="title"><span class="warn">高</span>L3 分数量纲问题仍存在</div>
+    <div class="loc">_recall.py :: _search_l3</div>
+    <div class="detail">时间衰减生效后分数更小：FTS5 rank 绝对值约 10^-6 量级，乘以衰减系数后更小，与 L2 的 0~1 分数量纲完全不可比，混排后 L3 几乎不会出现在 L2 之前（或反之），分层排序失去意义。</div>
+  </div>
+</section>
+
+<section>
+  <h2>四、剩余修复清单（按优先级）</h2>
+  <table>
+    <tr><th>优先级</th><th>事项</th><th>工作量</th></tr>
+    <tr><td>P0</td><td>pyproject.toml backend 改为 <code>setuptools.build_meta:__legacy__</code></td><td>5 分钟</td></tr>
+    <tr><td>P0</td><td>parallel_recall 捕获 TimeoutError + 不阻塞等待（线程池 daemon 化）</td><td>30 分钟</td></tr>
+    <tr><td>P0</td><td>L2 写入端生成 embedding 存 vector 列（schema 加 vector 字段）；vector 失败时降级文本而非返回空</td><td>2-4 小时</td></tr>
+    <tr><td>P1</td><td>L2 score 改为 <code>1/(1+distance)</code>，修正排序方向</td><td>10 分钟</td></tr>
+    <tr><td>P1</td><td>FTS5 中文：jieba 分词（写入+查询两侧）或 trigram tokenizer</td><td>2-3 小时</td></tr>
+    <tr><td>P2</td><td>L2/L3 分数归一化后合并排序</td><td>1 小时</td></tr>
+    <tr><td>P2</td><td>为上述链路补集成测试（建表/写入/检索/超时/中文）</td><td>3-4 小时</td></tr>
+  </table>
+  <p class="note">注：本次验证在 lancedb 0.37.1 实测；项目声明支持 0.17~0.37，create_table(dict) 与 search(limit=) 在 0.17 同样非法，结论跨版本成立。验证过程中的「建表 FAIL」曾为验证脚本误判（LanceTable 定义 __len__，空表 bool() 为 False），已用 count_rows 复核确认建表正常。</p>
+</section>
+
+</div>
+</body>
+</html>

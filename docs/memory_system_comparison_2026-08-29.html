@@ -1,0 +1,147 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>记忆系统对比：OpenSquilla vs hermes-memory-governed</title>
+<style>
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body { font-family: -apple-system, "Segoe UI", "Microsoft YaHei", sans-serif; background: #f6f7f9; color: #1f2933; line-height: 1.7; padding: 32px 16px; }
+  .wrap { max-width: 980px; margin: 0 auto; }
+  header { background: linear-gradient(135deg, #312e81, #7c3aed); color: #fff; border-radius: 16px; padding: 32px 36px; margin-bottom: 24px; }
+  header h1 { font-size: 24px; margin-bottom: 6px; }
+  header p { opacity: .85; font-size: 14px; }
+  .metrics { display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 12px; margin: 20px 0 26px; }
+  .metric { background: #fff; border-radius: 12px; padding: 16px; border: 1px solid #e3e8ee; }
+  .metric .num { font-size: 22px; font-weight: 700; color: #7c3aed; }
+  .metric .label { font-size: 13px; color: #64748b; margin-top: 2px; }
+  section { background: #fff; border-radius: 16px; padding: 26px 30px; margin-bottom: 20px; border: 1px solid #e3e8ee; }
+  h2 { font-size: 19px; margin-bottom: 14px; padding-bottom: 8px; border-bottom: 2px solid #eef2f6; }
+  h3 { font-size: 15.5px; margin: 16px 0 8px; }
+  table { width: 100%; border-collapse: collapse; font-size: 13.5px; }
+  th, td { padding: 9px 12px; text-align: left; border-bottom: 1px solid #eef2f6; vertical-align: top; }
+  th { background: #f8fafc; font-weight: 600; white-space: nowrap; }
+  .ok { color: #16a34a; font-weight: 700; }
+  .bad { color: #dc2626; font-weight: 700; }
+  .warn { color: #ea580c; font-weight: 700; }
+  .pill { display: inline-block; font-size: 11.5px; padding: 1px 8px; border-radius: 5px; font-weight: 600; margin: 1px 2px; }
+  .sq { background: #ede9fe; color: #6d28d9; }
+  .hg { background: #dcfce7; color: #15803d; }
+  code { background: #f1f5f9; padding: 1px 6px; border-radius: 5px; font-family: Consolas, monospace; font-size: 12.5px; }
+  pre.code { background: #1f2933; color: #e5e7eb; border-radius: 10px; padding: 14px 16px; font-family: Consolas, monospace; font-size: 12.5px; overflow-x: auto; margin: 10px 0; white-space: pre; }
+  .note { font-size: 12.5px; color: #94a3b8; margin-top: 10px; }
+  .verdict { border-left: 4px solid #7c3aed; padding: 10px 16px; background: #faf5ff; border-radius: 0 10px 10px 0; margin: 10px 0; }
+  .verdict b { display: block; margin-bottom: 4px; }
+  .verdict p { font-size: 13.5px; color: #475569; }
+</style>
+</head>
+<body>
+<div class="wrap">
+
+<header>
+  <h1>记忆系统对比：OpenSquilla vs hermes-memory-governed</h1>
+  <p>2026-08-29 · 基于 OpenSquilla 官网 / README.zh-Hans / opensquilla.toml.example（v0.5.4）与 hermes-memory-governed 当前代码</p>
+</header>
+
+<div class="metrics">
+  <div class="metric"><div class="num">4 层</div><div class="label">OpenSquilla：工作/情节/语义/原生认知记忆</div></div>
+  <div class="metric"><div class="num">5 层</div><div class="label">governed：L1-L4 + Bridge 审查门禁</div></div>
+  <div class="metric"><div class="num">hybrid</div><div class="label">两者检索殊途同归：向量 + 全文混合</div></div>
+  <div class="metric"><div class="num">互补</div><div class="label">OpenSquilla 重生命周期自动化，governed 重治理与溯源</div></div>
+</div>
+
+<section>
+  <h2>一、结论先行</h2>
+  <div class="verdict"><b>OpenSquilla 的优势：记忆生命周期自动化 + 轻量嵌入</b><p>四层认知记忆（工作/情节/语义/原生）配上「浮现 → 衰减 → 每 24h 做梦整理 → 晋升」的自动生命周期；hybrid 检索开箱即用；embedding 用本地 BGE-small ONNX（不依赖 PyTorch，数据不出本机），降级链设计优雅（auto → 本地 ONNX → 远程 key → FTS-only）。</p></div>
+  <div class="verdict"><b>hermes-memory-governed 的优势：治理、溯源与极端环境韧性</b><p>审查门禁（secret 拦截 + review-required + import_approved 落地）、provenance 溯源（source_rowid 直达 L3 原始消息）、L1 人工规则的治理地位（固定预算不可挤占）、双路径降级（L2 无模型走文本扫描、L3 英文 FTS5/中文 LIKE）——在「记忆可信、可审计、坏环境也能跑」上更强。</p></div>
+  <div class="verdict"><b>一句话</b><p>OpenSquilla 把记忆做成了「自动运转的认知系统」；你的项目把记忆做成了「受治理的知识资产管线」。前者赢在自动化与开箱体验，后者赢在可控性、可审计性与部署韧性。两者的强项几乎不重叠——互相借鉴的空间很大。</p></div>
+</section>
+
+<section>
+  <h2>二、OpenSquilla 记忆系统拆解（据其文档与配置）</h2>
+  <h3>存储结构</h3>
+  <pre class="code">workspace_dir/                      # 认知记忆层（文件形态）
+  MEMORY.md                         # 顶层记忆（人工可编辑）
+  memory/*.md                       # 分层记忆文件
+state_dir/                          # SQLite 索引（检索层）
+migrations/                         # 数据库自动迁移</pre>
+  <h3>四层认知记忆 + 生命周期</h3>
+  <table>
+    <tr><th>机制</th><th>说明（据官方描述与配置）</th></tr>
+    <tr><td>四层结构</td><td>工作（working）/ 情节（episodic）/ 语义（semantic）/ 原生（native）——类人记忆的认知科学分层</td></tr>
+    <tr><td>hybrid 检索</td><td>向量语义 + 全文关键词混合；<code>retrieval_mode = "hybrid" | "fts_only"</code></td></tr>
+    <tr><td>embedding 降级链</td><td><code>provider = "auto"</code>：内置 BGE-small ONNX（本地推理）→ memory 专用远程 key → 仅 FTS。支持 openai-compatible / ollama</td></tr>
+    <tr><td>浮现（promote）</td><td>热门记忆自动浮现；重要记忆「冒泡」晋升到上层</td></tr>
+    <tr><td>时间衰减</td><td>老旧记忆自动衰减</td></tr>
+    <tr><td>做梦整理（dream）</td><td>每 24h 后台巩固整理（默认关：enabled=false + preview_mode + auto_schedule=false，安全优先需显式 opt-in）</td></tr>
+    <tr><td>turn capture</td><td>对话轮默认写 memory/archive/** 审计转录（不进可检索记忆，index 需显式 opt-in；capture_user=true / capture_assistant=false）</td></tr>
+    <tr><td>DB 自动迁移</td><td>migrations/ 目录，schema 版本自动升级</td></tr>
+  </table>
+  <p class="note">来源：opensquilla.ai/zh（首页）、README.zh-Hans.md、opensquilla.toml.example v0.5.4 的 [memory] / [memory.embedding] / [memory.dream] 配置段。四层的源码级实现细节未逐行核实（本报告基于公开文档与配置面）。</p>
+</section>
+
+<section>
+  <h2>三、hermes-memory-governed 记忆系统拆解（对照）</h2>
+  <table>
+    <tr><th>机制</th><th>说明（当前代码实现）</th></tr>
+    <tr><td>L1 手写规则</td><td>MEMORY.md / USER.md，固定 800 tokens 始终注入，add/replace/remove 语义，60s 缓存</td></tr>
+    <tr><td>L2 语义记忆</td><td>LanceDB 向量（384 维 MiniLM，config 化）双路径：向量搜索 / 文本子串扫描；source_rowid 溯源到 L3 消息；NULL 向量自动迁移</td></tr>
+    <tr><td>L3 归档</td><td>SQLite + FTS5；英文 FTS5 / 中文 LIKE 降级 / 混合双路合并；abs(rank)/(1+abs(rank)) × 7 天半衰期衰减 → 组内归一化；幂等写入（content_hash）</td></tr>
+    <tr><td>L4 人格</td><td>cron 每日从 L1/L2/L3 生成 persona.md，注入系统提示</td></tr>
+    <tr><td>审查门禁（Bridge）</td><td>候选 JSONL：secret 模式拦截 + target 白名单 + 追加去重 + 500 行归档；import_approved 把已批准候选落地 L1</td></tr>
+    <tr><td>召回</td><td>异步预取（独立临时池 + 超时收集 + 串行降级），MIN_SCORE 过滤，L1 固定预算 800 + L2/L3 共享 1200</td></tr>
+    <tr><td>知识库管线</td><td>chat_extractor / meeting_recap / dashboard / knowledge_sync（Obsidian 可选）</td></tr>
+  </table>
+</section>
+
+<section>
+  <h2>四、逐维度对比</h2>
+  <table>
+    <tr><th>维度</th><th>OpenSquilla 记忆</th><th>hermes-memory-governed</th><th>评判</th></tr>
+    <tr><td>分层哲学</td><td>认知科学式四层（工作/情节/语义/原生），层间自动流动</td><td>治理式五层（L1 人工 / L2 语义 / L3 归档 / L4 人格 / Bridge 审查），边界由人工与规则定义</td><td>哲学不同：自动化 vs 可控性</td></tr>
+    <tr><td>检索</td><td>hybrid 开箱即用；FTS-only 一键降级</td><td>L2 向量/文本双路径 + L3 FTS5/LIKE 双路径（三条链路独立降级）</td><td>OpenSquilla 集成度更高；governed 韧性更强（极端环境每层都可用）</td></tr>
+    <tr><td>Embedding</td><td>本地 BGE-small ONNX（无 PyTorch 依赖）+ openai/ollama 远程可选</td><td>sentence-transformers（依赖 torch，重）+ 文本降级；模型/维度已 config 化</td><td><span class="pill sq">SQ 优</span> ONNX 路线更轻更省；可借鉴</td></tr>
+    <tr><td>记忆生命周期</td><td>浮现 / 衰减 / 晋升 / 每日做梦整理（自动，默认关）</td><td>时间衰减 + cron persona / health（确定性脚本，无自动晋升）</td><td><span class="pill sq">SQ 优</span> 生命周期自动化是它的招牌</td></tr>
+    <tr><td>写入治理</td><td>turn capture 审计转录（默认不进检索）+ 合规审批闸门</td><td>Bridge 门禁（secret 拦截 + 白名单 + 审查落地）+ 幂等写入</td><td><span class="pill hg">HG 优</span> 治理粒度更细（按内容拦截而非按轮归档）</td></tr>
+    <tr><td>溯源</td><td>决策日志存 hash 不存原文（合规向）</td><td>source_rowid 直达 L3 原始消息（审计向）</td><td>场景不同：合规脱敏 vs 知识溯源，各有所长</td></tr>
+    <tr><td>人机协作</td><td>MEMORY.md 人工可编辑（机器整理需 opt-in）</td><td>L1 文件直接手写 + replace/remove 语义；L3 可 SQL 查询</td><td><span class="pill hg">HG 优</span> 文件与 SQL 全透明，工程师可控性强</td></tr>
+    <tr><td>数据可移植</td><td>SQLite 索引 + workspace 文件，DB 自动迁移</td><td>全部是本地文件（md / sqlite / lancedb），可 git 管理</td><td>平手：都是本地优先</td></tr>
+    <tr><td>宿主形态</td><td>完整产品（微内核 + 桌面端 + 10+ 渠道 + 网关）</td><td>Hermes Agent 的可插拔 provider（单一职责）</td><td>定位不同，不可直接比</td></tr>
+    <tr><td>维护脚本</td><td>内置 cron 调度器 + dream 后台任务</td><td>外部 cron + 确定性脚本（persona / health / retention / rebuild）</td><td>OpenSquilla 集成度高；governed 更透明可审计</td></tr>
+  </table>
+</section>
+
+<section>
+  <h2>五、可互相借鉴的点</h2>
+  <h3>governed 可以从 OpenSquilla 借鉴（按价值排序）</h3>
+  <table>
+    <tr><th>借鉴点</th><th>现状差距</th><th>落地建议</th></tr>
+    <tr><td>ONNX 本地嵌入</td><td>sentence-transformers 依赖 torch（安装体积大、启动慢）</td><td>用 onnxruntime 跑 BGE-small（几十 MB，无 torch）作为默认 embedding 后端，ST 降为可选——安装体积和启动时间都会显著改善</td></tr>
+    <tr><td>记忆浮现 / 晋升机制</td><td>L2→L1 只能人工审查，无自动晋升</td><td>给 Bridge 加自动晋升通道：L3 中重复出现 ≥N 次的事实自动生成候选（仍走审查标记），减轻人工筛选拍量</td></tr>
+    <tr><td>做梦式整理（dream）</td><td>只有 cron persona 生成，无「记忆重组/压缩」步骤</td><td>加一个 opt-in 的 dream 任务：定期把 L3 旧会话压缩为语义摘要写回 L2（需人工确认首批输出）</td></tr>
+    <tr><td>DB 自动迁移</td><td>schema 变更靠 ALTER 兜底</td><td>建 migrations 目录 + 版本号，L2/L3 schema 演进可追溯</td></tr>
+  </table>
+  <h3>OpenSquilla 可以从 governed 借鉴（供参考）</h3>
+  <table>
+    <tr><th>借鉴点</th><th>说明</th></tr>
+    <tr><td>按内容拦截的审查门禁</td><td>secret 正则拦截 + target 白名单，比「按轮归档不进检索」的治理粒度更细</td></tr>
+    <tr><td>provenance 溯源（source_rowid）</td><td>记忆条目直达原始消息，审计/纠错更快</td></tr>
+    <tr><td>L1 的治理语义</td><td>人工规则的固定预算 + replace/remove 语义，比单纯文件更明确</td></tr>
+    <tr><td>极端环境双路径</td><td>无模型时文本扫描、无 FTS5 时 LIKE——低配设备也能跑</td></tr>
+  </table>
+</section>
+
+<section>
+  <h2>六、给你的取舍建议</h2>
+  <table>
+    <tr><th>如果你的诉求是…</th><th>建议</th></tr>
+    <tr><td>记忆要可信、可审计、给团队/客户用</td><td>保持 governed 路线，把 P1 剩余项（记忆晋升、dream 压缩）作为后续迭代——治理优势是这个项目的核心价值</td></tr>
+    <tr><td>想要开箱即用的自动记忆、且在意安装体积</td><td>借鉴 ONNX 嵌入路线：把 sentence-transformers 换成 onnxruntime + BGE-small，这是单点收益最大的借鉴项</td></tr>
+    <tr><td>两者都想体验</td><td>OpenSquilla 是完整 Agent 产品（6.8k stars、Apache-2.0、Python 3.12+），可以直接装来对照它的四层记忆实际表现，再把觉得好的机制搬回 governed</td></tr>
+  </table>
+  <p class="note">信息来源：opensquilla.ai/zh 首页、GitHub opensquilla/opensquilla（README.zh-Hans.md、opensquilla.toml.example v0.5.4、仓库结构）、hermes-memory-governed 当前代码。OpenSquilla 四层记忆的源码级实现未逐行核实，本对比基于其公开文档与配置面。</p>
+</section>
+
+</div>
+</body>
+</html>

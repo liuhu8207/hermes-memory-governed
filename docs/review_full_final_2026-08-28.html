@@ -1,0 +1,149 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>hermes-memory-governed 最终全面复查报告</title>
+<style>
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body { font-family: -apple-system, "Segoe UI", "Microsoft YaHei", sans-serif; background: #f6f7f9; color: #1f2933; line-height: 1.7; padding: 32px 16px; }
+  .wrap { max-width: 960px; margin: 0 auto; }
+  header { background: linear-gradient(135deg, #1e3a5f, #2d6a9f); color: #fff; border-radius: 16px; padding: 32px 36px; margin-bottom: 24px; }
+  header h1 { font-size: 24px; margin-bottom: 6px; }
+  header p { opacity: .85; font-size: 14px; }
+  .metrics { display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 12px; margin: 20px 0 26px; }
+  .metric { background: #fff; border-radius: 12px; padding: 16px; border: 1px solid #e3e8ee; }
+  .metric .num { font-size: 24px; font-weight: 700; }
+  .metric .label { font-size: 13px; color: #64748b; margin-top: 2px; }
+  .metric.green .num { color: #16a34a; }
+  .metric.orange .num { color: #ea580c; }
+  .metric.red .num { color: #dc2626; }
+  section { background: #fff; border-radius: 16px; padding: 26px 30px; margin-bottom: 20px; border: 1px solid #e3e8ee; }
+  h2 { font-size: 19px; margin-bottom: 14px; padding-bottom: 8px; border-bottom: 2px solid #eef2f6; }
+  table { width: 100%; border-collapse: collapse; font-size: 14px; }
+  th, td { padding: 9px 12px; text-align: left; border-bottom: 1px solid #eef2f6; vertical-align: top; }
+  th { background: #f8fafc; font-weight: 600; }
+  .ok { color: #16a34a; font-weight: 700; }
+  .bad { color: #dc2626; font-weight: 700; }
+  .warn { color: #ea580c; font-weight: 700; }
+  .issue { border-left: 4px solid #e2e8f0; padding: 12px 16px; margin-bottom: 14px; background: #fafbfc; border-radius: 0 10px 10px 0; }
+  .issue.red { border-left-color: #dc2626; }
+  .issue.orange { border-left-color: #ea580c; }
+  .issue .title { font-weight: 700; margin-bottom: 6px; }
+  .issue .loc { font-size: 12px; color: #64748b; font-family: Consolas, monospace; }
+  .issue .detail { font-size: 14px; color: #475569; }
+  .evidence { background: #f1f5f9; border-radius: 8px; padding: 10px 14px; font-family: Consolas, monospace; font-size: 12.5px; margin-top: 8px; white-space: pre-wrap; color: #334155; }
+  pre.code { background: #1f2933; color: #e5e7eb; border-radius: 8px; padding: 14px 16px; font-family: Consolas, monospace; font-size: 12.5px; overflow-x: auto; margin-top: 8px; }
+  code { background: #f1f5f9; padding: 1px 6px; border-radius: 5px; font-family: Consolas, monospace; font-size: 13px; }
+  .note { font-size: 12.5px; color: #94a3b8; margin-top: 10px; }
+</style>
+</head>
+<body>
+<div class="wrap">
+
+<header>
+  <h1>hermes-memory-governed 最终全面复查报告</h1>
+  <p>2026-08-28 02:04 · 全模块重读 + 全套实测 · 测试 45/45（修复 1 个坏测试）· pip 构建通过 · 发现 2 个新问题</p>
+</header>
+
+<div class="metrics">
+  <div class="metric green"><div class="num">12</div><div class="label">功能场景实测通过</div></div>
+  <div class="metric red"><div class="num">1</div><div class="label">新发现：迁移功能无效</div></div>
+  <div class="metric orange"><div class="num">2</div><div class="label">历史遗留未修</div></div>
+  <div class="metric green"><div class="num">0</div><div class="label">核心链路回归问题</div></div>
+</div>
+
+<section>
+  <h2>一、总体结论</h2>
+  <p>核心链路（L1 手写 / L2 语义 / L3 归档 / L4 画像 / 并行召回 / Bridge / 构建）全部实测通过，多轮修复的成果稳定。本次全面复查发现 <b>1 个新功能的实质缺陷</b>：新加的 NULL vector 迁移调用了不存在的 <code>replace_rows</code> API 且依赖未安装的 pandas，双重失败被静默吞掉——迁移承诺实际失效；另有 1 个测试数据与断言不符的坏测试（已修复）和 2 个此前提过的历史遗留。</p>
+</section>
+
+<section>
+  <h2>二、全套实测结果</h2>
+  <table>
+    <tr><th>模块 / 场景</th><th>实测</th><th>状态</th></tr>
+    <tr><td>L1 add / replace / remove</td><td>三项操作后文件内容正确</td><td class="ok">✅</td></tr>
+    <tr><td>L2 建表 + 写入 + 文本降级检索</td><td>建表 0 行 → 写入 1 行</td><td class="ok">✅</td></tr>
+    <tr><td>L3 五类查询（英 / 中 / 空格中文 / 混合 / CJK+数字）</td><td>3 / 3 / 1 / 5 / 0 hits，全部符合预期</td><td class="ok">✅</td></tr>
+    <tr><td>并行召回：不阻塞</td><td>慢任务 2s + 超时 0.5s → 0.50s 返回</td><td class="ok">✅</td></tr>
+    <tr><td>并行召回：池间隔离</td><td>重叠召回 A/B 均有结果</td><td class="ok">✅</td></tr>
+    <tr><td>并行召回：shutdown 串行降级</td><td>shutdown 后召回不崩，返回 3 层</td><td class="ok">✅</td></tr>
+    <tr><td>Bridge 追加去重</td><td>同内容二次导出 skipped</td><td class="ok">✅</td></tr>
+    <tr><td>Provider 全生命周期（init → sync_turn → session_end → shutdown → recall）</td><td>全链路不崩，shutdown 后降级正常</td><td class="ok">✅</td></tr>
+    <tr><td>会话候选启发式（CJK 加权）</td><td>「请记住我喜欢简洁回复，以后都用中文」正确命中并提取</td><td class="ok">✅</td></tr>
+    <tr><td>pip 构建</td><td>Would install hermes-memory-governed-0.1.0</td><td class="ok">✅</td></tr>
+    <tr><td>测试套件</td><td>45/45（修复 1 个坏测试后）</td><td class="ok">✅</td></tr>
+  </table>
+</section>
+
+<section>
+  <h2>三、新发现的问题</h2>
+
+  <div class="issue red">
+    <div class="title"><span class="bad">中</span>_migrate_null_vectors 调用不存在的 API + 依赖缺失，迁移功能完全无效</div>
+    <div class="loc">_sync.py :: _migrate_null_vectors（新增功能）</div>
+    <div class="detail">
+      ① <code>self._l2_store.replace_rows(updated_table)</code> — lancedb 0.37.1 的 LanceTable <b>没有 replace_rows 方法</b>（实测 hasattr=False），调用即 AttributeError；<br>
+      ② <code>table.to_pandas()</code> — 需要 pandas，而 lancedb 安装不带 pandas（当前环境实测未装）→ ImportError；<br>
+      ③ 两个异常都被 <code>except Exception: logger.debug</code> 吞掉 → <b>迁移永远静默跳过</b>。影响：装上 sentence-transformers 后，存量 NULL vector 数据依然在向量模式下不可见——这个迁移承诺实际没有兑现。
+    </div>
+    <div class="evidence">实测（lancedb 0.37.1）：
+LanceTable.replace_rows 存在: False
+LanceTable 可用更新 API: update / merge_insert / delete / add
+pandas 可用: False</div>
+    <div class="detail"><b>修法（不依赖 pandas，delete + re-add）</b>：</div>
+    <pre class="code">def _migrate_null_vectors(self) -> None:
+    if self._l2_store is None or self._embed_model is None:
+        return
+    try:
+        rows = self._l2_store.to_arrow().to_pylist()
+        null_rows = [r for r in rows if r.get("vector") is None]
+        if not null_rows:
+            return
+        embeddings = self._embed_model.encode([r["content"] for r in null_rows]).tolist()
+        self._l2_store.delete("vector IS NULL")
+        re_added = [dict(r, vector=emb) for r, emb in zip(null_rows, embeddings)]
+        self._l2_store.add(re_added)
+        logger.info("L2 migration: re-embedded %d rows", len(null_rows))
+    except Exception as e:
+        logger.warning("L2 null-vector migration failed: %s", e)  # 至少升级为 warning</pre>
+    <div class="detail">另外两点：迁移放在 _init_l2 内联执行，首次打开会阻塞 worker 线程——数据量大时建议挪到独立维护脚本；失败日志建议从 debug 升为 warning（当前静默策略掩盖了本次 API 错误）。</div>
+  </div>
+
+  <div class="issue orange">
+    <div class="title"><span class="warn">已修</span>test_l3_search_cjk 数据与断言不符（测试 bug）</div>
+    <div class="loc">tests/test_memory_governed.py</div>
+    <div class="detail">
+      测试向库里插入英文内容「Python is a programming language」，却断言中文 query「编程语言」能命中——库中不含该词，0 hits 本是正确行为。已修复：插入内容改为「Python 是最好的编程语言」，修复后 45/45 全绿。
+    </div>
+  </div>
+</section>
+
+<section>
+  <h2>四、历史遗留（此前已提，仍未修）</h2>
+  <table>
+    <tr><th>#</th><th>问题</th><th>影响</th><th>建议</th></tr>
+    <tr><td>1</td><td>health 脚本 warning 即 FAIL（<code>return 1 if h.warnings else 0</code>）</td><td>daily pipeline 误报 FAIL，cron 收到假告警</td><td>warnings 与 errors 分离，仅 errors 返回非 0</td></tr>
+    <tr><td>2</td><td>memory_pipeline 引用不存在的 wiki_nblm_daily.py（--with-notebooklm）</td><td>启用该选项即 FAIL</td><td>补脚本或移除选项</td></tr>
+    <tr><td>3</td><td>WriteQueue.stop() 主线程 drain 与 worker 并发 get 竞态</td><td>轻微：可能重复/漏处理最后一个 item</td><td>stop 先置标志，join worker（带超时），再 drain</td></tr>
+    <tr><td>4</td><td>「50%了」类 CJK+数字混合查询 0 hits</td><td>极边缘</td><td>可接受现状；如需支持，LIKE 时同时尝试原串与去空格串</td></tr>
+    <tr><td>5</td><td>串行降级无超时限制</td><td>仅 shutdown 后触发，可接受</td><td>如需限制，给每层调用加计时</td></tr>
+    <tr><td>6</td><td>_archive_if_needed 中 jsonl_path.open() 未显式 close</td><td>极轻微（CPython 引用计数即关）</td><td>用 with 语句</td></tr>
+  </table>
+</section>
+
+<section>
+  <h2>五、结论与建议优先级</h2>
+  <table>
+    <tr><th>优先级</th><th>事项</th></tr>
+    <tr><td>P1</td><td>修 _migrate_null_vectors（换 delete+re-add，去掉 pandas 依赖，日志升级 warning）——否则「装 embedding 后旧数据可见」的承诺不成立</td></tr>
+    <tr><td>P2</td><td>health 退出码分离 warnings/errors</td></tr>
+    <tr><td>P2</td><td>memory_pipeline 移除或补齐 wiki_nblm 脚本</td></tr>
+    <tr><td>P3</td><td>WriteQueue.stop 竞态、_archive_if_needed with 语句、测试目录规范化</td></tr>
+  </table>
+  <p class="note">复查方法：全模块代码重读 + 12 个功能场景实测 + 45 项测试 + pip 构建验证。修复的坏测试已提交到 tests/test_memory_governed.py。本报告未修改除该测试外的任何项目代码。</p>
+</section>
+
+</div>
+</body>
+</html>

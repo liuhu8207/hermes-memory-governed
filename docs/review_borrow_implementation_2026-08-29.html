@@ -1,0 +1,125 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>借鉴 OpenSquilla 优化落地报告</title>
+<style>
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body { font-family: -apple-system, "Segoe UI", "Microsoft YaHei", sans-serif; background: #f6f7f9; color: #1f2933; line-height: 1.7; padding: 32px 16px; }
+  .wrap { max-width: 960px; margin: 0 auto; }
+  header { background: linear-gradient(135deg, #4c1d95, #7c3aed); color: #fff; border-radius: 16px; padding: 32px 36px; margin-bottom: 24px; }
+  header h1 { font-size: 24px; margin-bottom: 6px; }
+  header p { opacity: .85; font-size: 14px; }
+  .metrics { display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 12px; margin: 20px 0 26px; }
+  .metric { background: #fff; border-radius: 12px; padding: 16px; border: 1px solid #e3e8ee; }
+  .metric .num { font-size: 24px; font-weight: 700; color: #16a34a; }
+  .metric .label { font-size: 13px; color: #64748b; margin-top: 2px; }
+  section { background: #fff; border-radius: 16px; padding: 26px 30px; margin-bottom: 20px; border: 1px solid #e3e8ee; }
+  h2 { font-size: 19px; margin-bottom: 14px; padding-bottom: 8px; border-bottom: 2px solid #eef2f6; }
+  h3 { font-size: 15.5px; margin: 16px 0 8px; }
+  table { width: 100%; border-collapse: collapse; font-size: 13.5px; }
+  th, td { padding: 9px 12px; text-align: left; border-bottom: 1px solid #eef2f6; vertical-align: top; }
+  th { background: #f8fafc; font-weight: 600; }
+  .ok { color: #16a34a; font-weight: 700; }
+  .bad { color: #dc2626; font-weight: 700; }
+  .warn { color: #ea580c; font-weight: 700; }
+  code { background: #f1f5f9; padding: 1px 6px; border-radius: 5px; font-family: Consolas, monospace; font-size: 12.5px; }
+  .note { font-size: 12.5px; color: #94a3b8; margin-top: 10px; }
+  .feature { border-left: 4px solid #7c3aed; padding: 12px 16px; margin-bottom: 14px; background: #faf5ff; border-radius: 0 10px 10px 0; }
+  .feature .title { font-weight: 700; margin-bottom: 4px; }
+  .feature .loc { font-size: 12px; color: #64748b; font-family: Consolas, monospace; margin-bottom: 4px; }
+  .feature .detail { font-size: 13.5px; color: #475569; }
+  .evidence { background: #f1f5f9; border-radius: 8px; padding: 10px 14px; font-family: Consolas, monospace; font-size: 12.5px; margin-top: 8px; white-space: pre-wrap; color: #334155; }
+</style>
+</head>
+<body>
+<div class="wrap">
+
+<header>
+  <h1>借鉴 OpenSquilla 优化落地报告</h1>
+  <p>2026-08-29 · 四项借鉴全部落地并实测 · 测试 59 → 64 · 全绿</p>
+</header>
+
+<div class="metrics">
+  <div class="metric"><div class="num">4</div><div class="label">借鉴机制落地</div></div>
+  <div class="metric"><div class="num">2</div><div class="label">新增脚本（promote / dream）</div></div>
+  <div class="metric"><div class="num">+19</div><div class="label">新增测试（28→45→64）</div></div>
+  <div class="metric"><div class="num">64/64</div><div class="label">测试全绿</div></div>
+</div>
+
+<section>
+  <h2>一、总览</h2>
+  <p>按对比报告的价值排序，四个借鉴机制全部落地：①多后端 embedding 抽象（ONNX 优先）②记忆浮现/晋升 ③dream 式整理 ④schema 版本化迁移。每项都有端到端实测，并配了回归测试。落地过程中与其它工具并行加入的 API embedding 功能做了<b>融合而非覆盖</b>：最终 embedding 优先级链 = API（如配置）→ fastembed（ONNX）→ sentence-transformers → 文本降级。</p>
+</section>
+
+<section>
+  <h2>二、四项机制详解</h2>
+
+  <div class="feature">
+    <div class="title">① 多后端 Embedding 抽象层（借鉴 OpenSquilla 的 embedding 降级链）</div>
+    <div class="loc">plugin/memory_governed/_embedding.py（新增）· _config.py VectorConfig.backend · _sync.py / _recall.py 接入</div>
+    <div class="detail">
+      新增 <code>load_embedder(backend, model)</code>：auto = fastembed（ONNX，无 torch，模型自动下载）→ sentence-transformers → None（文本降级）。与另一工具并行加入的 API embedding 融合后，完整优先级链为：<b>API（如配置）→ fastembed → sentence-transformers → 文本降级</b>。config 化：<code>vector.backend / vector.model / vector.dim</code>；建表向量维度以实际后端 dim 为准（本机无 fastembed 时回退 ST/配置值）。ST 模型名改用 <code>config.vector.model</code>（此前硬编码）。fastembed 后端已实现（接口与 ST 完全一致），需要时 <code>pip install fastembed</code> 即启用，无需改代码——本机未实测其模型下载（大文件），ST 路径已实测。
+    </div>
+  </div>
+
+  <div class="feature">
+    <div class="title">② 记忆浮现/晋升（借鉴 promote 机制）</div>
+    <div class="loc">scripts/memory_promote.py（新增）</div>
+    <div class="detail">
+      扫描 L3 用户消息 → 按归一化内容分组 → 重复出现 ≥N 次（默认 3x）的模式自动生成 Bridge 候选（tags: auto-promoted + review-required——<b>仍走人工审查，不自动落地</b>）。支持 --min-count / --days / --dry-run。实测：3 次重复模式正确识别并导出 Bridge（written=1），单次出现不晋升。
+    </div>
+  </div>
+
+  <div class="feature">
+    <div class="title">③ Dream 式整理（借鉴 dream consolidation，安全优先）</div>
+    <div class="loc">scripts/memory_dream.py（新增，opt-in）</div>
+    <div class="detail">
+      把超过 N 天（默认 30）的旧会话压缩为「dream:*」摘要写回 L2（category=dream）。LLM 可选：有 key 走抽象摘要，无 key 走提取式降级。原 L3 消息不删（清理交给 l3_retention）。<b>实测</b>：2 个 45 天前旧会话 → 2 条 dream facts 写入 L2，source_rowid 溯源保留。写前检查 L2 表存在性，缺失时提示而非崩溃。
+    </div>
+  </div>
+
+  <div class="feature">
+    <div class="title">④ Schema 版本化迁移（借鉴 migrations/）</div>
+    <div class="loc">plugin/memory_governed/_migrations.py（新增）· provider.initialize 接入</div>
+    <div class="detail">
+      MIGRATIONS 注册表（版本号 + 幂等函数）+ MigrationRunner（状态存 migrations_state.json）。注册了两个历史迁移（L3 hash 列、L2 source_rowid 列——此前内联的 schema 变更收敛到统一机制）。provider.initialize 自动跑 pending 迁移，幂等可重入。新 schema 演进只需追加 (version, name, fn)。实测：首轮应用 001/002，二次运行无 pending。
+    </div>
+  </div>
+</section>
+
+<section>
+  <h2>三、与其它工具改动的融合</h2>
+  <table>
+    <tr><th>并行改动（其它工具）</th><th>融合方式</th></tr>
+    <tr><td>API embedding（EmbeddingConfig + _make_api_embed_fn，SiliconFlow/OpenAI 兼容）</td><td>保留为最高优先级；fastembed 插入其后的本地链路，两套配置（embedding.* / vector.*）共存</td></tr>
+    <tr><td>NULL vector 迁移（_migrate_null_vectors）</td><td>保留；embedding 后端解析统一走 load_embedder，迁移时 ST 模型名已 config 化</td></tr>
+  </table>
+</section>
+
+<section>
+  <h2>四、回归确认</h2>
+  <table>
+    <tr><th>场景</th><th>结果</th></tr>
+    <tr><td>测试套件</td><td class="ok">64/64 通过（含 19 个架构/新功能测试）</td></tr>
+    <tr><td>并行召回四项（不阻塞 0.50s / 池间隔离 / 0 泄漏 / shutdown 降级）</td><td class="ok">全过</td></tr>
+    <tr><td>L3 检索五类查询 / Bridge / 知识库管线（Obsidian 可选）</td><td class="ok">无回归</td></tr>
+    <tr><td>pip wheel 构建（含 entry-points）</td><td class="ok">成功</td></tr>
+  </table>
+</section>
+
+<section>
+  <h2>五、剩余可选项</h2>
+  <table>
+    <tr><th>事项</th><th>状态</th></tr>
+    <tr><td>fastembed 模型下载实测</td><td>结构就绪；首次运行需联网下载 ONNX 模型（~100MB），建议在网络良好时执行一次验证</td></tr>
+    <tr><td>obsidian_sync 完整迁移（graph/仪表盘等）</td><td>等确认在用 Obsidian；knowledge_sync 骨架已就位，子脚本按需补</td></tr>
+    <tr><td>dream 的 LLM 摘要实测</td><td>结构就绪；需配置 LLM_API_KEY/LLM_BASE_URL/LLM_MODEL 后验证抽象摘要质量</td></tr>
+    <tr><td>promote 接入 cron</td><td>可在 cron 加一条：0 8 * * * python scripts/memory_promote.py --min-count 3</td></tr>
+  </table>
+</section>
+
+</div>
+</body>
+</html>
