@@ -54,6 +54,41 @@ MIN_SCORE: float = 0.1
 L3_RECALL_ROLES: tuple = ("user", "assistant")
 
 
+def layer_score_floor(layer: str, recall_cfg=None, *,
+                      l2_min_score: "float | None" = None) -> float:
+    """返回指定记忆层的最低相关分门槛（``>= floor`` 才会被注入）。
+
+    L2 与 L3 的分数分布不同源，必须分开设阈值：
+
+    * **L3**（FTS5 关键词 + 时间衰减）：有效命中实测 0.3~0.7，门槛沿用
+      :data:`MIN_SCORE`（0.1）。
+    * **L2**（1024 维余弦映射 ``1 - d/2``）：无关查询的地板分就有 0.73，
+      门槛取 ``recall.l2_min_score``；未配置（``0.0``）时**回退**到
+      :data:`MIN_SCORE`，保证老配置行为不变。
+
+    Args:
+        layer: ``"l2"`` / ``"l3"`` 等记忆层标识。
+        recall_cfg: ``RecallConfig`` 实例（可为 ``None``）。
+        l2_min_score: 显式覆盖值，用于测试或调用方临时收紧；``None`` 时读配置。
+
+    Returns:
+        该层的绝对分数门槛。任何异常都返回 :data:`MIN_SCORE`，绝不抛错——
+        召回是读路径，宁可放行也不能因为配置脏值把记忆全砍光。
+    """
+    if layer != "l2":
+        return MIN_SCORE
+    value = l2_min_score
+    if value is None:
+        value = getattr(recall_cfg, "l2_min_score", 0.0)
+    try:
+        value = float(value or 0.0)
+    except (TypeError, ValueError):
+        return MIN_SCORE
+    if value <= 0.0 or math.isnan(value):
+        return MIN_SCORE
+    return value
+
+
 def distance_to_score(distance: float) -> float:
     """把 LanceDB 的余弦距离换算成 [0, 1] 的相关性分数。
 
@@ -745,12 +780,17 @@ class RecallEngine:
         )
 
     def format_recall(self, results: List[RecallResult], l1_text: str,
-                      l1_budget: int, l23_budget: int) -> str:
+                      l1_budget: int, l23_budget: int,
+                      l2_min_score: "float | None" = None) -> str:
         """Format recall results into injectable context text.
 
         L1 gets its own fixed budget (never displaced).
         L2/L3 share the remaining budget.
         L4 is injected via system_prompt_block, not here.
+
+        Args:
+            l2_min_score: 可选的 L2 门槛覆盖值；``None`` 时读
+                ``config.recall.l2_min_score``（见 :func:`layer_score_floor`）。
         """
         parts = []
 
@@ -760,7 +800,17 @@ class RecallEngine:
             parts.append(f"[User Rules]\n{truncated_l1}")
 
         # L2/L3: shared budget, skip low-relevance items, then dedup by content.
-        l23_items = [r for r in results if r.layer in ("l2", "l3") and r.score >= MIN_SCORE]
+        # 两层门槛分开取：L2 用 recall.l2_min_score（未配置回退 MIN_SCORE），
+        # L3 恒用 MIN_SCORE —— L3 的 FTS5 分数本就偏低（0.3~0.7），套用 L2
+        # 的高门槛会把它整层砍空（实测 82/91 条被误删）。
+        recall_cfg = getattr(getattr(self, "_config", None), "recall", None)
+        l2_floor = layer_score_floor("l2", recall_cfg, l2_min_score=l2_min_score)
+        l3_floor = layer_score_floor("l3", recall_cfg)
+        l23_items = [
+            r for r in results
+            if r.layer in ("l2", "l3")
+            and r.score >= (l2_floor if r.layer == "l2" else l3_floor)
+        ]
 
         # 按 content 去重，只保留最高分那条：实测 L2 重复率 94.8%，
         # 同一事实的副本会彼此抢占 l23_budget，把真正多样的记忆挤出去。

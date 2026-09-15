@@ -27,6 +27,18 @@ class RecallConfig:
     l3_max_results: int = 20
     l2_max_results: int = 15
     parallel_timeout_seconds: float = 2.0
+    #: L2（向量语义层）**专用**的最低相关分阈值；``0.0`` = 关闭（沿用
+    #: :data:`_recall.MIN_SCORE`，保持历史行为不变）。
+    #:
+    #: 为什么必须和 L3 分开：``MIN_SCORE`` 同时过滤 L2 与 L3，而两层分数的
+    #: 分布完全不同 —— L3 是 FTS5 关键词命中 + 时间衰减，实测有效命中的分数
+    #: 集中在 0.3~0.7（例如 SSH 相关对话 0.655）；L2 是 1024 维余弦映射，
+    #: 无关查询的地板分就有 0.73。直接把 ``MIN_SCORE`` 提到 0.76 会砍掉
+    #: L3 的 82/91 条有效结果，属于典型的"用错尺子量错层"。
+    #:
+    #: 标定依据（2026-09-16，L2=29 条）：无关查询 top1 0.731~0.741，
+    #: 相关查询 top1 0.782~0.912 → 0.76 是两者之间唯一的干净切点。
+    l2_min_score: float = 0.0
 
 
 @dataclass
@@ -293,7 +305,7 @@ def _inherit_synthesis_model(config: GovernedMemoryConfig, hermes_home: Path) ->
 _NUMERIC_FIELDS = {
     "recall": ["l1_budget_tokens", "l23_budget_tokens", "prefetch_ttl_seconds",
                "l3_time_decay_hours", "l3_max_results", "l2_max_results",
-               "parallel_timeout_seconds"],
+               "parallel_timeout_seconds", "l2_min_score"],
     "sync": ["write_queue_maxsize", "l2_max_facts_per_turn"],
     "mermaid_compress": ["canvas_max_tokens"],
     "vector": ["dim"],

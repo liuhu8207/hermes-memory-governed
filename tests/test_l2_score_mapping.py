@@ -40,6 +40,7 @@ from plugin.memory_governed._recall import (
     RecallEngine,
     RecallResult,
     distance_to_score,
+    layer_score_floor,
     row_to_score,
 )
 
@@ -384,6 +385,111 @@ class TestFormatRecallMinScore:
         )
         assert "PostgreSQL" in text
         assert max(r.score for r in results) > MIN_SCORE
+
+
+# ---------------------------------------------------------------------------
+# 4.5) L2 独立阈值 recall.l2_min_score（L3 必须不受影响）
+# ---------------------------------------------------------------------------
+
+
+def _make_engine_with_l2_floor(tmp_path: Path, floor: float) -> RecallEngine:
+    """构造一个 ``recall.l2_min_score = floor`` 的 engine。"""
+    engine = _make_engine(tmp_path)
+    engine._config.recall.l2_min_score = floor
+    return engine
+
+
+class TestL2MinScoreThreshold:
+    """``recall.l2_min_score`` 只切 L2，不能误伤 L3。
+
+    反面案例（真实踩过的坑）：直接把共用的 ``MIN_SCORE`` 提到 0.76，L3 的
+    82/91 条有效命中被砍光 —— L3 是 FTS5 分数，分布本就在 0.3~0.7。
+    """
+
+    def test_default_zero_keeps_legacy_behaviour(self, tmp_path):
+        """未配置（0.0）时 L2 仍按 MIN_SCORE 过滤 —— 老配置行为不变。"""
+        engine = _make_engine(tmp_path)
+        assert engine._config.recall.l2_min_score == 0.0
+
+        results = [RecallResult(layer="l2", content="中分事实", score=MIN_SCORE + 0.1)]
+        assert "中分事实" in engine.format_recall(results, "", 800, 1200)
+
+    def test_l2_below_floor_is_dropped(self, tmp_path):
+        """0.76 门槛：L2 的 0.74（无关查询实测地板分）必须被拦。"""
+        engine = _make_engine_with_l2_floor(tmp_path, 0.76)
+        results = [
+            RecallResult(layer="l2", content="无关噪声", score=0.741),
+            RecallResult(layer="l2", content="真实记忆", score=0.782),
+        ]
+        text = engine.format_recall(results, "", 800, 1200)
+        assert "无关噪声" not in text
+        assert "真实记忆" in text
+
+    def test_p0_regression_l3_survives_high_l2_floor(self, tmp_path):
+        """同一 engine 里 L3 不受 L2 高门槛影响 —— 这是本改动的全部意义。"""
+        engine = _make_engine_with_l2_floor(tmp_path, 0.76)
+        results = [
+            # 0.655 = 真实标定里 SSH 相关会话的 L3 命中分，必须活下来
+            RecallResult(layer="l3", content="SSH 免密配置讨论", score=0.655),
+            # 0.4 / 0.3 也是 L3 的常见区间
+            RecallResult(layer="l3", content="家用 NAS 备份策略", score=0.4),
+            RecallResult(layer="l2", content="无关噪声", score=0.655),
+        ]
+        text = engine.format_recall(results, "", 800, 1200)
+        assert "[History] SSH 免密配置讨论" in text
+        assert "[History] 家用 NAS 备份策略" in text
+        assert "无关噪声" not in text
+
+    def test_boundary_is_inclusive(self, tmp_path):
+        engine = _make_engine_with_l2_floor(tmp_path, 0.76)
+        results = [
+            RecallResult(layer="l2", content="刚好达标", score=0.76),
+            RecallResult(layer="l2", content="差一点点", score=0.76 - 1e-9),
+        ]
+        text = engine.format_recall(results, "", 800, 1200)
+        assert "刚好达标" in text
+        assert "差一点点" not in text
+
+    def test_explicit_override_wins(self, tmp_path):
+        """调用方显式传的 l2_min_score 覆盖配置值。"""
+        engine = _make_engine_with_l2_floor(tmp_path, 0.76)
+        results = [RecallResult(layer="l2", content="中分事实", score=0.5)]
+        # 显式收紧到 0.9 → 丢
+        assert "中分事实" not in engine.format_recall(results, "", 800, 1200, l2_min_score=0.9)
+        # 显式放宽到 0.0（=回退 MIN_SCORE）→ 留
+        assert "中分事实" in engine.format_recall(results, "", 800, 1200, l2_min_score=0.0)
+
+
+class TestLayerScoreFloor:
+    """:func:`layer_score_floor` 的纯函数断言（配置脏值时绝不抛错）。"""
+
+    @pytest.mark.parametrize(
+        "cfg_value, expected",
+        [
+            (0.0, MIN_SCORE),      # 未配置 → 回退
+            (-1.0, MIN_SCORE),     # 负值 = 关闭
+            (0.76, 0.76),
+            (None, MIN_SCORE),     # 字段缺失（getattr 返回 None）
+        ],
+    )
+    def test_l2_floor_resolution(self, cfg_value, expected):
+        class _Cfg:
+            l2_min_score = cfg_value
+        assert layer_score_floor("l2", _Cfg()) == expected
+
+    def test_l3_always_uses_min_score(self):
+        class _Cfg:
+            l2_min_score = 0.99
+        assert layer_score_floor("l3", _Cfg()) == MIN_SCORE
+
+    def test_dirty_config_falls_back_instead_of_raising(self):
+        class _Cfg:
+            l2_min_score = "不是数字"
+        assert layer_score_floor("l2", _Cfg()) == MIN_SCORE
+
+    def test_no_config_at_all(self):
+        assert layer_score_floor("l2", None) == MIN_SCORE
+        assert layer_score_floor("l3", None) == MIN_SCORE
 
 
 # ---------------------------------------------------------------------------
