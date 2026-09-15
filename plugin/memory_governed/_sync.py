@@ -462,18 +462,54 @@ class WriteQueue:
     def _existing_contents(self) -> set:
         """Return the set of ``content`` values already present in L2.
 
-        Reads ONLY the content column: pulling the 1024-dim vector column for
-        thousands of rows is needlessly expensive. Best-effort by contract — a
-        failure here degrades to an empty set, which can only cause a duplicate
-        re-add, never a loss.
+        Reads ONLY the content column where possible: pulling the 1024-dim
+        vector column for thousands of rows is needlessly expensive. Best-effort
+        by contract — a failure here degrades to an empty set, which can only
+        cause a duplicate re-add, never a loss.
+
+        STRATEGY ORDER MATTERS (see STRATEGY 1 comment): pyarrow is a hard
+        dependency of lancedb, so the Arrow projection scan must be tried first.
+        The pandas-based strategies are kept only as later fallbacks for
+        environments that happen to have pandas installed.
         """
         store = self._l2_store
         if store is None:
             return set()
 
-        # Preferred (lancedb >= 0.17): a scan query with `.select(["content"])`
-        # projects ONLY the content column, so the 1024-dim vector column is
-        # never materialised. `limit()` must be >= row count (the default is 10).
+        # STRATEGY 1 (must be first): pyarrow is a HARD dependency of lancedb,
+        # so an Arrow scan is the only path guaranteed to exist on every
+        # deployment. A scan query with `.select(["content"])` projects ONLY the
+        # content column, so the 1024-dim vector column is never materialised.
+        # `limit()` must be >= row count (the default is 10).
+        #
+        # LESSON LEARNED (2026-09): the original ordering tried `to_pandas()`
+        # first. pandas is NOT a lancedb hard dependency — the hermes deploy
+        # runtime (`hermes-agent/venv`) ships lancedb + pyarrow + numpy but NO
+        # pandas and NO pylance. Every pandas-based strategy therefore raised
+        # ModuleNotFoundError there, `_existing_contents()` returned an empty
+        # set, and store-level L2 dedup was silently inert (every turn re-added
+        # the same facts). The project dev venv happened to have pandas, so the
+        # tests passed and the bug escaped to production. Arrow must come first.
+        try:
+            n = store.count_rows()
+            if n == 0:
+                return set()
+            table = store.search().select(["content"]).limit(n).to_arrow()
+            return {str(c) for c in table.column("content").to_pylist() if c is not None}
+        except Exception:  # noqa: BLE001 - fall through to the next strategy
+            pass
+
+        # STRATEGY 2: full-table Arrow scan. No column projection, so it drags
+        # the whole 1024-dim vector column along — used only when the projected
+        # scan above is unavailable. Still pyarrow-only, hence still dependency-free.
+        try:
+            table = store.to_arrow()
+            return {str(c) for c in table.column("content").to_pylist() if c is not None}
+        except Exception:  # noqa: BLE001 - fall through
+            pass
+
+        # STRATEGY 3: pandas-based projection over a scan query. Works ONLY
+        # where pandas is installed (project dev venv) — NOT the deploy runtime.
         try:
             n = store.count_rows()
             if n == 0:
@@ -483,21 +519,23 @@ class WriteQueue:
         except Exception:  # noqa: BLE001 - fall through to the next strategy
             pass
 
-        # Some LanceDB builds expose column projection on to_pandas().
+        # STRATEGY 4: some LanceDB builds expose column projection on to_pandas().
         try:
             df = store.to_pandas(columns=["content"])
             return {str(c) for c in df["content"].tolist() if c is not None}
         except Exception:  # noqa: BLE001 - fall through
             pass
 
-        # Older LanceDB builds: project through the Lance dataset (needs pylance).
+        # STRATEGY 5: older LanceDB builds project through the Lance dataset
+        # (needs pylance, which is usually absent).
         try:
             table = store.to_lance().to_table(columns=["content"])
             return {str(c) for c in table.column("content").to_pylist() if c is not None}
         except Exception:  # noqa: BLE001 - fall through
             pass
 
-        # In-memory doubles (e.g. test stores) expose their rows directly.
+        # STRATEGY 6: in-memory doubles (e.g. test stores) expose their rows
+        # directly via a plain list attribute.
         rows = getattr(store, "rows", None)
         if isinstance(rows, list):
             return {

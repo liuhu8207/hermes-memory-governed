@@ -528,6 +528,126 @@ class TestL2Dedup:
         assert _diag.metrics().get("facts_deduped") == 1
 
 
+class TestL2DedupArrowPriority:
+    """Regression guard: the Arrow path must be tried BEFORE any pandas path.
+
+    The hermes deploy runtime (``hermes-agent/venv``) ships lancedb + pyarrow +
+    numpy but NO pandas and NO pylance. The previous ordering called
+    ``to_pandas()`` first, so ``_existing_contents()`` raised
+    ModuleNotFoundError, fell through every strategy, returned an empty set,
+    and store-level L2 dedup silently no-op'd in production. The project dev
+    venv happens to have pandas, so the tests stayed green and the bug escaped.
+    See ``_sync._existing_contents`` STRATEGY 1.
+    """
+
+    class _Col:
+        def __init__(self, data):
+            self._data = list(data)
+
+        def to_pylist(self):
+            return list(self._data)
+
+    class _Table:
+        def __init__(self, data):
+            self._data = list(data)
+            self.num_rows = len(self._data)
+            self.column_names = ["content"]
+
+        def column(self, name):
+            assert name == "content", name
+            return TestL2DedupArrowPriority._Col(self._data)
+
+    class _Series:
+        def __init__(self, data):
+            self._data = list(data)
+
+        def tolist(self):
+            return list(self._data)
+
+    class _FakeDF:
+        """Stand-in for a pandas DataFrame: only ``df["content"].tolist()``."""
+
+        def __init__(self, data):
+            self._data = list(data)
+
+        def __getitem__(self, key):
+            assert key == "content", key
+            return TestL2DedupArrowPriority._Series(self._data)
+
+    class _Query:
+        def __init__(self, store):
+            self._store = store
+
+        def select(self, cols):
+            assert cols == ["content"], cols
+            return self
+
+        def limit(self, n):
+            self._store.limit_calls.append(n)
+            return self
+
+        def to_arrow(self):
+            self._store.arrow_calls += 1
+            return TestL2DedupArrowPriority._Table(self._store.arrow_rows)
+
+        def to_pandas(self):
+            # Reached only if the ordering regressed (pandas tried first).
+            self._store.pandas_calls += 1
+            return TestL2DedupArrowPriority._FakeDF(self._store.pandas_rows)
+
+    class _Store:
+        """Arrow-only table double: no ``to_pandas`` / ``to_lance`` / ``rows``.
+
+        This mirrors the deploy runtime, where the only importable projection
+        path is Arrow.
+        """
+
+        def __init__(self, arrow_rows, pandas_rows=()):
+            self.arrow_rows = list(arrow_rows)
+            self.pandas_rows = list(pandas_rows)
+            self.arrow_calls = 0
+            self.pandas_calls = 0
+            self.limit_calls: list = []
+
+        def count_rows(self):
+            return len(self.arrow_rows)
+
+        def search(self):
+            return TestL2DedupArrowPriority._Query(self)
+
+        def add(self, rows):  # pragma: no cover - reads must not add
+            raise AssertionError("add() must not run while reading existing content")
+
+    def test_arrow_only_store_still_dedups(self, config):
+        """A runtime without pandas must still dedup — never return an empty set."""
+        queue = WriteQueue(config)
+        store = self._Store(["alpha fact", "beta fact", None])
+        queue._l2_store = store
+
+        assert queue._existing_contents() == {"alpha fact", "beta fact"}
+        assert store.arrow_calls == 1, "the Arrow projection scan was not used"
+        assert store.limit_calls == [3], store.limit_calls
+
+    def test_arrow_result_wins_over_pandas(self, config):
+        """Arrow is tried first: a differing pandas result must never be returned."""
+        queue = WriteQueue(config)
+        store = self._Store(arrow_rows=["from-arrow"],
+                            pandas_rows=["from-pandas"])
+        queue._l2_store = store
+
+        assert queue._existing_contents() == {"from-arrow"}
+        assert store.arrow_calls == 1
+        assert store.pandas_calls == 0, "pandas path ran before the Arrow path"
+
+    def test_zero_rows_short_circuits_before_scan(self, config):
+        queue = WriteQueue(config)
+        store = self._Store([])
+        queue._l2_store = store
+
+        assert queue._existing_contents() == set()
+        assert store.arrow_calls == 0, "count_rows()==0 must short-circuit the scan"
+
+
 # ---------------------------------------------------------------------------
 # P1-2 — WriteQueue stop semantics
 # ---------------------------------------------------------------------------
