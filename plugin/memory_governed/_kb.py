@@ -397,7 +397,17 @@ class KnowledgeBase:
                         "snippet": r["text"][:160].strip(),
                     }
 
-        ranked = sorted(scored.values(), key=lambda x: x["score"], reverse=True)[:top_k]
+        ranked = sorted(scored.values(), key=lambda x: x["score"], reverse=True)
+
+        # ``kb.min_score`` 过滤：低于阈值的条目不再返回，让配置真正生效。
+        # 默认 0.0 时**完全不过滤**（等价于旧行为，向后兼容）；防御式读取
+        # 旧配置缺字段的情况。注意：关键词分数与语义分数不同量纲（关键词
+        # 命中可到 10 分制、语义为 [0,1]），阈值应据此设置。
+        min_score = float(getattr(self._config.kb, "min_score", 0.0) or 0.0)
+        if min_score > 0.0:
+            ranked = [item for item in ranked if item["score"] >= min_score]
+
+        ranked = ranked[:top_k]
 
         # 反链统计（只对 top_k 结果补充，避免全库扫描放大）
         backlink_cache: Dict[str, List[str]] = {}

@@ -47,6 +47,12 @@ DEFAULT_COSINE_DISTANCE: float = 1.0
 #: :meth:`RecallEngine.format_recall` 丢弃低相关项的阈值（P0 用户可见症状的闸门）。
 MIN_SCORE: float = 0.1
 
+#: L3 召回只保留"用户 / 助手"对话，过滤 ``tool`` 角色。
+#: 实测 tool 消息（JSON 结果 / 终端输出 / 文件列表）占 L3 语料约 60%，
+#: 且会以 score=1.0 挤进注入上下文 —— 它们是工具过程输出，不是可复用的
+#: 会话记忆，必须挡在召回之外。提为模块级常量便于以后调整白名单。
+L3_RECALL_ROLES: tuple = ("user", "assistant")
+
 
 def distance_to_score(distance: float) -> float:
     """把 LanceDB 的余弦距离换算成 [0, 1] 的相关性分数。
@@ -436,13 +442,19 @@ class RecallEngine:
             self._close_quietly(conn)
 
     def _search_l3_fts(self, conn: sqlite3.Connection, fts_query: str) -> List[RecallResult]:
-        """Run the FTS5 branch on an existing connection (English / non-CJK terms)."""
+        """Run the FTS5 branch on an existing connection (English / non-CJK terms).
+
+        ``messages_fts`` 自带 ``role`` 列，直接加 ``AND role IN (...)`` 过滤 tool
+        角色即可，无需 join 回 ``messages``。
+        """
         results: List[RecallResult] = []
+        role_placeholders = ",".join("?" * len(L3_RECALL_ROLES))
         try:
             rows = conn.execute(
                 "SELECT rowid, content, rank, timestamp FROM messages_fts "
-                "WHERE messages_fts MATCH ? ORDER BY rank LIMIT ?",
-                (fts_query, self._config.recall.l3_max_results),
+                f"WHERE messages_fts MATCH ? AND role IN ({role_placeholders}) "
+                "ORDER BY rank LIMIT ?",
+                (fts_query, *L3_RECALL_ROLES, self._config.recall.l3_max_results),
             ).fetchall()
         except Exception as e:
             logger.debug("L3 FTS5 search failed: %s", e)
@@ -550,10 +562,14 @@ class RecallEngine:
         try:
             patterns = [f"%{self._escape_like(segment)}%" for segment in segments]
             where_clause = " OR ".join(["content LIKE ? ESCAPE '\\'"] * len(patterns))
+            role_placeholders = ",".join("?" * len(L3_RECALL_ROLES))
+            # 括号保证语义是 (片段1 OR 片段2 ...) AND role IN (...)，
+            # 而不是把 role 条件并进 OR 链（那样会让任意 tool 行都被命中）。
             rows = conn.execute(
                 "SELECT rowid, content, timestamp FROM messages "
-                f"WHERE {where_clause} ORDER BY timestamp DESC LIMIT ?",
-                (*patterns, self._config.recall.l3_max_results),
+                f"WHERE ({where_clause}) AND role IN ({role_placeholders}) "
+                "ORDER BY timestamp DESC LIMIT ?",
+                (*patterns, *L3_RECALL_ROLES, self._config.recall.l3_max_results),
             ).fetchall()
         except Exception as e:
             logger.debug("L3 LIKE search failed: %s", e)
@@ -743,8 +759,22 @@ class RecallEngine:
             truncated_l1 = self._truncate_to_tokens(l1_text, l1_budget)
             parts.append(f"[User Rules]\n{truncated_l1}")
 
-        # L2/L3: shared budget, sorted by score, skip low-relevance items
+        # L2/L3: shared budget, skip low-relevance items, then dedup by content.
         l23_items = [r for r in results if r.layer in ("l2", "l3") and r.score >= MIN_SCORE]
+
+        # 按 content 去重，只保留最高分那条：实测 L2 重复率 94.8%，
+        # 同一事实的副本会彼此抢占 l23_budget，把真正多样的记忆挤出去。
+        best_by_content: Dict[str, RecallResult] = {}
+        for item in l23_items:
+            current = best_by_content.get(item.content)
+            if current is None or item.score > current.score:
+                best_by_content[item.content] = item
+
+        # 显式按分数降序，不依赖调用方：parallel_recall 已经排好序，但
+        # format_recall 也会被直接调用（测试 / 其它入口），必须先排序再进预算
+        # 循环，否则低分条目会先占满预算、把高分条目 break 掉。
+        l23_items = sorted(best_by_content.values(), key=lambda r: r.score, reverse=True)
+
         if l23_items:
             budget_chars = l23_budget * 4  # rough token→char
             used = 0

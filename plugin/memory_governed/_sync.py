@@ -31,6 +31,7 @@ from typing import Any, Dict, List, Optional
 
 from ._config import GovernedMemoryConfig
 from ._diag import log_data_loss, log_degraded, record_metric
+from ._synthesize import _content_to_text
 
 logger = logging.getLogger(__name__)
 
@@ -433,6 +434,14 @@ class WriteQueue:
             if not facts:
                 return
 
+            # Deduplicate (vs. the store + within the batch) BEFORE embedding:
+            # a long-lived session re-feeds its history every turn, so without
+            # this the same sentences were re-embedded and re-appended (~19x
+            # redundancy observed in production).
+            facts = self._drop_existing_facts(facts)
+            if not facts:
+                return
+
             # Attach L3 source reference (rowid) for audit drill-down.
             # Facts are SENTENCES while rowid_map is keyed by MESSAGE, so the
             # lookup must fall back to substring matching.
@@ -449,6 +458,86 @@ class WriteQueue:
             self._l2_store.add(facts)
         except Exception as e:  # noqa: BLE001 - L2 failure must not kill the turn
             log_degraded("l2_write", "index_failed", exc=e)
+
+    def _existing_contents(self) -> set:
+        """Return the set of ``content`` values already present in L2.
+
+        Reads ONLY the content column: pulling the 1024-dim vector column for
+        thousands of rows is needlessly expensive. Best-effort by contract — a
+        failure here degrades to an empty set, which can only cause a duplicate
+        re-add, never a loss.
+        """
+        store = self._l2_store
+        if store is None:
+            return set()
+
+        # Preferred (lancedb >= 0.17): a scan query with `.select(["content"])`
+        # projects ONLY the content column, so the 1024-dim vector column is
+        # never materialised. `limit()` must be >= row count (the default is 10).
+        try:
+            n = store.count_rows()
+            if n == 0:
+                return set()
+            df = store.search().select(["content"]).limit(n).to_pandas()
+            return {str(c) for c in df["content"].tolist() if c is not None}
+        except Exception:  # noqa: BLE001 - fall through to the next strategy
+            pass
+
+        # Some LanceDB builds expose column projection on to_pandas().
+        try:
+            df = store.to_pandas(columns=["content"])
+            return {str(c) for c in df["content"].tolist() if c is not None}
+        except Exception:  # noqa: BLE001 - fall through
+            pass
+
+        # Older LanceDB builds: project through the Lance dataset (needs pylance).
+        try:
+            table = store.to_lance().to_table(columns=["content"])
+            return {str(c) for c in table.column("content").to_pylist() if c is not None}
+        except Exception:  # noqa: BLE001 - fall through
+            pass
+
+        # In-memory doubles (e.g. test stores) expose their rows directly.
+        rows = getattr(store, "rows", None)
+        if isinstance(rows, list):
+            return {
+                str(r["content"]) for r in rows
+                if isinstance(r, dict) and r.get("content") is not None
+            }
+
+        logger.debug("L2 dedup: could not read existing content; skipping store-level dedup")
+        return set()
+
+    def _drop_existing_facts(self, facts: List[dict]) -> List[dict]:
+        """Drop facts whose content is already in L2, or repeated in this batch.
+
+        Two layers, both required:
+
+        - store-level: a re-fed long session re-extracts the same sentences
+          every turn — without this they are re-embedded and re-appended;
+        - batch-level: the same sentence can be extracted twice within one
+          batch (duplicate messages in the turn).
+
+        First-seen order is preserved. Call BEFORE ``_attach_vectors`` so no
+        embedding work is spent on rows that will be dropped.
+        """
+        if not facts:
+            return facts
+        seen = self._existing_contents()
+        kept: List[dict] = []
+        dropped = 0
+        for fact in facts:
+            key = str(fact.get("content", ""))
+            if key in seen:
+                dropped += 1
+                continue
+            seen.add(key)
+            kept.append(fact)
+        if dropped:
+            record_metric("facts_deduped", dropped)
+            logger.info("L2 dedup: dropped %d/%d fact(s) already present",
+                        dropped, len(facts))
+        return kept
 
     def _attach_vectors(self, facts: List[dict]) -> None:
         """Fill ``fact["vector"]`` where an embedding backend produced one.
@@ -733,7 +822,9 @@ class WriteQueue:
             return ref
 
         for msg in messages:
-            content = msg.get("content", "") or ""
+            # Normalise first: a multimodal (list) message would make
+            # `fact_content in content` raise instead of matching.
+            content = _content_to_text(msg.get("content"))
             if content and fact_content in content:
                 ref = rowid_map.get(_rowid_key(content))
                 if ref is not None:
@@ -745,7 +836,10 @@ class WriteQueue:
         facts = []
         for msg in messages:
             role = msg.get("role", "")
-            content = msg.get("content", "")
+            # Normalise multimodal content (list of OpenAI parts) to text so that
+            # sentence splitting never sees a `list` (which raised
+            # "expected string or bytes-like object, got 'list'").
+            content = _content_to_text(msg.get("content"))
             if not content or role not in ("user", "assistant"):
                 continue
 
@@ -1017,7 +1111,11 @@ class L3Writer:
             try:
                 for msg in messages:
                     role = msg.get("role", "")
-                    content = msg.get("content", "")
+                    # hermes transcripts may carry multimodal content (a list of
+                    # OpenAI parts). Normalise to text BEFORE hashing/splitting,
+                    # otherwise `str + list` raises TypeError and the whole batch
+                    # is rolled back (real data loss).
+                    content = _content_to_text(msg.get("content"))
                     if not content:
                         continue
 

@@ -380,6 +380,155 @@ class TestAuditDrillDown:
 
 
 # ---------------------------------------------------------------------------
+# P0 regression — multimodal (list) message content must not break the write path
+# ---------------------------------------------------------------------------
+
+class TestMultimodalContent:
+    """hermes transcripts carry OpenAI-style content parts (a ``list``).
+
+    Regression: ``session_id + "|" + role + "|" + content`` raised
+    ``TypeError: can only concatenate str (not "list") to str`` inside
+    ``L3Writer.write`` (rolling back the WHOLE batch — repeated real data loss),
+    and ``_split_sentences`` raised
+    ``expected string or bytes-like object, got 'list'`` inside
+    ``_extract_atomic_facts``. Both paths now normalise through
+    ``_synthesize._content_to_text`` before hashing / splitting.
+    """
+
+    @staticmethod
+    def _text(*texts):
+        return [{"type": "text", "text": t} for t in texts]
+
+    def test_l3_write_accepts_list_content(self, config):
+        writer = L3Writer(config)
+        rowid_map = writer.write(
+            [{"role": "user", "content": self._text("我们决定用 PostgreSQL 作为主数据库")}],
+            "s-multimodal",
+        )
+        conn = sqlite3.connect(config.l3_db_path)
+        rows = conn.execute("SELECT content FROM messages").fetchall()
+        n_fts = conn.execute("SELECT COUNT(*) FROM messages_fts").fetchone()[0]
+        conn.close()
+        writer.shutdown()
+
+        assert len(rows) == 1, "list-content message was not archived"
+        assert "PostgreSQL" in rows[0][0]
+        assert n_fts == 1, "list-content message was not mirrored into FTS"
+        assert rowid_map, "rowid_map empty for list content"
+
+    def test_l3_write_mixed_str_and_list(self, config):
+        writer = L3Writer(config)
+        writer.write([
+            {"role": "user", "content": "I prefer dark mode everywhere"},
+            {"role": "assistant", "content": self._text("好的", "我会记录这个决定")},
+        ], "s-mixed")
+        conn = sqlite3.connect(config.l3_db_path)
+        n_msg = conn.execute("SELECT COUNT(*) FROM messages").fetchone()[0]
+        n_fts = conn.execute("SELECT COUNT(*) FROM messages_fts").fetchone()[0]
+        conn.close()
+        writer.shutdown()
+
+        assert n_msg == n_fts == 2, f"mixed batch lost rows: msg={n_msg} fts={n_fts}"
+
+    def test_image_only_message_is_skipped(self, config):
+        """A list with no text parts normalises to '' and keeps skip semantics."""
+        writer = L3Writer(config)
+        writer.write(
+            [{"role": "user",
+              "content": [{"type": "image_url",
+                           "image_url": {"url": "https://example.com/x.png"}}]}],
+            "s-img",
+        )
+        conn = sqlite3.connect(config.l3_db_path)
+        n_msg = conn.execute("SELECT COUNT(*) FROM messages").fetchone()[0]
+        conn.close()
+        writer.shutdown()
+
+        assert n_msg == 0, "an image-only part has no text to archive"
+
+    def test_extract_atomic_facts_handles_list_content(self, config):
+        queue = WriteQueue(config)
+        facts = queue._extract_atomic_facts(
+            [{"role": "user", "content": self._text("我们决定用 PostgreSQL 作为主数据库")}]
+        )
+        assert facts, "list content produced no facts"
+        assert all(isinstance(f["content"], str) for f in facts)
+
+    def test_index_l2_end_to_end_with_list_content(self, config):
+        writer = L3Writer(config)
+        queue = WriteQueue(config)
+        messages = [{"role": "user",
+                     "content": self._text("部署方案确定用 Docker Compose")}]
+        rowid_map = writer.write(messages, "s-list-l2")
+        store = _FakeL2Store()
+        queue._l2_store = store
+        queue._index_l2(messages, rowid_map)
+        writer.shutdown()
+
+        assert store.rows, "no facts indexed from list content"
+
+    def test_resolve_source_rowid_handles_list_message(self, config):
+        """The messages fallback must normalise, not compare against a raw list."""
+        queue = WriteQueue(config)
+        messages = [{"role": "user",
+                     "content": self._text("We decided to use Postgres for the store.")}]
+        rowid_map = {"We decided to use Postgres for the store.": 5}
+        assert queue._resolve_source_rowid(
+            "use Postgres for the store", rowid_map, messages
+        ) == 5
+
+
+# ---------------------------------------------------------------------------
+# P0 regression — L2 write de-duplication (long sessions re-feed their history)
+# ---------------------------------------------------------------------------
+
+class TestL2Dedup:
+    FACT = "We decided to use PostgreSQL for the store"
+
+    def test_same_content_is_not_rewritten(self, config):
+        queue = WriteQueue(config)
+        store = _FakeL2Store()
+        queue._l2_store = store
+        messages = [{"role": "user", "content": self.FACT}]
+
+        queue._index_l2(messages, {})
+        first = len(store.rows)
+        assert first >= 1
+        queue._index_l2(messages, {})  # the long session re-feeds the same turn
+
+        assert len(store.rows) == first, "duplicate facts were re-appended to L2"
+
+    def test_batch_internal_duplicates_are_dropped(self, config):
+        queue = WriteQueue(config)
+        store = _FakeL2Store()
+        queue._l2_store = store
+
+        queue._index_l2([
+            {"role": "user", "content": self.FACT},
+            {"role": "user", "content": self.FACT},
+        ], {})
+
+        contents = [r["content"] for r in store.rows]
+        assert contents.count(self.FACT) == 1, f"batch duplicates kept: {contents}"
+
+    def test_dedup_runs_before_embedding(self, config):
+        """Dropped facts must not spend an embedding call."""
+        queue = WriteQueue(config)
+        store = _FakeL2Store()
+        queue._l2_store = store
+        calls: list = []
+        queue._embed_fn = lambda text: (calls.append(text), [0.1, 0.2])[1]
+        messages = [{"role": "user", "content": self.FACT}]
+
+        queue._index_l2(messages, {})
+        assert calls == [self.FACT]
+        queue._index_l2(messages, {})
+
+        assert calls == [self.FACT], "duplicate fact was embedded again"
+        assert _diag.metrics().get("facts_deduped") == 1
+
+
+# ---------------------------------------------------------------------------
 # P1-2 — WriteQueue stop semantics
 # ---------------------------------------------------------------------------
 
