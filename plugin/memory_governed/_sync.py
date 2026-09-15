@@ -171,6 +171,29 @@ _FACT_SIGNALS_EN = (
     "the reason", "conclusion", "migrate", "deprecat",
 )
 
+# Named constants for the signal weights below. Keeping them explicit makes the
+# ranking tunable without hunting magic numbers through the scoring function.
+_USER_SIGNAL_WEIGHT = 2
+_SOFT_SIGNAL_WEIGHT = 1
+
+# First-person user statements — the core payload of a memory system.
+# "我需要/我一般/太麻烦/必须/不能/否则" encode constraints and preferences that
+# stay true across sessions, so they must outrank generic prose when the
+# per-turn cap bites.
+_FACT_SIGNALS_USER_ZH = (
+    "我需要", "我想要", "我一般", "我家里", "我的", "我装", "我在", "我用的",
+    "我不", "太麻烦", "必须", "不能", "否则",
+)
+
+# Hedged / procedural wording. Real but weakly committed, so rank it below a
+# hard user constraint. (Never blocks extraction on its own — ranking only.)
+_FACT_SIGNALS_SOFT = ("可能", "建议", "试试", "或许", "大概", "一般来说")
+
+# Durable knowledge comes overwhelmingly from USER turns: preferences,
+# constraints and requirements. Assistant turns mostly narrate execution
+# ("让我检查一下…"), which is a run log rather than knowledge.
+_ROLE_WEIGHTS: Dict[str, int] = {"user": 2, "assistant": -1}
+
 # Pure chatter: never a durable fact.
 _GREETINGS = {
     "你好", "您好", "嗨", "哈喽", "谢谢", "多谢", "感谢", "好的", "好", "嗯",
@@ -201,9 +224,170 @@ _IMPORT_LINE_RE = re.compile(
     r"^from\s+[\w.]+\s+import\s|^import\s+[\w.]+(\s*,\s*[\w.]+)*\s*$", re.IGNORECASE
 )
 
+# ---------------------------------------------------------------------------
+# L2 quality gate
+#
+# L2 is a VECTOR store, so a junk row is worse than wasted disk: it competes
+# for recall slots and wins them. Once a row is in L2 it is already past the
+# Bridge review gate (which sits between L2 and L1), so nothing downstream can
+# clean it up — this gate has to reject noise at extraction time.
+#
+# Categories rejected below (each observed in the real L2 corpus):
+#   1. assistant process narration      "让我检查一下记忆系统的状态"
+#   2. markdown structure               "============", "| 组件 | 状态 |", "## 方案一：…"
+#   3. system-injected notices          "[System note: …]"
+#   4. status-report metadata rows      "Provider: governed", "大小: 236KB"
+#   5. self-check boilerplate           "记忆系统自检报告", "⏳ 待积累"
+# ---------------------------------------------------------------------------
 
-def _fact_signal_score(sentence: str) -> int:
-    """Count how many preference/decision signals a sentence contains."""
+# Assistant narration about what it is about to do. A run log of the current
+# turn, not knowledge worth carrying into the next one. ("让我", which the
+# older `_COMMAND_PREFIXES` misses, is the single biggest offender.)
+_ASSISTANT_PROCESS_PREFIXES = (
+    "让我", "我来", "我先", "让我来", "让我先", "现在让我", "好的，让我",
+    "接下来", "下面", "咱们", "来看一下", "来总结一下", "来测试一下",
+    "我这就", "好，让我",
+)
+
+# Politeness / filler offers. Never durable knowledge.
+_POLITE_MARKERS = (
+    "有什么我能帮", "有什么可以帮", "能帮到你吗", "我可以帮你", "我可以为您",
+    "要我帮你", "需要我帮你", "要不要我",
+)
+
+# Assistant outcome reports about THIS turn ("Bug 修复成功", "现在正常工作了").
+# A result is a fact about one run, not durable knowledge.
+_ASSISTANT_OUTCOME_MARKERS = (
+    "修复成功", "修复完成", "正常工作了", "已正常工作", "已正常运行",
+    "对接正常", "现在可以直接使用", "现在可以这样使用", "就不需要",
+)
+
+# Notices injected by the runtime rather than written by either participant.
+_SYSTEM_NOISE_MARKERS = (
+    "[system note", "system note", "operation interrupted",
+    "gateway shutdown", "gateway is no longer running", "gateway is now back online",
+    "session was restored", "has already run", "any restart/shutdown command",
+)
+
+# Self-check / health-report boilerplate (`governed_health` output was the
+# single largest noise source in the corpus).
+_SELF_CHECK_MARKERS = (
+    "自检报告", "健康报告", "自检一下", "全面自检", "自检完毕", "状态报告",
+    "待积累", "尚未创建", "尚未生成",
+)
+
+# Markdown structure. These carry formatting, not content.
+_MD_RULE_RE = re.compile(r"^(?:={3,}|-{3,}|_{3,}|\*{3,}|~{3,})$")
+_MD_TABLE_ROW_RE = re.compile(r"^\|.*\|$")
+# NOTE: `\S.*` rather than a bare `\S+` — real headings contain spaces and
+# emoji ("## 方案三：链接分享 + 密码", "## ✅ 对接状态"), which `\S+` misses.
+_MD_HEADING_RE = re.compile(r"^#{1,6}\s+\S.*$")
+_MD_BOLD_LABEL_RE = re.compile(r"^\*\*[^*]{1,40}\*\*")
+# Sections written without '#' ("L2 语义记忆 (向量搜索)").
+_MD_PAREN_TITLE_RE = re.compile(r"^[^\n:：。！？]{1,30}[（(][^）)]{1,30}[）)]\s*$")
+_MD_BRACKET_LABEL_RE = re.compile(r"^【[^】]{0,24}】")
+
+# Tree listings and "path - count" directory enumerations.
+_MD_TREE_RE = re.compile(r"^[├└│─\s]*[├└│]")
+_DIR_COUNT_RE = re.compile(r"^[A-Za-z0-9_./\-]+\s+[-–—]\s+\S.{0,40}$")
+
+# Metadata "key: value" rows out of status reports. Matched against the
+# UNDECORATED copy so that "- **Provider**: `governed`", "**Provider**: …"
+# and "Provider: …" all hit the same rule. Deliberately a closed list: a
+# generic short-key rule would also eat prose headings such as
+# "方案二：文件夹权限控制".
+_REPORT_KV_KEYS = (
+    # English keys
+    "provider", "status", "state", "size", "path", "storage", "store", "dir",
+    "embedding", "reranking", "reranker", "file", "files", "content", "total",
+    "total files", "version", "available", "latency", "cache", "mode",
+    "index", "vector index", "kb", "bridge", "write queue", "queue", "model",
+    "dim", "timeout", "ttl", "decay", "health", "component",
+    # Chinese keys
+    "状态", "大小", "路径", "存储", "内容", "文件", "总文件", "总行数",
+    "索引", "向量索引", "索引状态", "时间衰减", "可用", "延迟", "版本",
+    "模式", "容量", "地址", "组件", "健康",
+)
+_REPORT_KV_RE = re.compile(
+    r"^(?:"
+    + "|".join(re.escape(k) for k in sorted(_REPORT_KV_KEYS, key=len, reverse=True))
+    + r")\s*[:：]",
+    re.IGNORECASE,
+)
+
+# "L1（手写规则层）: …" — a parenthesis-labelled metadata row.
+_PAREN_LABEL_KV_RE = re.compile(
+    r"^[^:：（）()]{0,24}[（(][^）)]{1,30}[）)][^:：]{0,16}[:：]"
+)
+
+# Leading decoration that must be removed BEFORE prefix/key checks: bullets,
+# ordinal list marks and status symbols ("- ⚠️ **Provider**: governed").
+_LEADING_BULLET_RE = re.compile(r"^(?:[-*•>]|\d+[.)、])\s+")
+_LEADING_SYMBOL_RE = re.compile(r"^[^\w\u4e00-\u9fff*`(【\[\"'“”]+")
+_BOLD_STRIP_RE = re.compile(r"\*\*([^*]{1,200}?)\*\*")
+
+# An assistant sentence this short cannot carry durable knowledge unless it
+# echoes a user constraint. Only applied when the role is known.
+_ASSISTANT_MIN_WEIGHTED_LEN = 24
+
+# Section titles written as bare fragments ("项目规则和行为约束", "记忆系统怎么样").
+# A CJK-only run with no punctuation and no user voice is a heading, not a
+# sentence. English is exempt: its spaces are word separators, so it has no
+# equivalent of this shape.
+_TITLE_FRAGMENT_MAX_WEIGHT = 36
+_TITLE_FRAGMENT_RE = re.compile(r"^\S+$")
+
+# Assistant lead-in lines that end on a colon ("来看一下当前记忆系统的状态：").
+_COLON_LEADIN_PREFIXES = (
+    "以下是", "如下", "来看一下", "来总结一下", "总结一下", "可以有几个",
+    "但有几个", "有几个方案", "可以这样配合", "现在可以直接", "现在可以这样",
+)
+
+# Max times _undecorate() peels one layer of leading decoration.
+_UNDECORATE_PEELS = 4
+
+
+def _undecorate(text: str) -> str:
+    """Peel leading bullets, list marks and status symbols off a sentence.
+
+    ``"- ⚠️ **Provider**: governed"`` -> ``"**Provider**: governed"``.
+    Reference-style structure needs to survive (``**`` is preserved) because
+    the bold-label rule matches on it, so only symbols that are NOT part of a
+    markdown token are stripped.
+
+    Args:
+        text: Raw sentence text.
+
+    Returns:
+        The sentence with leading decoration removed.
+    """
+    body = text.strip()
+    for _ in range(_UNDECORATE_PEELS):
+        candidate = _LEADING_BULLET_RE.sub("", body, count=1).lstrip()
+        candidate = _LEADING_SYMBOL_RE.sub("", candidate, count=1)
+        if candidate == body:
+            break
+        body = candidate
+    return body
+
+
+def _fact_signal_score(sentence: str, role: str = "") -> int:
+    """Score how much durable value a sentence carries.
+
+    Higher is better: the score decides which facts survive when the per-turn
+    cap in :meth:`WriteQueue._extract_atomic_facts` bites.
+
+    Args:
+        sentence: Candidate fact text.
+        role: Role of the originating message (``"user"`` / ``"assistant"``).
+            User turns state the preferences and constraints this system
+            exists to remember, so they are weighted UP; assistant turns are
+            mostly narration about how the request was fulfilled, so they are
+            weighted DOWN. Unknown/empty roles are neutral.
+
+    Returns:
+        An integer that may be negative.
+    """
     lowered = sentence.lower()
     score = 0
     for signal in _FACT_SIGNALS_EN:
@@ -212,6 +396,13 @@ def _fact_signal_score(sentence: str) -> int:
     for signal in _FACT_SIGNALS_ZH:
         if signal in sentence:
             score += 1
+    for signal in _FACT_SIGNALS_USER_ZH:
+        if signal in sentence:
+            score += _USER_SIGNAL_WEIGHT
+    for signal in _FACT_SIGNALS_SOFT:
+        if signal in sentence:
+            score -= _SOFT_SIGNAL_WEIGHT
+    score += _ROLE_WEIGHTS.get(role, 0)
     return score
 
 
@@ -883,13 +1074,15 @@ class WriteQueue:
 
             # Simple extraction: sentences that look like facts
             for sentence in self._split_sentences(content):
-                if self._looks_like_fact(sentence):
+                # Pass the role so the gate can be stricter on assistant
+                # narration, and so ranking prefers user-stated constraints.
+                if self._looks_like_fact(sentence, role):
                     facts.append({
                         "content": sentence.strip(),
                         "category": self._categorize(sentence),
                         "source": "auto-extract",
                         "timestamp": datetime.now().isoformat(),
-                        "_signals": _fact_signal_score(sentence),
+                        "_signals": _fact_signal_score(sentence, role),
                     })
 
         # Ranking: keep the strongest facts when the per-turn cap bites.
@@ -928,13 +1121,27 @@ class WriteQueue:
         return _split_sentences(text)
 
     @staticmethod
-    def _looks_like_fact(sentence: str) -> bool:
+    def _looks_like_fact(sentence: str, role: str = "") -> bool:
         """Heuristic: does this sentence look like a durable fact?
 
-        Deliberately LENIENT (recall first — the Bridge review gate filters
-        noise later), but with explicit exclusions for content that is never
-        durable knowledge: greetings, imperatives, code/log lines, questions
-        and fragments that are too short or too long.
+        Rejects content that is never durable knowledge: questions, greetings,
+        imperatives, code/log lines, fragments that are too short or too long,
+        markdown structure, system-injected notices, status-report metadata
+        rows, self-check boilerplate and assistant process narration.
+
+        Anything that survives is still *lenient* on purpose — admission is
+        cheap, but every admitted row becomes a permanent competitor in L2
+        vector space, which is why the noise classes above are hard rejects.
+
+        Args:
+            sentence: Candidate sentence text.
+            role: Optional originating message role. When it is ``"assistant"``
+                an extra minimum-length rule applies, because an assistant's
+                short replies ("Bug 修复成功", "现在可以直接使用：") are outcome
+                reports rather than knowledge.
+
+        Returns:
+            True when the sentence should be extracted into L2.
         """
         text = (sentence or "").strip()
         if not text:
@@ -964,6 +1171,80 @@ class WriteQueue:
         if any(marker in lowered for marker in _CODE_MARKERS):
             return False
         if _IMPORT_LINE_RE.search(text):
+            return False
+
+        # --- 1. markdown structure -------------------------------------
+        if _MD_RULE_RE.match(text):
+            return False
+        if _MD_TABLE_ROW_RE.match(text):
+            return False
+        if _MD_HEADING_RE.match(text):
+            return False
+        if _MD_BRACKET_LABEL_RE.match(text):
+            return False
+        if _MD_TREE_RE.match(text) or _DIR_COUNT_RE.match(text):
+            return False
+        if _MD_PAREN_TITLE_RE.match(text):
+            return False
+        # Bare CJK heading fragments ("项目规则和行为约束", "记忆系统怎么样").
+        # A colon means the line already has a value half ("方案二：文件夹权限
+        # 控制"), so those are exempt — they are judged by the KV rule instead.
+        if (any("\u4e00" <= ch <= "\u9fff" for ch in text)
+                and _TITLE_FRAGMENT_RE.match(text)
+                and ":" not in text and "：" not in text
+                and _weighted_len(text) < _TITLE_FRAGMENT_MAX_WEIGHT
+                and not any(marker in text for marker in _FACT_SIGNALS_USER_ZH)):
+            return False
+
+        # --- 2. system noise / politeness / outcome reports -------------
+        if any(marker in text for marker in _SELF_CHECK_MARKERS):
+            return False
+        if any(marker in lowered for marker in _SYSTEM_NOISE_MARKERS):
+            return False
+        if any(marker in text for marker in _POLITE_MARKERS):
+            return False
+        if any(marker in text for marker in _ASSISTANT_OUTCOME_MARKERS):
+            return False
+
+        # Everything from here on operates on the undecorated body so that
+        # bullets and status symbols cannot smuggle a row past the rules
+        # ("- ⚠️ **Provider**: governed" is still a metadata row).
+        undecorated = _undecorate(text)
+
+        # --- 3. assistant process narration -----------------------------
+        if undecorated.lower().startswith(_ASSISTANT_PROCESS_PREFIXES):
+            return False
+
+        # --- 4. markdown bold used as a structural label ----------------
+        # "**✅ 正常的部分：**" is a label; "**必须同步 rsa.key**，否则…" keeps a
+        # real body past the label and therefore survives.
+        bold_match = _MD_BOLD_LABEL_RE.match(undecorated)
+        if bold_match:
+            body = undecorated[bold_match.end():].strip().strip("：:，-–—")
+            if not body or text.endswith(("：", ":")) or _fact_signal_score(text) == 0:
+                return False
+        elif text.startswith("*"):
+            # Bold decoration with no real content ("** 现在可以这样使用：").
+            return False
+
+        # --- 5. status-report metadata rows -----------------------------
+        plain = _BOLD_STRIP_RE.sub(r"\1", undecorated).strip()
+        if _REPORT_KV_RE.match(plain) or _PAREN_LABEL_KV_RE.match(plain):
+            return False
+
+        # --- 6. lead-in lines ending on a colon -------------------------
+        # "来看一下当前记忆系统的状态：" introduces content it does not contain;
+        # "不管哪个方案，Hermes 都可以通过 Bitwarden CLI 或 API 读取：" states it.
+        if text.endswith(("：", ":")):
+            if _fact_signal_score(text) == 0:
+                return False
+            if undecorated.startswith(_COLON_LEADIN_PREFIXES):
+                return False
+
+        # --- 7. assistant outcome reports -------------------------------
+        if (role == "assistant"
+                and _weighted_len(text) < _ASSISTANT_MIN_WEIGHTED_LEN
+                and not any(marker in text for marker in _FACT_SIGNALS_USER_ZH)):
             return False
 
         return True
