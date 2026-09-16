@@ -369,7 +369,24 @@ def load_config() -> dict:
 
 
 def wiki_dir(config: dict) -> Path:
-    return Path(config.get("wiki_dir") or r"D:\repos\Drive\项目\github\wiki")
+    """Resolve the vault root: configured value first, then HERMES_HOME.
+
+    The fallback used to be a hardcoded ``D:\\Sync\\...\\wiki`` — one developer's
+    machine. That made ``HERMES_HOME`` a lie: set it to a sandbox and ``health``
+    still reported the real vault's notes, because every read path resolved
+    through here. Any write-path test or rehearsal therefore touched the real
+    vault no matter what HOME it pointed at, and the only way to get isolation
+    was to hand-write a ``governed_memory.json``.
+
+    A default derived from HERMES_HOME is the honest answer: an unconfigured
+    home owns its own (probably empty) vault instead of borrowing another
+    machine's. Deployments that configure ``wiki_dir`` — including the real one,
+    ``C:/Users/example/wiki`` — are unaffected; the explicit value still wins.
+    """
+    configured = str(config.get("wiki_dir") or "").strip()
+    if configured:
+        return Path(configured)
+    return Path(hermes_home()) / "wiki"
 
 
 def read_text(path: str) -> str:

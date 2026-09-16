@@ -55,6 +55,12 @@ NEGATIVE = [
     "嗯嗯",
     "那你继续吧",
     "这个方案我再想想",
+    # 认知性否定：陈述的是说话人的无知，不是关于世界的事实。'我不' 曾以权重 2
+    # 待在强信号池里，正好等于 _EXTERNAL_MIN_SIGNAL，而强信号分支没有长度/结构
+    # 要求 —— 这三条曾全部被放行。见 tmp/calibrate_gate_negation.py。
+    "我不知道",
+    "我不太确定",
+    "我不这么认为",
 ]
 
 
@@ -92,6 +98,26 @@ class TestExternalWriteGate:
         """Pinned so a future edit has to be deliberate, not incidental."""
         assert (_EXTERNAL_MIN_SIGNAL, _EXTERNAL_MIN_WEIGHTED_LEN,
                 _EXTERNAL_MIN_STRUCTURE) == (2, 40, 2)
+
+    @pytest.mark.parametrize("text", ["我不知道", "我不太确定", "我不这么认为"])
+    def test_epistemic_negation_is_refused_with_a_reason(self, text):
+        """A hedge reports the speaker's ignorance; it is not a fact about anything.
+
+        These are the three samples the negation bypass was found with. They
+        must be refused *and* say why — a bare False looks like success.
+        """
+        admitted, reason = external_write_verdict(text)
+        assert not admitted, f"gate admitted a hedge: {text}"
+        assert reason == "weak_signal"
+
+    def test_the_negation_token_is_not_in_the_strong_pool(self):
+        """Pin the fix at the source, not only at the verdict.
+
+        The behaviour test above would go green for any reason; this one fails
+        if somebody puts '我不' back and re-tunes something else to compensate.
+        """
+        from plugin.memory_governed._sync import _FACT_SIGNALS_USER_ZH
+        assert "我不" not in _FACT_SIGNALS_USER_ZH
 
     def test_role_user_must_not_be_used(self):
         """Why the gate scores with an empty role.
@@ -630,6 +656,51 @@ class TestProjectScopedRecall:
         assert by_content["alpha 事项属于 p1"]["project"] == "p1"
         # A global fact has no project key at all — absent, not empty.
         assert "project" not in by_content["alpha 是全局事实"]
+
+
+class TestWikiDirIsolation:
+    """``wiki_dir`` must follow HERMES_HOME, not one developer's machine.
+
+    It used to fall back to ``D:\\Sync\\Drive\\项目\\github\\wiki``. Setting
+    ``HERMES_HOME`` to a sandbox therefore did not isolate anything: ``health``
+    still reported the real vault's notes, so every write rehearsal touched
+    real data and the only workaround was to hand-write a
+    ``governed_memory.json``. A sandbox that is not a sandbox is worse than no
+    sandbox, because it looks isolated while it is not.
+    """
+
+    def test_unconfigured_home_owns_its_own_vault(self, tmp_path, monkeypatch):
+        home = tmp_path / "sandbox"
+        monkeypatch.setenv("HERMES_HOME", str(home))
+        assert cli.wiki_dir({}) == home / "wiki"
+
+    def test_default_never_escapes_hermes_home(self, tmp_path, monkeypatch):
+        """No configuration, no environment: the answer is still inside HOME."""
+        home = tmp_path / "sandbox"
+        monkeypatch.setenv("HERMES_HOME", str(home))
+        resolved = cli.wiki_dir(cli.load_config())
+        assert str(resolved).startswith(str(home)), \
+            f"unconfigured wiki_dir escaped the sandbox: {resolved}"
+
+    def test_configured_value_still_wins(self, tmp_path, monkeypatch):
+        """The real deployment sets wiki_dir explicitly; that must keep working."""
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path / "sandbox"))
+        explicit = r"C:\Users\example\wiki"
+        assert str(cli.wiki_dir({"wiki_dir": explicit})) == explicit
+
+    def test_no_hardcoded_development_path(self):
+        """Source-level pin: the default is derived, never written down.
+
+        Checked positively as well as negatively — a future edit that swaps one
+        hardcoded path for another would satisfy only the negative half.
+        """
+        import inspect
+
+        src = inspect.getsource(cli.wiki_dir)
+        assert "hermes_home()" in src, "default must be derived from HERMES_HOME"
+        # The old fallback was D:\repos\Drive\项目\github\wiki. Neither a drive
+        # letter nor the repo's parent directory may appear as a literal.
+        assert "Drive" not in src and "github" not in src
 
 
 class TestL2SchemaDeclaresProject:

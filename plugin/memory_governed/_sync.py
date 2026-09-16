@@ -234,8 +234,29 @@ _SOFT_SIGNAL_WEIGHT = 1
 # per-turn cap bites.
 _FACT_SIGNALS_USER_ZH = (
     "我需要", "我想要", "我一般", "我家里", "我的", "我装", "我在", "我用的",
-    "我不", "太麻烦", "必须", "不能", "否则",
+    "太麻烦", "必须", "不能", "否则",
 )
+# Why "我不" is NOT in the pool above (removed 2026-09-16):
+#
+# It weighed 2 — exactly `_EXTERNAL_MIN_SIGNAL` — and the strong-signal branch
+# imposes no length or structure requirement, so *any* sentence starting with it
+# walked straight through the external write gate. Measured: "我不知道",
+# "我不太确定", "我不这么认为" were all admitted. Those are epistemic hedges:
+# they report the speaker's ignorance, not a fact about the world, and a row
+# that says nothing is pure competition for recall slots.
+#
+# The other entries are all *commitment* shapes (我需要 / 我用的 / 必须…). "我不"
+# was the only one that can be purely non-committal, which makes it a category
+# error in a gate rather than a matter of tuning.
+#
+# A blanket minimum length on the strong branch was the alternative and was
+# rejected: it would have to clear "我不这么认为" (weighted len 18) while keeping
+# real short facts like "必须用 cosine" (weighted len 16), i.e. there is no
+# length that separates them. Removing the token is targeted instead.
+#
+# Calibration (8 relevant / 8 irrelevant, tmp/calibrate_gate_negation.py):
+#   before  relevant 7/8, irrelevant leaked 3/8
+#   after   relevant 7/8, irrelevant leaked 0/8   (24 historical negatives: 0 leaked)
 
 # Hedged / procedural wording. Real but weakly committed, so rank it below a
 # hard user constraint. (Never blocks extraction on its own — ranking only.)
