@@ -36,6 +36,58 @@ from ._synthesize import _content_to_text
 logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
+# L2 provenance columns — ONE definition, three consumers
+# ---------------------------------------------------------------------------
+#: The L2 columns that carry *who/where* a row came from, as
+#: ``(column name, pyarrow type constructor name)``.
+#:
+#: Single source of truth, and deliberately so. This is the shape of an
+#: incident that already happened: ``project`` was added to the backfill list
+#: but not to the create-table schema, so an *existing* table gained the column
+#: while a *freshly created* one never would. No behaviour test can see that —
+#: every test runs against a table that already has the column — and the whole
+#: suite stayed green while the bug shipped. The three places that must agree
+#: are:
+#:
+#: 1. the create-table schema (see :meth:`WriteQueue._init_l2`),
+#: 2. the legacy backfill loop in the same method,
+#: 3. the CLI's backfill (:func:`memory_cli.open_l2_table`), which writes the
+#:    same rows through a different door.
+#:
+#: All three now iterate this constant. Types are named, not instantiated:
+#: pyarrow is imported lazily so the CLI's read-only commands keep working on
+#: an interpreter that has nothing installed.
+L2_PROVENANCE_COLUMNS: Tuple[Tuple[str, str], ...] = (
+    # L3 message rowid the fact was lifted from, for audit.
+    ("source_rowid", "int64"),
+    # Originating turn role, so the quality gate can be replayed against the
+    # real rule instead of assuming "user" (see _extract_atomic_facts).
+    ("role", "string"),
+    # Writing agent identity — single-writer deployments never needed it, a
+    # shared store cannot do without it.
+    ("agent", "string"),
+    # Owning project, or NULL for a fact that holds everywhere. Deliberately
+    # left NULL by the local extractor: a fact lifted out of a conversation has
+    # no reliable project attribution, and guessing one would be worse than
+    # admitting we do not know. Callers that *do* know — an external agent
+    # working inside a checkout — declare it via
+    # ``memory_cli.py remember --project``.
+    ("project", "string"),
+)
+
+
+def l2_provenance_fields() -> list:
+    """The provenance columns as ``pa.Field`` objects, for a table schema.
+
+    Kept as a function rather than a module constant because instantiating the
+    fields requires pyarrow, which this module imports lazily.
+    """
+    import pyarrow as pa
+
+    return [pa.field(name, getattr(pa, typ)()) for name, typ in L2_PROVENANCE_COLUMNS]
+
+
+# ---------------------------------------------------------------------------
 # Module-level helpers (shared by WriteQueue and L3Writer)
 # ---------------------------------------------------------------------------
 
@@ -1321,23 +1373,16 @@ class WriteQueue:
                 # 维度取实际探测值（service.dim）；API 场景下 config.vector.dim
                 # 是本地模型默认值（512），与 API 实际维度无关。
                 dim = getattr(self._embed_model, "dim", 0) or self._config.vector.dim
+                # Provenance columns come from L2_PROVENANCE_COLUMNS so the
+                # schema and the legacy backfill cannot drift apart (see the
+                # comment there for the incident that motivated it).
                 schema = pa.schema([
                     pa.field("content", pa.string()),
                     pa.field("category", pa.string()),
                     pa.field("source", pa.string()),
                     pa.field("timestamp", pa.string()),
                     pa.field("vector", pa.list_(pa.float32(), dim)),
-                    pa.field("source_rowid", pa.int64()),  # L3 message rowid for audit
-                    pa.field("role", pa.string()),         # originating turn role
-                    pa.field("agent", pa.string()),        # writing agent identity
-                    # Owning project, or NULL for a fact that holds everywhere.
-                    # Deliberately left NULL by the local extractor: a fact
-                    # lifted out of a conversation has no reliable project
-                    # attribution, and guessing one would be worse than
-                    # admitting we do not know. Callers that *do* know — an
-                    # external agent working inside a checkout — declare it via
-                    # ``memory_cli.py remember --project``.
-                    pa.field("project", pa.string()),
+                    *l2_provenance_fields(),
                 ])
                 self._l2_store = db.create_table("memories", schema=schema)
 
@@ -1356,12 +1401,9 @@ class WriteQueue:
             # was tracked" is the truth, and guessing would be worse.
             try:
                 col_names = [f.name for f in self._l2_store.schema]
-                for col, typ in (("source_rowid", pa.int64()),
-                                 ("role", pa.string()),
-                                 ("agent", pa.string()),
-                                 ("project", pa.string())):
+                for col, typ in L2_PROVENANCE_COLUMNS:
                     if col not in col_names:
-                        self._l2_store.add_columns(pa.field(col, typ))
+                        self._l2_store.add_columns(pa.field(col, getattr(pa, typ)()))
                         logger.info("L2 legacy table backfilled with %s column", col)
             except Exception as e:  # noqa: BLE001
                 log_degraded("l2_write", "column_backfill_failed", exc=e)

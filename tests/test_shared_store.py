@@ -26,6 +26,7 @@ import pytest
 
 import memory_cli as cli
 from plugin.memory_governed._sync import (
+    L2_PROVENANCE_COLUMNS,
     _EXTERNAL_MIN_SIGNAL,
     _EXTERNAL_MIN_STRUCTURE,
     _EXTERNAL_MIN_WEIGHTED_LEN,
@@ -492,10 +493,25 @@ class TestProjectLabelling:
         deep.mkdir(parents=True)
         assert cli.infer_project(str(deep)) == "myrepo"
 
-    def test_infer_falls_back_to_leaf_without_marker(self, tmp_path):
+    def test_infer_reports_global_when_there_is_no_marker(self, tmp_path):
+        # The leaf name used to be the fallback, which invented a project out
+        # of a directory that merely exists: `~/.workbuddy` became the project
+        # ".workbuddy" and `~` became the user's name. Facts written from
+        # anywhere under HOME were then invisible to a real project scope.
         leaf = tmp_path / "somewhere"
         leaf.mkdir()
-        assert cli.infer_project(str(leaf)) == "somewhere"
+        assert cli.infer_project(str(leaf)) == ""
+
+    def test_infer_refuses_a_user_level_directory(self, tmp_path, monkeypatch):
+        # `.workbuddy` is in _PROJECT_MARKERS, but the HOME-adjacent copy is
+        # WorkBuddy's user config, not a checkout.
+        home = tmp_path / "home"
+        (home / ".workbuddy").mkdir(parents=True)
+        monkeypatch.setenv("USERPROFILE", str(home))
+        monkeypatch.setenv("HOME", str(home))
+        monkeypatch.setattr(Path, "home", classmethod(lambda cls: home))
+        assert cli.infer_project(str(home / ".workbuddy")) == ""
+        assert cli.infer_project(str(home)) == ""
 
     def test_infer_refuses_a_nonexistent_directory(self, tmp_path):
         # Attributing facts to a directory that is not there is worse than
@@ -624,6 +640,8 @@ class TestL2SchemaDeclaresProject:
     created one never would. Behaviour tests cannot see that: they all run
     against a table that already has the column. Only the schema declaration
     itself catches it.
+    Both consumers now read ``L2_PROVENANCE_COLUMNS`` instead of restating the
+    list, so the guard is that neither has drifted back to a private copy.
     """
 
     @staticmethod
@@ -631,11 +649,25 @@ class TestL2SchemaDeclaresProject:
         path = Path(__file__).resolve().parents[1] / "plugin" / "memory_governed" / "_sync.py"
         return path.read_text(encoding="utf-8")
 
-    def test_schema_lists_project(self):
-        assert 'pa.field("project", pa.string())' in self._source()
+    @staticmethod
+    def _cli_source():
+        path = Path(__file__).resolve().parents[1] / "memory_cli.py"
+        return path.read_text(encoding="utf-8")
 
-    def test_backfill_list_includes_project(self):
-        assert '("project", pa.string())' in self._source()
+    def test_schema_is_built_from_the_shared_definition(self):
+        assert "*l2_provenance_fields()," in self._source()
+
+    def test_backfill_reads_the_shared_definition(self):
+        assert "for col, typ in L2_PROVENANCE_COLUMNS:" in self._source()
+
+    def test_cli_backfill_reads_the_same_definition(self):
+        # The CLI is the third consumer and the one that missed `role`.
+        assert "L2_PROVENANCE_COLUMNS" in self._cli_source()
+        assert 'for col in ("agent", "project")' not in self._cli_source()
+
+    def test_definition_covers_every_provenance_column(self):
+        names = [name for name, _ in L2_PROVENANCE_COLUMNS]
+        assert {"source_rowid", "role", "agent", "project"} <= set(names)
 
     def test_open_l2_table_backfills_project_on_a_legacy_table(self, shared):
         import lancedb

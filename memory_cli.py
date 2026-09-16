@@ -312,9 +312,16 @@ def infer_project(cwd: str = "") -> str:
 
     Walks up from ``cwd`` to the first directory carrying a project marker, so
     a hook invoked from ``<repo>/scripts`` still reports ``<repo>`` rather than
-    ``scripts``. Falls back to the leaf directory name when no marker is found:
-    the label exists to *find* related facts, and an empty one finds nothing —
-    a truthful "this is where you are" beats a blank.
+    ``scripts``. Returns ``""`` (global) when no marker is found.
+
+    The leaf directory name used to be the fallback, and it was actively wrong:
+    standing in ``~/.workbuddy`` produced the project ``.workbuddy`` — the very
+    thing the home-directory guard above exists to prevent — and standing in
+    ``~`` produced a project named after the user. A fact written from anywhere
+    under ``~`` was therefore filed under a pseudo-project and became invisible
+    the moment anyone scoped a query to the real one. No project marker means
+    "no project", and that has to be the answer even though it is less
+    decorative than a name.
 
     Never raises. A caller is only decorating its output; a malformed cwd must
     not be allowed to take down the call.
@@ -341,7 +348,9 @@ def infer_project(cwd: str = "") -> str:
                     return normalize_project(cand.name)
             except OSError:
                 continue
-        return normalize_project(start.name)
+        # No marker anywhere up to the home directory: this is not a project.
+        # Returning the leaf name here would invent one — see the docstring.
+        return ""
     except Exception:  # noqa: BLE001 — decoration must never be fatal
         return ""
 
@@ -447,9 +456,102 @@ def search_l3(query: str, top_k: int, errors: list = None) -> list:
 
 
 # -- L2: LanceDB keyword scan (no embeddings) -------------------------------
+#: Stated on every CLI L2 answer. The keyword channel and the in-plugin vector
+#: channel both land on [0, 1] and both are cut by ``recall.l2_min_score``, but
+#: they measure different things — one measures meaning, this one measures
+#: wording. Leaving that unsaid would let a caller treat a lexical hit as a
+#: semantic one, which is the same class of error as the hardcoded 0.9 it
+#: replaces.
+_L2_RANKING_NOTE = (
+    "L2 reached through the CLI is keyword-scored (no embedding model is "
+    "loaded here): score = share of the query's distinct terms present in the "
+    "fact, on [0,1]. The range matches the in-plugin cosine score so "
+    "recall.l2_min_score means the same thing, but the measures are not "
+    "interchangeable — this channel is ranked and thresholded, not "
+    "vector-ranked.")
+
+
+def l2_lexical_score(tokens, content: str) -> float:
+    """Share of the query's distinct terms that ``content`` contains, on [0, 1].
+
+    Why a real score instead of the hardcoded ``0.9`` this replaced: the score
+    is the *only* input the ``recall.l2_min_score`` floor has, so a constant
+    turns the floor into a no-op — 0.9 clears every threshold anyone would
+    configure, and the CLI would keep presenting unranked, unfiltered keyword
+    hits as if they had passed the same gate the plugin applies.
+
+    Why [0, 1]: that is where the in-plugin L2 score lives
+    (``_recall.distance_to_score`` maps a cosine distance onto it), so one
+    configured floor means "relevant enough" on both channels.
+    """
+    if not tokens:
+        return 0.0
+    low = str(content or "").lower()
+    covered = sum(1 for t in tokens if t in low)
+    return covered / len(tokens)
+
+
+def _resolve_l2_floor(explicit=None) -> tuple:
+    """Resolve the L2 score floor as ``(floor, resolved)``.
+
+    ``resolved`` is ``False`` when the plugin's threshold could not be read, so
+    the answer can say "unfiltered" instead of implying a gate that never ran.
+    """
+    if explicit is not None:
+        try:
+            return float(explicit), True
+        except (TypeError, ValueError):
+            return 0.0, False
+    try:
+        recall = plugin_module("_recall")
+        return (recall.layer_score_floor("l2", getattr(plugin_config(), "recall", None)),
+                True)
+    except Exception:  # noqa: BLE001 — a missing threshold must not blind recall
+        return 0.0, False
+
+
+def _l2_ranking(ranked: bool, floor: float, resolved: bool,
+                filtered: int = 0, truncated: int = 0,
+                note: str = None) -> dict:
+    """Metadata describing *how* the L2 hits were produced.
+
+    Reported separately from the hits because a score without its basis is
+    unfalsifiable: a caller cannot tell a filtered list from an unfiltered one,
+    nor a lexical 0.8 from a semantic 0.8, unless the answer says so.
+    """
+    return {
+        "ranked": ranked,
+        "basis": "keyword-coverage",
+        "floor": floor,
+        "floor_resolved": resolved,
+        "filtered_out": filtered,
+        "truncated": truncated,
+        "note": _L2_RANKING_NOTE if note is None else note,
+    }
+
+
 def search_l2(query: str, top_k: int, errors: list = None,
-              project: str = "") -> list:
-    """Keyword-scan L2 without an embedding model.
+              project: str = "", l2_floor: float = None) -> list:
+    """Keyword-scan L2 without an embedding model. See :func:`recall_l2`."""
+    return recall_l2(query, top_k, errors, project, l2_floor)["hits"]
+
+
+def recall_l2(query: str, top_k: int, errors: list = None,
+              project: str = "", l2_floor: float = None) -> dict:
+    """Keyword-scan L2 without an embedding model, ranked and thresholded.
+
+    Returns ``{"hits": [...], "ranking": {...}}``. Hits are ordered by
+    relevance and every one of them is at or above the L2 floor.
+
+    Two things the previous version got wrong, both of which made the shared
+    entry point the weakest implementation of the same query:
+
+    * it emitted a hardcoded ``score`` of 0.9, so the calibrated L2 threshold
+      (0.76 — measured: relevant 8/8 at 0.8458~0.9095, irrelevant 8/8 at
+      0.6755~0.7515) could never reject anything coming through the CLI;
+    * it stopped at the first ``top_k`` rows in *write order*, so the cut was
+      arbitrary — the facts that happened to be written first won, and a
+      caller had no way to know anything had been dropped.
 
     ``errors`` is an optional sink. L2 used to fail silently — an ImportError
     from a bare interpreter produced the same ``[]`` as a genuine no-match, and
@@ -458,11 +560,24 @@ def search_l2(query: str, top_k: int, errors: list = None,
 
     ``project`` narrows the result to one project *plus* the global facts that
     belong to no project in particular.
+
+    ``l2_floor`` overrides the configured threshold; ``None`` reads
+    ``recall.l2_min_score`` through :func:`_recall.layer_score_floor`, the same
+    function the in-plugin path uses.
     """
-    def _fail(msg: str) -> list:
+    floor, resolved = _resolve_l2_floor(l2_floor)
+
+    def _fail(msg: str) -> dict:
         if errors is not None:
             errors.append(f"l2: {msg}")
-        return []
+        # "ranked: false" here means exactly that: nothing was ranked because
+        # nothing could be read. Saying otherwise would let a caller read an
+        # empty L2 as "searched and found nothing relevant".
+        return {"hits": [],
+                "ranking": _l2_ranking(False, floor, resolved,
+                                       note="L2 could not be read, so no hits "
+                                            "were ranked or filtered; see the "
+                                            "'degraded' entry for the reason.")}
 
     try:
         import lancedb
@@ -490,8 +605,13 @@ def search_l2(query: str, top_k: int, errors: list = None,
                   else [None] * len(contents))
         projects = (arr["project"].to_pylist() if "project" in arr.column_names
                     else [None] * len(contents))
-        tokens = re.findall(r"[\w\u4e00-\u9fff]+", query)
-        hits = []
+        # Distinct, lowercased: repeating a term in the query must not inflate
+        # the coverage denominator, and "the THE The" is one term, not three.
+        tokens = list(dict.fromkeys(
+            t.lower() for t in re.findall(r"[\w\u4e00-\u9fff]+", query or "")))
+        if not tokens:
+            return {"hits": [], "ranking": _l2_ranking(True, floor, resolved)}
+        hits, filtered = [], 0
         for c, ag, pj in zip(contents, agents, projects):
             c = str(c or "")
             if not c:
@@ -502,17 +622,27 @@ def search_l2(query: str, top_k: int, errors: list = None,
             # it must not see is *another* project's facts.
             if project and pj and pj != project:
                 continue
-            score = sum(1 for t in tokens if t.lower() in c.lower())
-            if score > 0:
-                hit = {"layer": "l2", "content": c[:600], "score": 0.9}
-                if ag:
-                    hit["agent"] = ag
-                if pj:
-                    hit["project"] = pj
-                hits.append(hit)
-                if len(hits) >= top_k:
-                    break
-        return hits
+            score = l2_lexical_score(tokens, c)
+            if score <= 0:
+                continue
+            if score < floor:
+                filtered += 1
+                continue
+            hit = {"layer": "l2", "content": c[:600],
+                   "score": round(score, 4),
+                   "score_basis": "keyword-coverage"}
+            if ag:
+                hit["agent"] = ag
+            if pj:
+                hit["project"] = pj
+            hits.append(hit)
+        # Ranked, then cut — the old code took the first top_k in write order
+        # and never said it had dropped anything.
+        hits.sort(key=lambda h: h["score"], reverse=True)
+        kept = hits[:max(int(top_k or 0), 0)]
+        return {"hits": kept,
+                "ranking": _l2_ranking(True, floor, resolved, filtered,
+                                       len(hits) - len(kept))}
     except Exception as e:  # noqa: BLE001
         return _fail(str(e)[:200])
 
@@ -527,9 +657,13 @@ def plugin_config():
 def open_l2_table(cfg):
     """Open the L2 table, backfilling the sharing columns on a legacy table.
 
-    Migration is additive and in-place: existing rows simply carry a null
-    ``agent``/``project``, which reads back as "written before this dimension
-    was tracked" rather than being guessed at.
+    The column list is *not* written here. It comes from
+    ``_sync.L2_PROVENANCE_COLUMNS`` — the same constant that builds the
+    create-table schema and the plugin's own backfill. This is the exact shape
+    of an incident that already shipped: ``project`` was added to a backfill
+    list but not to the schema, so old tables gained the column while new ones
+    never had it, and every test stayed green because they all ran against a
+    table that already had it. One definition, three consumers.
     """
     import lancedb
     import pyarrow as pa
@@ -547,9 +681,12 @@ def open_l2_table(cfg):
     # {name: pa.array} mapping — the array form raises TypeError, and when that
     # happens inside a best-effort block the migration fails invisibly.
     existing = {f.name for f in table.schema}
-    for col in ("agent", "project"):
+    # `role` was missing here while cmd_remember writes role="agent" on every
+    # row, so `table.add()` raised "field 'role' does not exist" on any table
+    # predating the column — every external agent's `remember` failed at once.
+    for col, typ in plugin_module("_sync").L2_PROVENANCE_COLUMNS:
         if col not in existing:
-            table.add_columns(pa.field(col, pa.string()))
+            table.add_columns(pa.field(col, getattr(pa, typ)()))
     return table
 
 
@@ -709,8 +846,123 @@ def cmd_agents(config: dict) -> dict:
     return out
 
 
+# -- vault path safety -----------------------------------------------------
+class VaultPathEscape(ValueError):
+    """A requested vault path would land outside the vault.
+
+    Raised rather than silently rewritten. A caller that asks for
+    ``--section ../memory`` must be told it was refused, not handed a note
+    filed somewhere else: "my write succeeded" turning into "my write
+    vanished" is the worst outcome this module can produce, and it is exactly
+    what normalising the path quietly would cause.
+    """
+
+
+def _is_link(path: Path) -> bool:
+    """True for a symlink **or** a Windows junction.
+
+    Junctions are the easy one to miss: ``os.path.islink`` reports ``False``
+    for them because they are a different reparse-tag, yet they redirect just
+    as effectively. On this machine both ``hermes-home`` and ``wiki`` are
+    junctions, so a check that only saw symlinks would step straight over the
+    construct it exists to catch.
+    """
+    try:
+        if path.is_symlink():
+            return True
+    except OSError:
+        return False
+    isjunction = getattr(os.path, "isjunction", None)
+    if callable(isjunction):
+        try:
+            return bool(isjunction(str(path)))
+        except OSError:
+            return False
+    return False
+
+
+def _is_within(child: Path, parent: Path) -> bool:
+    """True when ``child`` is ``parent`` or sits below it."""
+    try:
+        child.relative_to(parent)
+        return True
+    except ValueError:
+        return False
+
+
+def _refuse_escaping_links(root: Path, root_real: Path, candidate: Path) -> None:
+    """Reject a candidate that leaves the vault through a link.
+
+    Checked *before* the resolved comparison on purpose. ``resolve()`` follows
+    links, so by the time the resolved path looks wrong all that is left to
+    report is a location the caller never typed; naming the link says what
+    actually happened. A link that stays inside the vault is allowed — it is
+    the direction, not the construct, that matters.
+    """
+    try:
+        rel = candidate.relative_to(root)
+    except ValueError:  # pragma: no cover — guarded by the caller
+        return
+    cur = root
+    for part in rel.parts:
+        if part in ("", ".", ".."):
+            continue
+        cur = cur / part
+        if not _is_link(cur):
+            continue
+        target = Path(os.path.realpath(str(cur)))
+        if not _is_within(target, root_real):
+            raise VaultPathEscape(
+                f"refused: '{cur}' is a link to '{target}', outside the vault "
+                f"'{root_real}'")
+
+
+def safe_vault_path(vault, *parts: str) -> Path:
+    """Join ``parts`` under ``vault``, refusing anything that leaves it.
+
+    Three checks, in this order — each one catches something the next would get
+    wrong:
+
+    1. **lexical containment** on the *normalised* path. Both ``../`` and an
+       absolute ``--section`` collapse here, before a filesystem call can be
+       misled by them.
+    2. **link containment** for every component below the vault (see
+       :func:`_refuse_escaping_links`). A symlink or junction inside the vault
+       pointing outside it is an escape even though the path text looks
+       innocent.
+    3. **resolved containment** as the backstop: ``realpath`` of both sides, so
+       a link, a stray ``..`` or a case difference cannot slip past 1 and 2.
+
+    Args:
+        vault: Vault root. May itself be a junction — both sides of every
+            comparison are resolved through the same rule, so that stays
+            inside.
+        *parts: Path components to append (``section``, then the filename).
+
+    Returns:
+        The normalised absolute path, guaranteed to be inside the vault.
+
+    Raises:
+        VaultPathEscape: With an actionable message. Never rewrites the path —
+            a refused write is recoverable, a silently relocated one is not.
+    """
+    root = Path(os.path.abspath(str(vault)))
+    candidate = Path(os.path.normpath(str(root.joinpath(*(str(p) for p in parts)))))
+    if not _is_within(candidate, root):
+        raise VaultPathEscape(
+            f"refused: '{candidate}' is outside the vault '{root}'")
+    root_real = Path(os.path.realpath(str(root)))
+    _refuse_escaping_links(root, root_real, candidate)
+    resolved = Path(os.path.realpath(str(candidate)))
+    if not _is_within(resolved, root_real):
+        raise VaultPathEscape(
+            f"refused: '{candidate}' resolves to '{resolved}', which is outside "
+            f"the vault '{root_real}'")
+    return candidate
+
+
 # -- KB vault ---------------------------------------------------------------
-def iter_notes(config: dict, subdirs: list = None) -> list:
+def iter_notes(config: dict, subdirs: list = None, errors: list = None) -> list:
     """Every note in the vault, or every note under the named sections.
 
     Scans the **whole vault** rather than a fixed section list. ``kb-add`` takes
@@ -722,9 +974,20 @@ def iter_notes(config: dict, subdirs: list = None) -> list:
 
     Hidden directories are skipped: ``.obsidian`` / ``.trash`` hold tooling, not
     notes. Root-level scaffold files (``index.md``) are not notes either.
+
+    ``errors`` is an optional sink: a ``--section`` that points outside the
+    vault is skipped and named there, because returning "no such notes" for a
+    query that was refused reads as an empty vault rather than a rejected
+    request.
     """
     vault = wiki_dir(config)
-    roots = [vault / s for s in subdirs] if subdirs is not None else [vault]
+    roots = [vault] if subdirs is None else []
+    for s in (subdirs or []):
+        try:
+            roots.append(safe_vault_path(vault, s))
+        except VaultPathEscape as e:
+            if errors is not None:
+                errors.append(str(e))
     out = []
     for root in roots:
         if not root.exists():
@@ -799,12 +1062,13 @@ def dump_frontmatter(meta: dict) -> str:
     return "\n".join(lines)
 
 
-def cmd_kb_search(config: dict, query: str, top_k: int, section: str) -> list:
+def cmd_kb_search(config: dict, query: str, top_k: int, section: str,
+                  errors: list = None) -> list:
     # No section -> search the whole vault, not a fixed list of sections.
     subdirs = [section] if section else None
     tokens = re.findall(r"[\w\u4e00-\u9fff]+", query)
     results = []
-    for p in iter_notes(config, subdirs):
+    for p in iter_notes(config, subdirs, errors):
         meta, body = parse_frontmatter(p.read_text(encoding="utf-8", errors="replace"))
         title = meta.get("title") or p.stem
         hay = f"{title} {body}".lower()
@@ -849,10 +1113,18 @@ def cmd_kb_add(config: dict, title: str, body: str, section: str,
         section = section or "notes"
 
     vault = wiki_dir(config)
-    subdir = vault / section
+    # Containment is decided BEFORE the directory is created: mkdir on an
+    # escaping path would happily build the target outside the vault, and the
+    # note would then "succeed" into a place nothing reads.
+    try:
+        subdir = safe_vault_path(vault, section)
+        path = safe_vault_path(subdir, slugify(title) + ".md")
+    except VaultPathEscape as e:
+        return {"ok": False, "error": str(e),
+                "hint": ("--section must name a directory inside the vault; "
+                         "use kb-add with a plain section name such as 'notes'")}
+
     subdir.mkdir(parents=True, exist_ok=True)
-    filename = slugify(title) + ".md"
-    path = subdir / filename
 
     now = time.strftime("%Y-%m-%dT%H:%M:%S", time.localtime())
     existed = path.exists()
@@ -1020,13 +1292,21 @@ def main():
     if args.cmd == "recall":
         degraded: list = []
         scoped = normalize_project(getattr(args, "project", "") or "")
+        l2 = recall_l2(args.query, args.top_k, degraded, project=scoped)
+        kb_refused: list = []
         out = {
             "query": args.query,
             "l1": cmd_l1(),
-            "l2": search_l2(args.query, args.top_k, degraded, project=scoped),
+            "l2": l2["hits"],
+            # How the L2 hits were produced. Emitted unconditionally: a score
+            # the caller cannot attribute to a channel is a score they will
+            # over-trust.
+            "l2_ranking": l2["ranking"],
             "l3": search_l3(args.query, args.top_k, degraded),
-            "kb": cmd_kb_search(config, args.query, args.top_k, ""),
+            "kb": cmd_kb_search(config, args.query, args.top_k, "", kb_refused),
         }
+        if kb_refused:
+            out["kb_refused"] = kb_refused
         # Absence of a layer is stated, never implied: "no memory matched" and
         # "memory could not be read" must not look the same to the caller.
         if degraded:
@@ -1037,7 +1317,14 @@ def main():
         if scoped:
             out["project"] = scoped
     elif args.cmd == "kb-search":
-        out = {"results": cmd_kb_search(config, args.query, args.top_k, args.section)}
+        refused: list = []
+        results = cmd_kb_search(config, args.query, args.top_k, args.section,
+                                refused)
+        out = {"results": results}
+        # An empty list is what "no notes matched" looks like; a refused
+        # --section must not borrow that shape.
+        if refused:
+            out["refused"] = refused
     elif args.cmd == "kb-get":
         out = cmd_kb_get(config, args.title) or {"error": f"note not found: {args.title}"}
     elif args.cmd == "kb-add":
