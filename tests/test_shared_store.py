@@ -369,3 +369,100 @@ class TestReplayConsistency:
         import l2_apply_gate
 
         assert l2_apply_gate.admits("好的，我明白了", "agent") is False
+
+
+class TestWorkBuddyIdentity:
+    """Detection must be pinned to *observed* marker names.
+
+    The first version guessed plausible ones (``WORKBUDDY_SESSION``,
+    ``WORKBUDDY_HOME``, ``CODEBUDDY_SESSION``). None of them exist, so detection
+    fell through to ``external`` and every WorkBuddy write would have been
+    misattributed — the same class of bug as the hardcoded ``"dsh"`` this whole
+    subsystem was built to remove. These tests exist so a future edit cannot
+    quietly reintroduce a guess.
+    """
+
+    @staticmethod
+    def _clear(monkeypatch):
+        monkeypatch.delenv(cli.AGENT_ENV_VAR, raising=False)
+        for _, markers in cli._AGENT_ENV_MARKERS:
+            for m in markers:
+                monkeypatch.delenv(m, raising=False)
+
+    @pytest.mark.parametrize("marker", [
+        "WORKBUDDY_APP_NAME", "WORKBUDDY_CONFIG_DIR",
+        "WORKBUDDY_USER_DATA_DIR", "CODEBUDDY_SESSION_ID",
+    ])
+    def test_observed_markers_identify_workbuddy(self, monkeypatch, marker):
+        self._clear(monkeypatch)
+        monkeypatch.setenv(marker, "1")
+        assert cli.resolve_agent("") == "workbuddy"
+
+    def test_the_guessed_names_are_not_relied_on(self, monkeypatch):
+        self._clear(monkeypatch)
+        for bogus in ("WORKBUDDY_SESSION", "WORKBUDDY_HOME", "CODEBUDDY_SESSION"):
+            monkeypatch.setenv(bogus, "1")
+        assert cli.resolve_agent("") == cli.DEFAULT_AGENT
+
+
+class TestVaultScanning:
+    """A write must be readable back, whichever section it was filed under.
+
+    ``kb-add --section X`` creates ``X/`` on demand, but the scanner walked a
+    fixed list of sections. A note filed under any other heading was written
+    successfully and then never found again — invisible to ``kb-search``,
+    ``kb-get`` and the provenance report alike. Nothing signalled the loss,
+    which is what makes it worth a test rather than a comment.
+    """
+
+    def test_note_in_a_nonstandard_section_is_retrievable(self, shared):
+        cfg = {"wiki_dir": str(shared.vault)}
+        out = cli.cmd_kb_add(cfg, "运维笔记", "示例主路由 8022", "运维",
+                             [], [], None, agent="workbuddy")
+        assert out["ok"] is True
+
+        titles = [r["title"] for r in cli.cmd_kb_search(cfg, "运维笔记", 5, "")]
+        assert titles == ["运维笔记"]
+        assert cli.cmd_kb_get(cfg, "运维笔记") is not None
+
+    def test_provenance_sees_notes_outside_the_standard_sections(self, shared):
+        cfg = {"wiki_dir": str(shared.vault)}
+        cli.cmd_kb_add(cfg, "运维笔记", "body", "运维", [], [], None, agent="workbuddy")
+        assert cli.cmd_agents(cfg)["agents"]["workbuddy"]["kb_notes"] == 1
+
+    def test_hidden_and_scaffold_files_are_not_notes(self, shared):
+        vault = shared.vault
+        (vault / ".obsidian").mkdir()
+        (vault / ".obsidian" / "workspace.md").write_text("x", encoding="utf-8")
+        (vault / "index.md").write_text("# index", encoding="utf-8")
+        cli.cmd_kb_add({"wiki_dir": str(vault)}, "真笔记", "body", "notes",
+                       [], [], None, agent="dsh")
+
+        names = {p.name for p in cli.iter_notes({"wiki_dir": str(vault)})}
+        assert "真笔记.md" in names
+        assert "workspace.md" not in names
+        assert "index.md" not in names
+
+
+class TestRuntimeReport:
+    """``runtime`` must describe the environment *after* relocation.
+
+    It used to run before bootstrap, so it reported the invoked interpreter and
+    printed ``full_store_visible: false`` while ``recall`` was in fact working.
+    A diagnostic that contradicts reality is worse than no diagnostic.
+    """
+
+    def test_runtime_participates_in_bootstrap(self):
+        assert "runtime" in cli._L2_COMMANDS
+
+    def test_relocation_is_stated_not_hidden(self, monkeypatch):
+        monkeypatch.setenv(cli._ORIGINAL_PYTHON_FLAG, "/usr/bin/python3")
+        report = cli.runtime_report()
+        assert report["requested_interpreter"] == "/usr/bin/python3"
+        assert "note" in report
+
+    def test_no_relocation_means_no_extra_fields(self, monkeypatch):
+        monkeypatch.delenv(cli._ORIGINAL_PYTHON_FLAG, raising=False)
+        report = cli.runtime_report()
+        assert "requested_interpreter" not in report
+        assert "interpreter" in report

@@ -65,6 +65,10 @@ from pathlib import Path
 DEFAULT_HERMES_HOME = r"D:\repos\Drive\项目\github\hermes-home"
 VAULT_SUBDIRS = ["inbox", "notes", "projects", "areas", "resources", "archive"]
 
+#: Root-level vault files that are navigation scaffolds, not notes. Only
+#: consulted when scanning the whole vault (see :func:`iter_notes`).
+_VAULT_SCAFFOLD = {"index", "readme", "home"}
+
 #: Agent name written when the caller cannot be identified. Never guess a
 #: specific agent's name — mis-attribution is worse than an honest "unknown".
 DEFAULT_AGENT = "external"
@@ -77,6 +81,11 @@ PYTHON_ENV_VAR = "HGM_PYTHON"
 
 _BOOTSTRAP_FLAG = "HGM_BOOTSTRAPPED"
 
+#: Set on the re-exec'd process so ``runtime`` can still say which interpreter
+#: the caller actually invoked. Without it a bootstrapped run looks identical to
+#: a native one and "why is my python reporting a venv path" has no answer.
+_ORIGINAL_PYTHON_FLAG = "HGM_ORIGINAL_PYTHON"
+
 #: Modules that make the full store reachable. Without them L2 is invisible and
 #: the CLI would silently under-report — which is exactly the bug this
 #: bootstrap exists to prevent.
@@ -85,10 +94,18 @@ _REQUIRED_MODULES = ("lancedb", "pyarrow")
 #: Well-known markers each agent sets in its own environment. Only *specific*
 #: markers count: inferring from something generic like HERMES_HOME would label
 #: every caller "hermes", which is the same class of bug as hardcoding "dsh".
+#: NOTE (2026-09-16, measured): these names must be *observed*, not guessed. A
+#: first pass used plausible-sounding names for WorkBuddy
+#: (``WORKBUDDY_SESSION`` / ``WORKBUDDY_HOME`` / ``CODEBUDDY_SESSION``) — none of
+#: which exist. Detection therefore silently fell through to ``external`` and
+#: every WorkBuddy write would have been misattributed. The WorkBuddy entries
+#: below were read off a live environment with ``env``; the rest still need the
+#: same treatment before they can be trusted.
 _AGENT_ENV_MARKERS = (
     ("dsh", ("DSH_WORKSPACE", "DSH_PYTHON", "DSH_SESSION")),
     ("autoclaw", ("AUTOCLAW_HOME", "AUTOCLAW_AGENT", "AUTOCLAW_WORKSPACE")),
-    ("workbuddy", ("WORKBUDDY_SESSION", "WORKBUDDY_HOME", "CODEBUDDY_SESSION")),
+    ("workbuddy", ("WORKBUDDY_APP_NAME", "WORKBUDDY_CONFIG_DIR",
+                   "WORKBUDDY_USER_DATA_DIR", "CODEBUDDY_SESSION_ID")),
     ("mimocode", ("MIMOCODE_HOME", "MIMO_WORKSPACE")),
     ("opencode", ("OPENCODE_HOME", "OPENCODE_SESSION")),
 )
@@ -166,6 +183,7 @@ def bootstrap_interpreter() -> None:
             continue
         env = dict(os.environ)
         env[_BOOTSTRAP_FLAG] = "1"
+        env.setdefault(_ORIGINAL_PYTHON_FLAG, sys.executable)
         try:
             proc = subprocess.run(
                 [str(cp), str(Path(__file__).resolve()), *sys.argv[1:]],
@@ -177,13 +195,25 @@ def bootstrap_interpreter() -> None:
 
 
 def runtime_report() -> dict:
-    """Describe whether this interpreter can reach every layer."""
+    """Describe whether this interpreter can reach every layer.
+
+    Reported *after* any bootstrap, so the answer means "can this environment
+    use the full store" rather than "what was missing a moment ago". The
+    pre-bootstrap interpreter is kept as ``requested_interpreter`` so the
+    relocation stays visible instead of looking like a mystery venv path.
+    """
     missing = _missing_modules()
-    return {
+    out = {
         "interpreter": sys.executable,
         "missing_modules": missing,
         "full_store_visible": not missing,
     }
+    original = os.environ.get(_ORIGINAL_PYTHON_FLAG, "")
+    if original:
+        out["requested_interpreter"] = original
+        out["note"] = ("auto-relocated: the invoked interpreter has no LanceDB, "
+                       "so the CLI re-ran itself under the project venv")
+    return out
 
 
 # -- agent identity ---------------------------------------------------------
@@ -584,12 +614,37 @@ def cmd_agents(config: dict) -> dict:
 
 # -- KB vault ---------------------------------------------------------------
 def iter_notes(config: dict, subdirs: list = None) -> list:
+    """Every note in the vault, or every note under the named sections.
+
+    Scans the **whole vault** rather than a fixed section list. ``kb-add`` takes
+    an arbitrary ``--section`` and creates that directory on demand, so a fixed
+    list meant a note filed under any other heading was written successfully and
+    then never found again — invisible to ``kb-search``, ``kb-get`` and the
+    ``agents`` provenance report alike. A write that cannot be read back is
+    worse than a rejected write, because nothing signals the loss.
+
+    Hidden directories are skipped: ``.obsidian`` / ``.trash`` hold tooling, not
+    notes. Root-level scaffold files (``index.md``) are not notes either.
+    """
     vault = wiki_dir(config)
-    roots = [vault / s for s in (subdirs or VAULT_SUBDIRS)]
+    roots = [vault / s for s in subdirs] if subdirs is not None else [vault]
     out = []
     for root in roots:
-        if root.exists():
-            out.extend(sorted(p for p in root.rglob("*.md") if p.is_file()))
+        if not root.exists():
+            continue
+        for p in sorted(root.rglob("*.md")):
+            if not p.is_file():
+                continue
+            try:
+                rel = p.relative_to(vault)
+            except ValueError:
+                out.append(p)
+                continue
+            if any(part.startswith(".") for part in rel.parts[:-1]):
+                continue
+            if len(rel.parts) == 1 and rel.stem.lower() in _VAULT_SCAFFOLD:
+                continue
+            out.append(p)
     return out
 
 
@@ -648,7 +703,8 @@ def dump_frontmatter(meta: dict) -> str:
 
 
 def cmd_kb_search(config: dict, query: str, top_k: int, section: str) -> list:
-    subdirs = [section] if section else VAULT_SUBDIRS
+    # No section -> search the whole vault, not a fixed list of sections.
+    subdirs = [section] if section else None
     tokens = re.findall(r"[\w\u4e00-\u9fff]+", query)
     results = []
     for p in iter_notes(config, subdirs):
@@ -774,7 +830,7 @@ def cmd_health(config: dict):
 #: Commands whose answer depends on L2, and therefore on LanceDB being
 #: importable. Only these pay the cost of a possible interpreter re-exec; the
 #: read-only Markdown commands stay fast on a bare interpreter.
-_L2_COMMANDS = {"recall", "remember", "agents", "health"}
+_L2_COMMANDS = {"recall", "remember", "agents", "health", "runtime"}
 
 
 def build_parser() -> argparse.ArgumentParser:
