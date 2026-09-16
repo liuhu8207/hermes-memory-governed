@@ -24,6 +24,7 @@ from __future__ import annotations
 import json
 import logging
 import re
+import threading
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -41,6 +42,21 @@ _LINK_RE = re.compile(r"\[\[([^\]\|#]+)(?:\|[^\]]*)?\]\]")
 #: 索引表名（LanceDB）
 _TABLE_NAME = "kb_notes"
 
+#: 关键词分归一化分母（见 ``_keyword_score_norm``）。
+_KEYWORD_SCORE_DENOM = 5.0
+
+#: 关键词分 / 语义分在融合时的权重。
+#:
+#: 为什么需要融合而不是取 max（P0，2026-09-16）：旧实现把关键词原始分
+#: （0~12）和语义分（0~1）直接丢进同一个 dict、用 ``max()`` 合并再统一
+#: 排序，结果是**关键词永远碾压语义** —— 实测 ``hermes 记忆系统`` 返回
+#: 1.8/1.6/1.4 全是关键词分，向量检索这一路等于白建。而 vault 里全是
+#: 中文长笔记，查询词往往不在标题而在正文，恰恰是语义检索该发力的场景。
+#: 归一化后按权重线性融合，语义为主（vault 以长文为主，同义改写多）、
+#: 关键词为辅（精确术语命中依然是强证据）。
+_KB_KW_WEIGHT = 0.4
+_KB_SEM_WEIGHT = 0.6
+
 
 def _as_list(value: Any) -> List[str]:
     """归一化 frontmatter 的 tags/concepts 到 List[str]。"""
@@ -54,6 +70,18 @@ def _as_list(value: Any) -> List[str]:
 def _sql_literal(s: str) -> str:
     """SQL 字符串字面量（单引号转义为双单引号）。"""
     return "'" + s.replace("'", "''") + "'"
+
+
+def _file_mtime(path: Path) -> float:
+    """文件的 mtime（epoch 秒）；取不到时返回 0.0。
+
+    写路径统一用它给索引打时间戳：只要写索引时 mtime 与正本一致，
+    下一次 ``sync_index`` 就会判定「未变化」而跳过重新嵌入。
+    """
+    try:
+        return float(path.stat().st_mtime)
+    except OSError:
+        return 0.0
 
 
 def _bigrams(s: str) -> set:
@@ -133,11 +161,21 @@ class KBIndex:
             names = db.table_names()
             if _TABLE_NAME in names:
                 self._store = db.open_table(_TABLE_NAME)
-            else:
+                # 旧 schema（无 mtime）无法做增量同步，且索引只是**投影**、
+                # 正本是 vault，可直接重建。此处就地迁移，重建交给
+                # KnowledgeBase.sync_index()（会发现索引为空 → 全量补齐）。
+                if "mtime" not in [f.name for f in self._store.schema]:
+                    logger.info("kb index schema lacks 'mtime' — rebuilding")
+                    db.drop_table(_TABLE_NAME)
+                    self._store = None
+            if self._store is None:
                 dim = int(getattr(self._service, "dim", 0) or self._config.vector.dim)
                 schema = pa.schema([
                     pa.field("path", pa.string()),
                     pa.field("text", pa.string()),
+                    # 文件 mtime（epoch 秒）。增量同步靠它判断「是否需要重新
+                    # 嵌入」；没有它就只能全量重建（26 篇 ≈ 26 次 API 调用）。
+                    pa.field("mtime", pa.float64()),
                     pa.field("vector", pa.list_(pa.float32(), dim)),
                 ])
                 self._store = db.create_table(_TABLE_NAME, schema=schema)
@@ -157,8 +195,12 @@ class KBIndex:
 
     # -- 写 ----------------------------------------------------------
 
-    def upsert(self, path: str, text: str) -> None:
-        """写入/更新一条向量。失败仅 debug 记录，不抛。"""
+    def upsert(self, path: str, text: str, mtime: float = 0.0) -> None:
+        """写入/更新一条向量。失败仅 debug 记录，不抛。
+
+        Args:
+            mtime: 正本文件的 mtime（epoch 秒）。增量同步据此判断陈旧。
+        """
         if not self._available or self._service is None:
             return
         vec = self._service.embed_one(text)
@@ -169,9 +211,35 @@ class KBIndex:
         except Exception:  # noqa: BLE001 — 删不掉就靠搜索侧去重兜底
             pass
         try:
-            self._store.add([{"path": path, "text": text, "vector": vec}])
+            self._store.add([{"path": path, "text": text,
+                              "mtime": float(mtime or 0.0), "vector": vec}])
         except Exception as e:  # noqa: BLE001
             logger.debug("kb index upsert failed for %s: %s", path, e)
+
+    def path_mtimes(self) -> Dict[str, float]:
+        """索引里 ``path -> mtime`` 的映射（供增量同步比对）。
+
+        失败时返回空 dict —— 调用方会把空映射理解为「索引里什么都没有」，
+        从而触发一次全量补齐；宁可多嵌一次，也不能漏掉正本里的新笔记。
+        """
+        if not self._available or self._store is None:
+            return {}
+        try:
+            n = self._store.count_rows()
+            if n <= 0:
+                return {}
+            arrow = (
+                self._store.search()
+                .select(["path", "mtime"])
+                .limit(n)
+                .to_arrow()
+            )
+            paths = arrow.column("path").to_pylist()
+            mtimes = arrow.column("mtime").to_pylist()
+            return {p: float(m or 0.0) for p, m in zip(paths, mtimes)}
+        except Exception as e:  # noqa: BLE001
+            logger.debug("kb index path_mtimes failed: %s", e)
+            return {}
 
     def delete(self, path: str) -> None:
         if not self._available or self._store is None:
@@ -235,9 +303,22 @@ class KnowledgeBase:
 
     # -- 骨架 / 索引 -------------------------------------------------
 
-    def ensure(self) -> Dict[str, Any]:
-        """建 vault 骨架（幂等）。"""
-        return _vault.ensure_skeleton(self._vault)
+    def ensure(self, *, sync: bool = True) -> Dict[str, Any]:
+        """建 vault 骨架（幂等），并按需在后台补齐向量索引。
+
+        Args:
+            sync: 是否触发一次后台增量同步。默认开启 —— 外部写入
+                （DeepSeek Harness、Obsidian 手工编辑、同步盘）不经过
+                ``_kb.add``，只有这次 mtime 比对能发现它们，否则索引会
+                随时间越来越陈旧（实测停滞 15 天，漏掉 1 篇笔记）。
+        """
+        result = _vault.ensure_skeleton(self._vault)
+        if sync:
+            try:
+                self.sync_index(background=True)
+            except Exception as e:  # noqa: BLE001 — 同步是增强，失败不影响主流程
+                logger.debug("kb background sync failed to start: %s", e)
+        return result
 
     def _index_get(self) -> KBIndex:
         if self._index is None:
@@ -256,9 +337,108 @@ class KnowledgeBase:
         idx.drop()
         n = 0
         for note in self._iter_notes():
-            idx.upsert(self._rel(note.path), note.full_text)
+            idx.upsert(self._rel(note.path), note.full_text,
+                       mtime=_file_mtime(note.path))
             n += 1
         return {"ok": True, "indexed": n}
+
+    def sync_index(self, *, background: bool = False,
+                   force: bool = False) -> Dict[str, Any]:
+        """增量同步：正本（vault）变更 → 索引投影更新。
+
+        与 :meth:`reindex` 的区别：``reindex`` 无条件全量重建（26 篇 = 26 次
+        embedding 调用）；``sync_index`` 按 mtime 比对，**只重嵌变化过的笔记**，
+        常态下是 0 次调用。
+
+        为什么必须有这个方法（2026-09-16 实测）：索引最后一次更新停在 9-01，
+        而 ``notes/共享记忆系统开通.md`` 是 9-04 由 DeepSeek Harness 直接写入
+        vault 的 —— 插件的 ``_kb.add`` 会 upsert，但**外部写入**（DSH、
+        Obsidian 手工编辑、同步盘）完全不会碰索引。没有兜底同步，索引就只会
+        随时间越来越陈旧，`_search_kb` 也永远找不到新笔记。
+
+        Args:
+            background: True 时在守护线程里执行，立即返回（供插件初始化调用，
+                避免首次全量补齐的 embedding 调用拖慢启动）。
+            force: True 时忽略 mtime 比对，全量重嵌。
+
+        Returns:
+            统计 dict：``{ok, added, updated, removed, unchanged, errors}``。
+        """
+        if background:
+            t = threading.Thread(
+                target=self.sync_index, kwargs={"force": force},
+                name="kb-sync-index", daemon=True,
+            )
+            t.start()
+            return {"ok": True, "scheduled": True}
+
+        idx = self._index_get()
+        if not idx.available:
+            return {"ok": False, "reason": idx.last_error or "index unavailable"}
+
+        notes = self._iter_notes()
+        vault: Dict[str, tuple] = {}
+        for note in notes:
+            rel = self._rel(note.path)
+            try:
+                mt = note.path.stat().st_mtime
+            except OSError:
+                mt = 0.0
+            vault[rel] = (note, mt)
+
+        indexed = {} if force else idx.path_mtimes()
+
+        added: List[str] = []
+        updated: List[str] = []
+        for rel, (note, mt) in vault.items():
+            cur = indexed.get(rel)
+            if cur is None:
+                added.append(rel)
+            elif abs(cur - mt) > 0.5:  # 容差：避开文件系统时间精度差异
+                updated.append(rel)
+        removed = [rel for rel in indexed if rel not in vault]
+
+        errors = 0
+        for rel in added + updated:
+            note, mt = vault[rel]
+            try:
+                idx.upsert(rel, note.full_text, mtime=mt)
+            except Exception as e:  # noqa: BLE001
+                logger.debug("kb sync upsert failed for %s: %s", rel, e)
+                errors += 1
+        for rel in removed:
+            try:
+                idx.delete(rel)
+            except Exception as e:  # noqa: BLE001
+                logger.debug("kb sync delete failed for %s: %s", rel, e)
+                errors += 1
+
+        result = {
+            "ok": True,
+            "added": len(added),
+            "updated": len(updated),
+            "removed": len(removed),
+            "unchanged": len(vault) - len(added) - len(updated),
+            "errors": errors,
+        }
+        if added or updated or removed:
+            logger.info("kb index sync: %s", result)
+        return result
+
+    def index_stats(self) -> Dict[str, Any]:
+        """索引新鲜度诊断：正本 vs 投影的差异计数（供 governed_health 用）。"""
+        idx = self._index_get()
+        vault = len(self._iter_notes())
+        if not idx.available:
+            return {"available": False, "reason": idx.last_error,
+                    "vault_notes": vault, "indexed": 0, "stale": vault}
+        indexed = idx.path_mtimes()
+        return {
+            "available": True,
+            "vault_notes": vault,
+            "indexed": len(indexed),
+            "missing": max(0, vault - len(indexed)),
+        }
 
     # -- 读取 --------------------------------------------------------
 
@@ -328,7 +508,12 @@ class KnowledgeBase:
 
     @staticmethod
     def _keyword_score(query: str, note: _Note) -> float:
-        """关键词打分（中文 bigram 兜底 + 整串命中）。"""
+        """关键词原始打分（中文 bigram 兜底 + 整串命中），量纲 0~12。
+
+        仅供 :meth:`_keyword_score_norm` 归一化使用，以及需要在 UI 上展示
+        原始命中强度的场景。**不要**直接把它和语义分（[0,1]）比较或混排
+        —— 见 :data:`_KEYWORD_SCORE_MAX` 的说明。
+        """
         q = query.strip().lower()
         if not q:
             return 0.0
@@ -349,8 +534,28 @@ class KnowledgeBase:
                 score += len(qg & sg) / len(qg) * 2.0
         return score
 
+    @classmethod
+    def _keyword_score_norm(cls, query: str, note: _Note) -> float:
+        """关键词分归一化到 [0,1]，可与语义分直接比较/融合。
+
+        归一化分母取 5.0 而非理论上限 12.0：``q in title`` 必然也让
+        ``q in short`` 成立（short_text 含 title），所以 title 命中天然拿到
+        5+3=8 分。以 5.0 为分母的含义是「标题命中即满格」，body 命中 0.4、
+        标签/概念命中 0.6，语义上正好对应「强/弱相关」的直觉分级。
+        """
+        return min(cls._keyword_score(query, note) / _KEYWORD_SCORE_DENOM, 1.0)
+
     def search(self, query: str, top_k: int = 10, section: str = "") -> List[Dict[str, Any]]:
-        """融合检索：关键词（必有） + 语义（可选） + 反链统计。"""
+        """融合检索：关键词 + 语义（权重融合） + 反链统计。
+
+        两路分数各自归一化到 [0,1] 后按 :data:`_KB_KW_WEIGHT` /
+        :data:`_KB_SEM_WEIGHT` 线性融合。``kb.keyword_enabled`` /
+        ``kb.semantic_enabled`` 在这里真正生效（此前两个开关只被定义、
+        从未被读取）。
+
+        返回项的 ``score`` 是融合分；``kind`` 标明主导来源（``keyword`` /
+        ``semantic`` / ``hybrid``），便于诊断。
+        """
         if not query.strip():
             return []
         top_k = max(1, min(int(top_k), 50))
@@ -358,52 +563,73 @@ class KnowledgeBase:
         if section:
             notes = [n for n in notes if n.section == section]
 
-        # 关键词打分（始终可用）
-        scored: Dict[str, Dict[str, Any]] = {}
-        for note in notes:
-            ks = self._keyword_score(query, note)
-            if ks <= 0.0:
-                continue
-            scored[self._rel(note.path)] = {
-                "title": note.title,
-                "path": self._rel(note.path),
-                "section": note.section,
-                "score": ks,
-                "kind": "keyword",
-                "tags": note.tags,
-                "concepts": note.concepts,
-                "snippet": note.body[:160].strip(),
-            }
+        kb_cfg = self._config.kb
+        keyword_on = bool(getattr(kb_cfg, "keyword_enabled", True))
+        semantic_on = bool(getattr(kb_cfg, "semantic_enabled", True))
 
-        # 语义检索（可选增强；按 path 去重合并，取更高分）
+        # 两路各自的归一化分（缺一路时置 0，由权重归一化兜底）
+        kw_norm: Dict[str, float] = {}
+        if keyword_on:
+            for note in notes:
+                rel = self._rel(note.path)
+                s = self._keyword_score_norm(query, note)
+                if s > 0.0:
+                    kw_norm[rel] = s
+
+        sem_norm: Dict[str, float] = {}
         idx = self._index_get()
-        if idx.available:
+        if semantic_on and idx.available:
             for r in idx.search(query, top_k):
-                p = r["path"]
-                if p in scored:
-                    if r["score"] > scored[p]["score"]:
-                        scored[p]["score"] = r["score"]
-                        scored[p]["kind"] = "semantic"
-                else:
-                    # 语义命中但关键词没中：补一个骨架（正文从索引 text 截取）
-                    scored[p] = {
-                        "title": Path(p).stem,
-                        "path": p,
-                        "section": Path(p).parent.name,
-                        "score": r["score"],
-                        "kind": "semantic",
-                        "tags": [],
-                        "concepts": [],
-                        "snippet": r["text"][:160].strip(),
-                    }
+                sem_norm[r["path"]] = float(r.get("score", 0.0) or 0.0)
+
+        # 权重按「实际启用的通道」重新归一化，避免关掉一路后总分整体缩水
+        active_kw = _KB_KW_WEIGHT if keyword_on else 0.0
+        active_sem = _KB_SEM_WEIGHT if semantic_on else 0.0
+        total_w = active_kw + active_sem
+        if total_w <= 0.0:
+            return []
+        active_kw /= total_w
+        active_sem /= total_w
+
+        note_by_rel: Dict[str, _Note] = {self._rel(n.path): n for n in notes}
+        scored: Dict[str, Dict[str, Any]] = {}
+        for rel in set(kw_norm) | set(sem_norm):
+            kw = kw_norm.get(rel, 0.0)
+            sem = sem_norm.get(rel, 0.0)
+            note = note_by_rel.get(rel)
+            if note is not None:
+                title, section_name = note.title, note.section
+                tags, concepts = note.tags, note.concepts
+                snippet = note.body[:160].strip()
+            else:
+                # 语义命中但 vault 里已无此文件（索引投影滞后于正本）
+                title = Path(rel).stem
+                section_name = Path(rel).parent.name
+                tags, concepts, snippet = [], [], ""
+            if kw > 0.0 and sem > 0.0:
+                kind = "hybrid"
+            elif sem > 0.0:
+                kind = "semantic"
+            else:
+                kind = "keyword"
+            scored[rel] = {
+                "title": title,
+                "path": rel,
+                "section": section_name,
+                "score": round(active_kw * kw + active_sem * sem, 4),
+                "kind": kind,
+                "keyword_score": round(kw, 4),
+                "semantic_score": round(sem, 4),
+                "tags": tags,
+                "concepts": concepts,
+                "snippet": snippet,
+            }
 
         ranked = sorted(scored.values(), key=lambda x: x["score"], reverse=True)
 
-        # ``kb.min_score`` 过滤：低于阈值的条目不再返回，让配置真正生效。
-        # 默认 0.0 时**完全不过滤**（等价于旧行为，向后兼容）；防御式读取
-        # 旧配置缺字段的情况。注意：关键词分数与语义分数不同量纲（关键词
-        # 命中可到 10 分制、语义为 [0,1]），阈值应据此设置。
-        min_score = float(getattr(self._config.kb, "min_score", 0.0) or 0.0)
+        # ``kb.min_score`` 过滤。归一化后该阈值是**统一量纲**（[0,1]），
+        # 不再像旧版那样受关键词 0~12 分制影响。默认 0.0 时完全不过滤。
+        min_score = float(getattr(kb_cfg, "min_score", 0.0) or 0.0)
         if min_score > 0.0:
             ranked = [item for item in ranked if item["score"] >= min_score]
 
@@ -487,6 +713,7 @@ class KnowledgeBase:
                 self._index_get().upsert(
                     self._rel(note.path),
                     _Note(note.path, note.title, ometa, nobody).full_text,
+                    mtime=_file_mtime(note.path),
                 )
                 added += 1
 
@@ -500,7 +727,8 @@ class KnowledgeBase:
             nbody = _vault.append_link_section(body, pending)
             _vault.write_note(path, meta, nbody)
             self._index_get().upsert(
-                self._rel(path), _Note(path, title, meta, nbody).full_text
+                self._rel(path), _Note(path, title, meta, nbody).full_text,
+                mtime=_file_mtime(path),
             )
             added += len(pending)
         return added
@@ -588,7 +816,8 @@ class KnowledgeBase:
 
         # 更新向量索引（尽力而为）；索引路径用相对 vault 的路径，与检索去重键一致
         note = _Note(path, title, meta, body)
-        self._index_get().upsert(self._rel(path), note.full_text)
+        self._index_get().upsert(self._rel(path), note.full_text,
+                                 mtime=_file_mtime(path))
 
         # 链接补全：只对正库 notes 做（inbox 待审先不互链，避免噪音）
         links_added = 0
@@ -669,7 +898,8 @@ class KnowledgeBase:
 
             idx = self._index_get()
             idx.delete(self._rel(note.path))
-            idx.upsert(self._rel(new_path), _Note(new_path, title, meta, body).full_text)
+            idx.upsert(self._rel(new_path), _Note(new_path, title, meta, body).full_text,
+                       mtime=_file_mtime(new_path))
 
             return {
                 "ok": True,
@@ -714,11 +944,25 @@ class KnowledgeBase:
         for n in notes:
             by_section[n.section] = by_section.get(n.section, 0) + 1
         idx = self._index_get()
+        # 索引新鲜度：正本 vs 投影的差异。``index_missing`` / ``index_stale``
+        # 长期不为 0 说明后台增量同步没跑起来（外部写入会持续漏索引）。
+        indexed = idx.path_mtimes() if idx.available else {}
+        missing = 0
+        stale = 0
+        for n in notes:
+            cur = indexed.get(self._rel(n.path))
+            if cur is None:
+                missing += 1
+            elif abs(cur - _file_mtime(n.path)) > 0.5:
+                stale += 1
         return {
             "total": len(notes),
             "by_section": by_section,
             "index_available": idx.available,
             "index_error": idx.last_error or "",
+            "indexed": len(indexed),
+            "index_missing": missing,
+            "index_stale": stale,
         }
 
 

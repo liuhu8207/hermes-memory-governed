@@ -23,6 +23,50 @@ from typing import Any, Dict, List, Optional, Tuple
 
 from ._config import GovernedMemoryConfig
 from ._diag import log_data_loss
+from ._sync import (
+    _ABS_PATH_RE,
+    _MEDIA_PLACEHOLDER_RE,
+    is_ephemeral_content,
+    is_template_placeholder,
+)
+
+
+def screen_bridge_content(content: str) -> Optional[str]:
+    """Bridge 候选准入闸门：通过返回 ``None``，否则返回拒绝原因字符串。
+
+    只管**内容质量**（时效性 / 模板 / 多模态占位符 / 纯路径）。
+    **凭据不在这里处理** —— 它由 ``matched_secret_patterns`` +
+    ``_quarantine_candidate`` 走独立的安全通道：凭据候选会被写入
+    ``quarantine.jsonl``（脱敏后）并计数，保留审计痕迹；如果在这里一并
+    拒掉，安全事件就只剩一个 ``skipped`` 计数器，从观测上等于消失了。
+
+    为什么门槛必须比 L2 更严（P1，2026-09-16）：L2 是**召回层**，一条错行
+    的代价是一次误导性提示；而 Bridge 的候选会被 ``import_approved``
+    **promote 进 L1**，L1 每轮都作为「规则」注入 —— 一次性待办进去就变
+    永久规则。实测候选池里躺着
+        「我儿子的准考证，考试前一天记得提醒我」
+    一旦 promote，Hermes 会永远记得「考试前一天提醒」，而考试早已结束。
+
+    四个写入者（插件 ``on_session_end``、``scope_recall_bridge.py``、
+    ``memory_promote.py``、``import_approved``）此前各写各的规则，这条
+    闸门是它们的**唯一共同入口**。
+
+    Returns:
+        拒绝原因（``ephemeral`` / ``template`` / ``media`` / ``abs_path``
+        / ``empty``），或 ``None`` 表示放行。
+    """
+    text = (content or "").strip()
+    if not text:
+        return "empty"
+    if is_ephemeral_content(text):
+        return "ephemeral"
+    if is_template_placeholder(text):
+        return "template"
+    if _MEDIA_PLACEHOLDER_RE.match(text):
+        return "media"
+    if _ABS_PATH_RE.match(text):
+        return "abs_path"
+    return None
 
 logger = logging.getLogger(__name__)
 
@@ -324,6 +368,15 @@ class BridgeExporter:
             logger.debug("Unsafe target: %s", target)
             return False
         if len(candidate["content"]) < 10:
+            return False
+        # 准入闸门：时效性待办 / 模板骨架 / 多模态占位符 / 凭据 / 纯路径
+        # 一律不得进入候选池（见 screen_bridge_content 的说明）。
+        reason = screen_bridge_content(candidate["content"])
+        if reason is not None:
+            logger.info(
+                "Bridge candidate rejected (%s): %s",
+                reason, str(candidate["content"])[:60].replace("\n", " "),
+            )
             return False
         return True
 

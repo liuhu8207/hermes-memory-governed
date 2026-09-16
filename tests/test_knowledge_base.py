@@ -179,7 +179,7 @@ class TestKnowledgeBase:
         class _FakeIdx:
             available = True
 
-            def upsert(self, path, text):
+            def upsert(self, path, text, mtime=0.0):
                 captured["path"] = path
 
         monkeypatch.setattr(kb, "_index_get", lambda: _FakeIdx())

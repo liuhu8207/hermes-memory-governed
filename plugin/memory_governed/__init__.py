@@ -27,9 +27,16 @@ from typing import Any, Dict, List, Optional, Set
 from ._config import GovernedMemoryConfig, load_governed_config
 from ._migrations import MigrationRunner
 from ._recall import RecallEngine
-from ._sync import WriteQueue, L3Writer
+from ._sync import (
+    WriteQueue,
+    L3Writer,
+    _MIN_SIGNAL_USER,
+    _content_to_text,
+    _fact_signal_score,
+    is_ephemeral_content,
+)
 from ._compress import MermaidCompressor
-from ._bridge import BridgeExporter
+from ._bridge import BridgeExporter, screen_bridge_content
 from ._kb import KnowledgeBase
 from . import _ingest
 from . import _synthesize
@@ -404,13 +411,15 @@ class GovernedMemoryProvider:
             Path(hermes_home, subdir).mkdir(parents=True, exist_ok=True)
 
         # Initialize components
-        self._recall = RecallEngine(self._config)
+        # KB 先于 RecallEngine 构造：召回引擎需要一个知识库句柄来产出
+        # 「有相关笔记」提示（KB 通道）。此处顺序有依赖，勿调换。
+        self._kb = KnowledgeBase(self._config)
+        self._kb.ensure()
+        self._recall = RecallEngine(self._config, kb=self._kb)
         self._l3_writer = L3Writer(self._config)
         self._write_queue = WriteQueue(self._config)
         self._compressor = MermaidCompressor(self._config)
         self._bridge = BridgeExporter(self._config)
-        self._kb = KnowledgeBase(self._config)
-        self._kb.ensure()
 
         # Start write queue worker
         self._write_queue.start()
@@ -1102,25 +1111,73 @@ class GovernedMemoryProvider:
             logger.debug("Failed to remove from %s: %s", path_str, e)
 
     def _extract_session_candidates(self, messages: List[Dict[str, Any]]) -> List[dict]:
-        """Extract Bridge candidates from a session's messages."""
+        """Extract Bridge candidates from a session's messages.
+
+        三道关（2026-09-16 统一到与 L2 同一把尺子）：
+
+        1. ``screen_bridge_content`` —— 整条硬拒（时效性待办 / 模板骨架 /
+           多模态占位符 / 凭据 / 纯路径）。时效性尤其关键：候选会被 promote
+           进 L1 成为**永久规则**，一条「考试前一天记得提醒我」会永远生效。
+        2. ``_looks_like_durable_fact`` —— 原有启发式（偏好关键词 + 长度 +
+           非问句 + 非列表）。
+        3. 强信号门槛 —— 与 ``WriteQueue._extract_atomic_facts`` 同一把尺子，
+           拦掉「都配吧，免得以后每次都弹窗」这类一次性确认。
+
+        另外用 ``_content_to_text`` 归一化 content：多模态消息的 content 是
+        list，直接做字符串运算会崩（这正是 9-15 那次 P0 的成因）。
+        """
         candidates = []
         for msg in messages:
-            content = msg.get("content", "")
-            role = msg.get("role", "")
-            if not content or role != "user":
+            if msg.get("role", "") != "user":
+                continue
+            content = _content_to_text(msg.get("content", ""))
+            if not content or not content.strip():
                 continue
 
-            if self._looks_like_durable_fact(content):
-                candidates.append({
-                    "content": content.strip()[:600],
-                    "target": "memory",
-                    "memory_type": "memory",
-                    "tags": ["session-extract", "review-required"],
-                    "source": "hermes-memory-governed",
-                    "source_path": "session",
-                })
+            reason = screen_bridge_content(content)
+            if reason is not None:
+                logger.debug("Session candidate rejected (%s): %s", reason, content[:60])
+                continue
+            if not self._passes_structural_filter(content):
+                continue
+            # 强信号门槛：只算用户约束 / 技术结论 / 代码标识符
+            if _fact_signal_score(content, "user", strong_only=True) <= _MIN_SIGNAL_USER:
+                logger.debug("Session candidate below signal floor: %s", content[:60])
+                continue
+
+            candidates.append({
+                "content": content.strip()[:600],
+                "target": "memory",
+                "memory_type": "memory",
+                "tags": ["session-extract", "review-required"],
+                "source": "hermes-memory-governed",
+                "source_path": "session",
+            })
 
         return candidates
+
+    @staticmethod
+    def _passes_structural_filter(content: str) -> bool:
+        """结构性排除：太短 / 问句 / 列表 / 空白。
+
+        与 :meth:`_looks_like_durable_fact` 的关系：那个方法还带一套**独立的
+        偏好词表**，在 Bridge 路径上与统一的强信号门槛（``_fact_signal_score``）
+        重复且更窄 —— 实测「我在NAS有装secretstore，但本地布署不能同步」
+        强信号 6 分（命中「我在」「不能」）却被旧词表拦下。Bridge 路径因此
+        只保留结构检查，值不值得记交给那把统一的尺子。
+        """
+        stripped = (content or "").strip()
+        if not stripped:
+            return False
+        if stripped.endswith(("?", "？")):
+            return False
+        cjk_count = sum(1 for c in stripped if "\u4e00" <= c <= "\u9fff")
+        non_cjk_count = len(stripped) - cjk_count
+        if non_cjk_count + cjk_count * 3 < 15:
+            return False
+        if stripped.count(",") > 3 or stripped.count("、") > 3:
+            return False
+        return True
 
     @staticmethod
     def _looks_like_durable_fact(content: str) -> bool:

@@ -8,12 +8,14 @@
 只作用于**新写入**。规则收紧之后，历史存量仍是按旧标准进来的，必须回头清一遍，
 否则它们会继续参与向量召回、抬高无关查询的地板分。
 
-role 的近似
------------
-L2 表**不存 role**（``_index_l2`` 只落 content/category/source/timestamp/vector）。
-回放时统一按 ``user`` 判定 —— 这是**已知的有意偏松**：user 基线 +2，比 assistant
-基线 -1 宽松，宁可漏删也不误杀。代价是少量助手叙述可能残留，用 ``--drop-extra``
-手工补刀；反过来若按 assistant 判定，会误杀大量真实的用户约束。
+role 的真实性
+-------------
+L2 现在会落真实 ``role``（``_extract_atomic_facts`` 写入），存量行用
+``scripts/l2_backfill_role.py`` 从 L3 回填。本脚本按真实角色回放 —— 这很
+关键，因为 user 基线 +2、assistant 基线 -1，用错角色的门槛会得出相反结论。
+
+若 role 尚未回填（列缺失 / 为空），本脚本**回退为按 user 判定**并在输出里
+明确提示：这是有意的偏松（宁可漏删不误杀），代价是助手叙述可能残留。
 
 用法::
 
@@ -35,17 +37,43 @@ import lancedb
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from plugin.memory_governed._sync import (  # noqa: E402
+    _MIN_SIGNAL_ASSISTANT,
     _MIN_SIGNAL_USER,
     WriteQueue,
     _fact_signal_score,
 )
 
 
-def admits(text: str) -> bool:
-    """当前质量门是否会让这条内容进入 L2（按 user 角色判定）。"""
-    if not WriteQueue._looks_like_fact(text, "user"):
+def admits(text: str, role: str = "user") -> bool:
+    """当前质量门是否会让这条内容进入 L2（按**真实角色**判定）。
+
+    role 影响很大：user 基线 +2、assistant 基线 -1，两边门槛也不同。
+    回填 role 之前这里只能一律按 user 走（偏松，助手叙述会漏删）。
+    """
+    if not WriteQueue._looks_like_fact(text, role):
         return False
-    return _fact_signal_score(text, "user", strong_only=True) > _MIN_SIGNAL_USER
+    floor = _MIN_SIGNAL_ASSISTANT if role == "assistant" else _MIN_SIGNAL_USER
+    return _fact_signal_score(text, role, strong_only=True) > floor
+
+
+def _row_roles(arrow) -> List[str]:
+    """取每行的真实 role；缺列/为空时回退 ``user``（旧行为，偏松）。"""
+    names = [f.name for f in arrow.schema]
+    if "role" not in names:
+        print("[l2-gate] L2 无 role 列 —— 全部按 user 判定（偏松）。"
+              "可先跑 scripts/l2_backfill_role.py 回填。")
+        return ["user"] * arrow.num_rows
+    roles = []
+    missing = 0
+    for v in arrow.column("role").to_pylist():
+        if v in ("user", "assistant"):
+            roles.append(str(v))
+        else:
+            roles.append("user")
+            missing += 1
+    if missing:
+        print(f"[l2-gate] {missing} 行 role 为空 → 按 user 判定（偏松）")
+    return roles
 
 
 def main(argv: List[str] | None = None) -> int:
@@ -61,11 +89,12 @@ def main(argv: List[str] | None = None) -> int:
     table = db.open_table(args.table)
     arrow = table.to_arrow()
     contents: List[str] = arrow.column("content").to_pylist()
+    roles = _row_roles(arrow)
 
     keep, drop = [], []
     for i, c in enumerate(contents):
         c = c or ""
-        if admits(c) and not any(x in c for x in args.drop_extra):
+        if admits(c, roles[i]) and not any(x in c for x in args.drop_extra):
             keep.append(i)
         else:
             drop.append(i)
@@ -73,10 +102,10 @@ def main(argv: List[str] | None = None) -> int:
     print(f"[l2-gate] {len(contents)} 条 → 保留 {len(keep)} / 剔除 {len(drop)}")
     print("\n--- 保留 ---")
     for i in keep:
-        print(f"  + {contents[i][:88].replace(chr(10), ' / ')}")
+        print(f"  + [{roles[i]:9s}] {contents[i][:80].replace(chr(10), ' / ')}")
     print("\n--- 剔除 ---")
     for i in drop:
-        print(f"  - {contents[i][:88].replace(chr(10), ' / ')}")
+        print(f"  - [{roles[i]:9s}] {contents[i][:80].replace(chr(10), ' / ')}")
 
     if args.dry_run:
         print("\n[dry-run] 未做任何修改")

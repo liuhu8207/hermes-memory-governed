@@ -131,6 +131,19 @@ class KnowledgeConfig:
     #: 落库时是否为共享 concepts/tags 的相关笔记自动补双向 [[wikilink]]。
     autolink_related: bool = True
 
+    #: 是否允许知识库参与对话召回（产出一行「有相关笔记」提示）。
+    recall_hint_enabled: bool = True
+    #: KB 提示通道的融合分门槛。**默认 0.0 = 关闭**，显式配置后才生效
+    #: （与 ``recall.l2_min_score`` 同一约定：代码默认不改行为，部署侧开启）。
+    #:
+    #: 标定参考（vault 26 篇 / 真实 bge-m3）：无关查询 top1 融合分
+    #: 0.4054~0.4666，相关 0.4709~0.8934。取 0.45 时相关 5/5 命中、无关
+    #: 漏过 1/5 —— 提示行误报成本仅 ~40 token，因此取偏宽松一侧换覆盖率。
+    #: 想要更干净可提到 0.50（相关 4/5、无关 0/5）。
+    recall_min_score: float = 0.0
+    #: 一次提示最多列出几篇笔记。
+    recall_max_notes: int = 3
+
 
 @dataclass
 class AsrConfig:
@@ -312,7 +325,7 @@ _NUMERIC_FIELDS = {
     "mermaid_compress": ["canvas_max_tokens"],
     "vector": ["dim"],
     "embedding": ["dimensions"],
-    "kb": ["top_k", "min_score"],
+    "kb": ["top_k", "min_score", "recall_min_score", "recall_max_notes"],
 }
 
 

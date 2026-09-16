@@ -373,6 +373,172 @@ _CREDENTIAL_RE = re.compile(
 # file moves ("C:\Users\...\plugins\model-providers\deepseek\__init__.py").
 _ABS_PATH_RE = re.compile(r"^(?:[A-Za-z]:[\\/]|\\\\)\S+$")
 
+
+# ---------------------------------------------------------------------------
+# Ephemeral (one-off, time-bound) intents — Bridge-only gate
+# ---------------------------------------------------------------------------
+# Why this exists and why it is NOT part of `_looks_like_fact`:
+#
+# L2 is a RECALL layer — a wrong row costs one bad hint. Bridge candidates,
+# by contrast, get **promoted into L1**, which is injected into every single
+# turn as the "rules" layer. A one-off todo that lands there becomes a
+# permanent rule: the live candidate pool held
+#     「我儿子的准考证，考试前一天记得提醒我」
+# which, once promoted, means Hermes reminds about an exam forever — long
+# after the exam ended. So ephemeral content must be stopped **before it
+# enters the pool**, not filtered at promotion time.
+#
+# The rule is a conjunction (time expression AND reminder verb) minus a
+# periodic-preference veto. That asymmetry matters: 「每次要输密码太麻烦」
+# contains a reminder-ish shape but is a durable preference and must survive;
+# 「考试前一天记得提醒我」 has no periodic marker and is genuinely one-off.
+_EPHEMERAL_TIME_RE = re.compile(
+    r"(明天|后天|大后天|今晚|今早|今天|当天|"
+    r"本周[一二三四五六日天]|这周|这星期|这个星期|"
+    r"下周[一二三四五六日天]?|下星期|下个星期|下个月|这个月|下季度|"
+    r"\d+\s*(?:天|日|周|个?月|小时|分钟)(?:后|之后|以内|内)|"
+    r"前(?:一天|两天|一晚|三天|一周)|"
+    r"tomorrow|tonight|next\s+(?:week|month|monday|tuesday|wednesday|thursday|friday|saturday|sunday)|"
+    r"in\s+\d+\s+(?:days?|weeks?|months?)|"
+    r"day\s+before)",
+    re.IGNORECASE,
+)
+
+_EPHEMERAL_ACTION_RE = re.compile(
+    r"(提醒我|记得提醒|别忘了|别忘记|到时候|记得|叫我|通知我|"
+    r"remind\s+me|don'?t\s+forget|remember\s+to)",
+    re.IGNORECASE,
+)
+
+#: 周期性/长期语汇 —— 它们描述的正是 L1 该记住的东西，构成否决票。
+_DURABLE_PERIODIC_RE = re.compile(
+    r"(每次|总是|以后|一直|永远|从来不|从不|每天|每周|每月|定期|习惯|"
+    r"every\s+time|always|never|usually|from\s+now\s+on)",
+    re.IGNORECASE,
+)
+
+
+def is_ephemeral_content(text: str) -> bool:
+    """Detect one-off, time-bound intents that must never reach L1.
+
+    A conjunction of a time expression and a reminder verb, vetoed by any
+    periodic/durable marker. Returns False for anything ambiguous — the cost
+    of letting a todo through is a stale permanent rule, but the cost of
+    dropping a real preference is far higher.
+
+    Examples:
+        >>> is_ephemeral_content("我儿子的准考证，考试前一天记得提醒我")
+        True
+        >>> is_ephemeral_content("每次要输密码太麻烦了，能不能做成免密")
+        False
+    """
+    s = (text or "").strip()
+    if not s:
+        return False
+    if _DURABLE_PERIODIC_RE.search(s):
+        return False
+    return bool(_EPHEMERAL_TIME_RE.search(s) and _EPHEMERAL_ACTION_RE.search(s))
+
+
+# ---------------------------------------------------------------------------
+# Template skeletons — Bridge-only gate
+# ---------------------------------------------------------------------------
+# The vault/memory files ship with commented-out scaffolding. `source_record`
+# in scripts/scope_recall_bridge.py treats a whole FILE as one candidate, so
+# an untouched USER.md becomes a candidate whose only content is the skeleton.
+# Promoting it copies the scaffold into L1, and the next persona build reads
+# L1 back into persona.md — a closed loop that keeps re-injecting the
+# scaffold. Strip first, then judge on what is left.
+_HTML_COMMENT_RE = re.compile(r"<!--.*?-->", re.DOTALL)
+
+_TEMPLATE_MARKERS = (
+    "直接编辑此文件",
+    "在此添加",
+    "手写用户信息",
+    "手写规则层",
+    "手写规则",
+    "_generated:",
+    "your name here",
+    # 模板的 H1 标题本身也算痕迹：USER.md 的 "# User Profile" 与
+    # MEMORY.md 的 "# Memory Rules" 会被 persona 构建原样吞进去，
+    # 只靠 "手写…" 那几行清不干净（实测 summary 里仍残留
+    # "User Profile User User Profile 身份 偏好 当前项目"）。
+    "user profile",
+    "memory rules",
+)
+
+#: 净化后至少要有这么多实质字符，才不算「只是模板骨架」。
+_TEMPLATE_MIN_SUBSTANTIVE_CHARS = 40
+
+
+def strip_template_fragments(text: str) -> str:
+    """去掉模板骨架：HTML 注释、生成时间戳行、使用说明行、**空章节标题**。
+
+    最后一步是必要的：模板里的 ``## 身份`` / ``## 偏好`` 这些标题本身
+    不在 ``_TEMPLATE_MARKERS`` 里（它们太通用，直接拉黑会误伤真实笔记），
+    但它们**后面没有任何内容**，所以按「空章节」处理更准确 —— 一个有内容
+    的 ``## 身份`` 会被保留，模板里的空壳则被丢掉。
+    """
+    if not text:
+        return ""
+    out = _HTML_COMMENT_RE.sub("", text)
+    kept = []
+    for line in out.splitlines():
+        s = line.strip()
+        if not s:
+            kept.append(line)
+            continue
+        low = s.lower()
+        if any(m in s or m in low for m in _TEMPLATE_MARKERS):
+            continue
+        kept.append(line)
+    return _drop_empty_sections("\n".join(kept)).strip()
+
+
+def _drop_empty_sections(text: str) -> str:
+    """删掉「后面没有任何正文」的标题行（模板遗留的空章节）。"""
+    lines = text.splitlines()
+    out: List[str] = []
+    for i, line in enumerate(lines):
+        s = line.strip()
+        if s and _MD_HEADING_RE.match(s):
+            j = i + 1
+            while j < len(lines) and not lines[j].strip():
+                j += 1
+            if j >= len(lines) or _MD_HEADING_RE.match(lines[j].strip()):
+                continue  # 空章节标题，丢弃
+        out.append(line)
+    return "\n".join(out)
+
+
+def is_template_placeholder(text: str) -> bool:
+    """整条内容是否只是模板骨架（净化后没有实质内容）。
+
+    先决条件：**必须含模板痕迹**（``_TEMPLATE_MARKERS``）。否则短句会被
+    误判 —— 「都配吧，免得以后每次都弹窗」只有 13 个字符，任何"字符数
+    下限"的判据都会把它当成空模板。
+
+    满足先决条件后，再看「非标题行的有效字符数」：USER.md 模板净化后只剩
+    若干个空标题（``## 身份`` / ``## 偏好`` …），实质字符数为 0，判为模板；
+    而 persona.md 这类「真实内容 + 夹带模板片段」净化后仍有大量正文，放行。
+    """
+    raw = (text or "").strip()
+    if not raw:
+        return True
+    low = raw.lower()
+    if not any(m in raw or m in low for m in _TEMPLATE_MARKERS):
+        return False
+    stripped = strip_template_fragments(raw)
+    if not stripped:
+        return True
+    substantive = 0
+    for line in stripped.splitlines():
+        s = line.strip()
+        if not s or _MD_HEADING_RE.match(s):
+            continue
+        substantive += len(s)
+    return substantive < _TEMPLATE_MIN_SUBSTANTIVE_CHARS
+
 # Metadata "key: value" rows out of status reports. Matched against the
 # UNDECORATED copy so that "- **Provider**: `governed`", "**Provider**: …"
 # and "Provider: …" all hit the same rule. Deliberately a closed list: a
@@ -959,17 +1125,25 @@ class WriteQueue:
                     pa.field("timestamp", pa.string()),
                     pa.field("vector", pa.list_(pa.float32(), dim)),
                     pa.field("source_rowid", pa.int64()),  # L3 message rowid for audit
+                    pa.field("role", pa.string()),         # originating turn role
                 ])
                 self._l2_store = db.create_table("memories", schema=schema)
 
-            # Backfill source_rowid column on legacy tables (best-effort)
+            # Backfill legacy columns (best-effort). `role` carries the
+            # originating turn's role so the quality gate can be replayed with
+            # the real rule instead of assuming "user" (see _extract_atomic_facts).
+            # Existing rows get NULL; scripts/l2_backfill_role.py fills them from
+            # the L3 archive via source_rowid.
             try:
                 col_names = [f.name for f in self._l2_store.schema]
                 if "source_rowid" not in col_names:
                     self._l2_store.add_columns({"source_rowid": pa.array([], type=pa.int64())})
                     logger.info("L2 legacy table backfilled with source_rowid column")
+                if "role" not in col_names:
+                    self._l2_store.add_columns({"role": pa.array([], type=pa.string())})
+                    logger.info("L2 legacy table backfilled with role column")
             except Exception as e:  # noqa: BLE001
-                logger.debug("L2 source_rowid column backfill skipped: %s", e)
+                logger.debug("L2 column backfill skipped: %s", e)
         except Exception as e:  # noqa: BLE001
             log_degraded("l2_write", "store_init_failed", exc=e)
             return
@@ -1191,6 +1365,10 @@ class WriteQueue:
                     "category": self._categorize(sentence),
                     "source": "auto-extract",
                     "timestamp": datetime.now().isoformat(),
+                    # 落库真实角色（2026-09-16）：质量门回放只能按真实 role
+                    # 复算分数，而过去 L2 表里根本没有这个字段，只好一律按
+                    # user 判定（偏松，会把该拦的助手叙述放过去）。
+                    "role": role,
                     "_signals": _fact_signal_score(sentence, role),
                 })
 

@@ -42,6 +42,53 @@ SECRET_PATTERNS = [
     ),
 ]
 
+_HELPERS: tuple | None = None
+
+
+def _governed_helpers():
+    """导入统一准入闸门（dev / installed 两种布局），结果缓存。
+
+    桥接的门槛只应有一份实现：插件侧 ``on_session_end``、``memory_promote``、
+    本脚本、``import_approved`` 共用 ``screen_bridge_content``。实测本脚本
+    此前把 persona.md 全文（其实是 USER.md 模板骨架 + 真实内容混在一起）
+    当作 target=user 候选导出，promote 之后模板会写进 L1 —— 而 L1 又会被
+    下一次 persona 构建读回去，形成闭环污染。
+
+    导入失败时降级为「不过滤 + 不净化」，绝不因为插件不可用而中断导出。
+    """
+    global _HELPERS
+    if _HELPERS is not None:
+        return _HELPERS
+
+    project_root = Path(__file__).resolve().parent.parent
+    candidates = []
+    if (project_root / "plugin" / "memory_governed").exists():
+        candidates.append(str(project_root))          # dev layout
+    installed_parent = HERMES_HOME / "plugins"
+    if (installed_parent / "governed").exists():
+        candidates.append(str(installed_parent))      # installed layout
+
+    last_error = None
+    for cand in candidates:
+        if cand in sys.path:
+            sys.path.remove(cand)
+        sys.path.insert(0, cand)
+        try:
+            try:
+                from plugin.memory_governed._bridge import screen_bridge_content
+                from plugin.memory_governed._sync import strip_template_fragments
+            except ImportError:
+                from governed._bridge import screen_bridge_content
+                from governed._sync import strip_template_fragments
+            _HELPERS = (screen_bridge_content, strip_template_fragments)
+            return _HELPERS
+        except ImportError as e:
+            last_error = e
+
+    logger.warning("governed gate unavailable (%s) — exporting unfiltered", last_error)
+    _HELPERS = (lambda _t: None, lambda t: t)
+    return _HELPERS
+
 
 def read_text(path: Path) -> str:
     return path.read_text(encoding="utf-8", errors="replace")
@@ -101,6 +148,19 @@ def source_record(path: Path, target: str, source_kind: str, source_trust: float
         return None
     if has_secret_like_text(content):
         logger.warning("skip_secret_like_source=%s", path)
+        return None
+
+    # 先净化模板骨架，再过统一闸门（见 _governed_helpers 的说明）。
+    # 净化必须发生在 title/summary 之前 —— 否则 summary 会把
+    # "直接编辑此文件" 之类的脚手架当成摘要。
+    screen, strip_template = _governed_helpers()
+    content = strip_template(content)
+    if not content.strip():
+        logger.info("skip_template_only_source=%s", path)
+        return None
+    reason = screen(content)
+    if reason is not None:
+        logger.info("skip_bridge_source reason=%s path=%s", reason, path)
         return None
 
     title = extract_title(content, path.stem)

@@ -137,7 +137,7 @@ def row_to_score(row: Any) -> float:
 @dataclass
 class RecallResult:
     """A single recalled memory item."""
-    layer: str           # "l1", "l2", "l3", "l4"
+    layer: str           # "l1", "l2", "l3", "l4", "kb"
     content: str
     score: float
     source: str = ""     # file path or "handwritten"
@@ -167,8 +167,11 @@ class RecallEngine:
         r"[\u4e00-\u9fff\u3000-\u303f]+|[^\u4e00-\u9fff\u3000-\u303f\s]+"
     )
 
-    def __init__(self, config: GovernedMemoryConfig):
+    def __init__(self, config: GovernedMemoryConfig, kb: Any = None):
         self._config = config
+        #: 知识库门面（``_kb.KnowledgeBase``）。可选注入：为 None 时 KB 通道
+        #: 静默关闭，其余三层不受影响。用 Any 避免 _recall ↔ _kb 循环导入。
+        self._kb = kb
         self._l1_cache: Optional[str] = None
         self._l1_cache_time: float = 0
         #: 缓存时所读 L1 文件的最大 mtime（秒，float）。用于廉价感知外部改动。
@@ -706,7 +709,7 @@ class RecallEngine:
         timeout = self._config.recall.parallel_timeout_seconds
 
         pool = ThreadPoolExecutor(
-            max_workers=3,
+            max_workers=4,
             thread_name_prefix="recall",
         )
         try:
@@ -714,6 +717,7 @@ class RecallEngine:
                 pool.submit(self._search_l2, query): "l2",
                 pool.submit(self._search_l3, query): "l3",
                 pool.submit(self._get_l4_result): "l4",
+                pool.submit(self._search_kb, query): "kb",
             }
 
             try:
@@ -755,7 +759,7 @@ class RecallEngine:
     def _sequential_recall(self, query: str) -> List[RecallResult]:
         """Fallback sequential recall when thread pool is unavailable."""
         results: List[RecallResult] = []
-        for fn in (self._search_l2, self._search_l3, self._get_l4_result):
+        for fn in (self._search_l2, self._search_l3, self._get_l4_result, self._search_kb):
             try:
                 r = fn(query) if fn != self._get_l4_result else fn()
                 if isinstance(r, list):
@@ -766,6 +770,59 @@ class RecallEngine:
                 logger.debug("Sequential recall layer failed: %s", e)
         results.sort(key=lambda r: r.score, reverse=True)
         return results
+
+    def _search_kb(self, query: str) -> List[RecallResult]:
+        """知识库提示通道（layer="kb"）。
+
+        只产出**提示**（笔记标题 + 路径），**不注入正文** —— 这是标定后的
+        刻意取舍：vault 语料同质化（26 篇里 16 篇是会议记录），实测相关/无关
+        的融合分分离带只有 +0.039（无关最高 0.4487 / 相关最低 0.4870），
+        任何绝对阈值都脆弱；而"注入全文"一旦误报就要付出几百 token 和
+        上下文污染。改为注入一行提示后，误报成本降到 ~40 token，于是可以
+        用宽松阈值换高覆盖率，把"要不要深读"的决定权交给 agent
+        （``governed_kb_get`` / ``governed_kb_search``）。
+
+        未注入 KB（``kb=None``）或 ``kb.recall_min_score <= 0`` 时静默返回空，
+        保持旧行为不变。
+        """
+        kb = getattr(self, "_kb", None)
+        if kb is None:
+            return []
+        kb_cfg = getattr(self._config, "kb", None)
+        if kb_cfg is None or not bool(getattr(kb_cfg, "recall_hint_enabled", True)):
+            return []
+        min_score = float(getattr(kb_cfg, "recall_min_score", 0.0) or 0.0)
+        if min_score <= 0.0:
+            return []
+        limit = max(1, int(getattr(kb_cfg, "recall_max_notes", 3) or 3))
+        try:
+            hits = kb.search(query, top_k=limit)
+        except Exception as e:  # noqa: BLE001 — 提示通道失败绝不能影响主召回
+            logger.debug("KB recall failed: %s", e)
+            return []
+
+        out: List[RecallResult] = []
+        for h in hits:
+            score = float(h.get("score", 0.0) or 0.0)
+            if score < min_score:
+                continue
+            title = str(h.get("title") or "").strip()
+            path = str(h.get("path") or "").strip()
+            if not title and not path:
+                continue
+            out.append(RecallResult(
+                layer="kb",
+                content=title or Path(path).stem,
+                score=score,
+                source=path,
+                metadata={
+                    "kind": h.get("kind", ""),
+                    "section": h.get("section", ""),
+                    "keyword_score": h.get("keyword_score", 0.0),
+                    "semantic_score": h.get("semantic_score", 0.0),
+                },
+            ))
+        return out
 
     def _get_l4_result(self) -> Optional[RecallResult]:
         """Get L4 persona as a recall result."""
@@ -798,6 +855,26 @@ class RecallEngine:
         if l1_text:
             truncated_l1 = self._truncate_to_tokens(l1_text, l1_budget)
             parts.append(f"[User Rules]\n{truncated_l1}")
+
+        # KB: 独立小预算的**提示**段（不占 L2/L3 预算）。
+        # 只给标题+路径，不注入正文 —— 理由见 RecallEngine._search_kb。
+        # 这一段是「wiki 被真正用起来」的入口：此前 25 篇笔记躺在 vault 里，
+        # 召回链路完全不碰 KB，agent 既不知道它们存在也无从索取。
+        kb_items = [r for r in results if r.layer == "kb"]
+        if kb_items:
+            kb_items.sort(key=lambda r: r.score, reverse=True)
+            kb_limit = 3
+            kb_cfg = getattr(getattr(self, "_config", None), "kb", None)
+            if kb_cfg is not None:
+                kb_limit = max(1, int(getattr(kb_cfg, "recall_max_notes", 3) or 3))
+            lines = []
+            for item in kb_items[:kb_limit]:
+                src = f" ({item.source})" if item.source else ""
+                lines.append(f"- 《{item.content}》{src}")
+            parts.append(
+                "[Knowledge] 知识库中有相关笔记，需要细节时用 governed_kb_get 读取全文：\n"
+                + "\n".join(lines)
+            )
 
         # L2/L3: shared budget, skip low-relevance items, then dedup by content.
         # 两层门槛分开取：L2 用 recall.l2_min_score（未配置回退 MIN_SCORE），

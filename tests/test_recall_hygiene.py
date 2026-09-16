@@ -24,7 +24,7 @@ import time
 import pytest
 
 from plugin.memory_governed._config import GovernedMemoryConfig
-from plugin.memory_governed._kb import KnowledgeBase
+from plugin.memory_governed._kb import KnowledgeBase, _KB_SEM_WEIGHT
 from plugin.memory_governed._recall import (
     L3_RECALL_ROLES,
     MIN_SCORE,
@@ -261,14 +261,18 @@ class TestKbMinScore:
         kb = _kb_with_semantic_scores(tmp_path, [0.9, 0.4, 0.1])
         kb._config.kb.min_score = 0.5
         results = kb.search("q", top_k=10)
-        assert [r["score"] for r in results] == pytest.approx([0.9])
+        # 融合分 = kw*W_kw + sem*W_sem；mock 的笔记不在真实 vault 里，
+        # 命中不了关键词，所以只剩语义分量：sem * W_sem。
+        assert [r["score"] for r in results] == pytest.approx([0.9 * _KB_SEM_WEIGHT])
 
     def test_mid_min_score_keeps_items_at_or_above_threshold(self, tmp_path):
         """``>= min_score``：正好等于阈值的条目保留。"""
         kb = _kb_with_semantic_scores(tmp_path, [0.9, 0.4, 0.1])
-        kb._config.kb.min_score = 0.4
+        kb._config.kb.min_score = 0.4 * _KB_SEM_WEIGHT
         results = kb.search("q", top_k=10)
-        assert [r["score"] for r in results] == pytest.approx([0.9, 0.4])
+        assert [r["score"] for r in results] == pytest.approx(
+            [0.9 * _KB_SEM_WEIGHT, 0.4 * _KB_SEM_WEIGHT]
+        )
 
     def test_min_score_still_respects_top_k(self, tmp_path):
         kb = _kb_with_semantic_scores(tmp_path, [0.9, 0.8, 0.7, 0.6])
