@@ -54,7 +54,9 @@ class SyncConfig:
     l2_write: str = "async"           # "async" or "sync"
     extract_async: bool = True
     write_queue_maxsize: int = 100
-    l2_max_facts_per_turn: int = 50   # write-path cap; independent of recall.l2_max_results
+    l2_max_facts_per_turn: int = 15   # write-path cap; independent of recall.l2_max_results
+    # 2026-09-16: 50 → 15。`_index_l2` 每次收到的是**整段会话历史**，靠去重兜底，
+    # 上限偏大时一次 turn 会灌进几十条（实测 09:58:17 一秒写入 36 条）。
 
 
 @dataclass

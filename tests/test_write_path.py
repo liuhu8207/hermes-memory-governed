@@ -323,7 +323,7 @@ class TestAuditDrillDown:
         """L3Writer.write() -> _index_l2() must attach a resolvable rowid."""
         messages = [
             {"role": "user",
-             "content": "I always prefer dark mode. The project deadline is next Friday."},
+             "content": "I always prefer dark mode because it hurts my eyes. The project deadline is next Friday because the vendor slipped."},
             {"role": "assistant", "content": "Noted, I will remember the deadline."},
         ]
         writer = L3Writer(config)
@@ -368,7 +368,7 @@ class TestAuditDrillDown:
 
     def test_instance_resolver_accepts_messages_fallback(self, config):
         """The WriteQueue method also accepts the original messages list."""
-        messages = [{"role": "user", "content": "We decided to use Postgres for the store."}]
+        messages = [{"role": "user", "content": "We decided to use Postgres for the store because it is more reliable."}]
         writer = L3Writer(config)
         rowid_map = writer.write(messages, "s-fallback")
         writer.shutdown()
@@ -402,7 +402,7 @@ class TestMultimodalContent:
     def test_l3_write_accepts_list_content(self, config):
         writer = L3Writer(config)
         rowid_map = writer.write(
-            [{"role": "user", "content": self._text("我们决定用 PostgreSQL 作为主数据库")}],
+            [{"role": "user", "content": self._text("我们决定用 PostgreSQL 作为主数据库，因为它更稳定")}],
             "s-multimodal",
         )
         conn = sqlite3.connect(config.l3_db_path)
@@ -449,7 +449,7 @@ class TestMultimodalContent:
     def test_extract_atomic_facts_handles_list_content(self, config):
         queue = WriteQueue(config)
         facts = queue._extract_atomic_facts(
-            [{"role": "user", "content": self._text("我们决定用 PostgreSQL 作为主数据库")}]
+            [{"role": "user", "content": self._text("我们决定用 PostgreSQL 作为主数据库，因为它更稳定")}]
         )
         assert facts, "list content produced no facts"
         assert all(isinstance(f["content"], str) for f in facts)
@@ -458,7 +458,7 @@ class TestMultimodalContent:
         writer = L3Writer(config)
         queue = WriteQueue(config)
         messages = [{"role": "user",
-                     "content": self._text("部署方案确定用 Docker Compose")}]
+                     "content": self._text("部署方案确定用 Docker Compose，因为要支持多服务编排")}]
         rowid_map = writer.write(messages, "s-list-l2")
         store = _FakeL2Store()
         queue._l2_store = store
@@ -471,8 +471,8 @@ class TestMultimodalContent:
         """The messages fallback must normalise, not compare against a raw list."""
         queue = WriteQueue(config)
         messages = [{"role": "user",
-                     "content": self._text("We decided to use Postgres for the store.")}]
-        rowid_map = {"We decided to use Postgres for the store.": 5}
+                     "content": self._text("We decided to use Postgres for the store because it is more reliable.")}]
+        rowid_map = {"We decided to use Postgres for the store because it is more reliable.": 5}
         assert queue._resolve_source_rowid(
             "use Postgres for the store", rowid_map, messages
         ) == 5
@@ -483,7 +483,7 @@ class TestMultimodalContent:
 # ---------------------------------------------------------------------------
 
 class TestL2Dedup:
-    FACT = "We decided to use PostgreSQL for the store"
+    FACT = "We decided to use PostgreSQL for the store because it has better tooling"
 
     def test_same_content_is_not_rewritten(self, config):
         queue = WriteQueue(config)
@@ -744,11 +744,14 @@ class TestWritePathConfig:
         queue = WriteQueue(config)
         messages = [
             {"role": "user",
-             "content": f"The project deadline for milestone {i} is next Friday."}
+             "content": f"The project milestone {i} is next Friday because the vendor slipped."}
             for i in range(40)
         ]
-        # A read-path cap of 15 must not truncate the write path.
+        # A read-path cap of 15 must not truncate the write path. Raise the
+        # WRITE cap explicitly: its default is now 15 (2026-09-16), so leaving
+        # it at the default would make this test measure the wrong knob.
         config.recall.l2_max_results = 15
+        config.sync.l2_max_facts_per_turn = 100
         assert len(queue._extract_atomic_facts(messages)) == 40
 
     def test_write_knob_is_independent_and_configurable(self, config):
@@ -756,7 +759,7 @@ class TestWritePathConfig:
         queue = WriteQueue(config)
         messages = [
             {"role": "user",
-             "content": f"The project deadline for milestone {i} is next Friday."}
+             "content": f"The project milestone {i} is next Friday because the vendor slipped."}
             for i in range(40)
         ]
         assert len(queue._extract_atomic_facts(messages)) == 7
@@ -821,8 +824,8 @@ class TestSentenceSplitting:
 
 class TestLooksLikeFact:
     @pytest.mark.parametrize("text", [
-        "我们决定用 PostgreSQL 作为主数据库",
-        "部署方案确定用 Docker Compose",
+        "我们决定用 PostgreSQL 作为主数据库，因为它更稳定",
+        "部署方案确定用 Docker Compose，因为要支持多服务编排",
         "注意：生产环境禁止直接改库",
         "以后都用 pnpm 而不是 npm",
         "结论是先做单体架构，以后再拆服务",
@@ -835,7 +838,7 @@ class TestLooksLikeFact:
     @pytest.mark.parametrize("text", [
         "I always prefer dark mode in every editor",
         "We decided to use Postgres instead of MySQL",
-        "The project deadline is next Friday",
+        "The project deadline is next Friday because the vendor slipped",
         "Remember that the staging server runs on port 8080",
     ])
     def test_english_facts_are_recognised(self, text):
@@ -872,7 +875,7 @@ class TestLooksLikeFact:
         _diag.reset()
         queue = WriteQueue(config)
         queue._extract_atomic_facts([
-            {"role": "user", "content": "我们决定用 PostgreSQL 作为主数据库"},
+            {"role": "user", "content": "我们决定用 PostgreSQL 作为主数据库，因为它更稳定"},
         ])
         assert _diag.metrics().get("fact_turns") == 1
         assert _diag.metrics().get("facts_extracted", 0) >= 1
@@ -883,7 +886,7 @@ class TestLooksLikeFact:
         queue = WriteQueue(config)
         facts = queue._extract_atomic_facts([
             {"role": "user", "content": "The weather is nice today in the park"},
-            {"role": "user", "content": "We decided to use PostgreSQL for the store"},
+            {"role": "user", "content": "We decided to use PostgreSQL for the store because it has better tooling"},
         ])
         assert len(facts) == 1
         assert "decided" in facts[0]["content"]
@@ -1318,7 +1321,7 @@ class TestGracefulDegradation:
         assert seen["cfg"] is config
 
         queue._index_l2(
-            [{"role": "user", "content": "We decided to use PostgreSQL for the store"}], {}
+            [{"role": "user", "content": "We decided to use PostgreSQL for the store because it has better tooling"}], {}
         )
         assert store.rows and store.rows[0]["vector"] == [0.5] * 4
 
@@ -1343,7 +1346,7 @@ class TestGracefulDegradation:
         writer = L3Writer(config)
         queue = WriteQueue(config)
         messages = [
-            {"role": "user", "content": "我们决定用 PostgreSQL 作为主数据库"},
+            {"role": "user", "content": "我们决定用 PostgreSQL 作为主数据库，因为它更稳定"},
             {"role": "assistant", "content": "好的，我会记录这个决定。"},
         ]
         rowid_map = writer.write(messages, "s-roundtrip")

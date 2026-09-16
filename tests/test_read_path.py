@@ -324,7 +324,7 @@ class TestPrefetchSelfHeal:
     def test_miss_triggers_background_recall(self, provider, config):
         """未命中时不应静默降级：应立即返回 L1，同时在后台补齐完整召回。"""
         _mk_l3(config)
-        _insert_l3(config, "The deployment deadline is next Friday", session="rt")
+        _insert_l3(config, "The deployment deadline is next Friday because the vendor slipped", session="rt")
 
         out = provider.prefetch("deployment deadline")
         assert out, "prefetch 未命中时至少要返回 L1 兜底"

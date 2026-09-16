@@ -315,9 +315,13 @@ class TestConnectionLeaks:
 class TestFactExtractionTruncation:
     def test_all_facts_are_extracted(self, config):
         """_extract_atomic_facts caps output at recall.l2_max_results (a read knob)."""
+        # Raise the WRITE-path cap out of the way so this test keeps measuring
+        # what it is about: the read knob must not truncate the write path.
+        # (The write cap is independently covered by test_write_path.py.)
+        config.sync.l2_max_facts_per_turn = 100
         q = WriteQueue(config)
         msgs = [
-            {"role": "user", "content": f"The project deadline for milestone {i} is next Friday."}
+            {"role": "user", "content": f"The project milestone {i} is next Friday because the vendor slipped."}
             for i in range(40)
         ]
         facts = q._extract_atomic_facts(msgs)
@@ -341,7 +345,7 @@ class TestSourceRowidPropagation:
         """
         _mk_l3(config)
         w = L3Writer(config)
-        content = "I always prefer dark mode. The project deadline is next Friday."
+        content = "I always prefer dark mode because it hurts my eyes. The project deadline is next Friday because the vendor slipped."
         rowid_map = w.write([{"role": "user", "content": content}], "s1")
 
         q = WriteQueue(config)
@@ -616,7 +620,7 @@ class TestGracefulDegradation:
             "", "",
             session_id="rt",
             messages=[
-                {"role": "user", "content": "The deployment deadline is next Friday"},
+                {"role": "user", "content": "The deployment deadline is next Friday because the vendor slipped"},
                 {"role": "assistant", "content": "Understood, I will note the deadline"},
             ],
         )

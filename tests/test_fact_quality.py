@@ -25,6 +25,8 @@ import pytest
 from plugin.memory_governed._sync import (
     WriteQueue,
     _ASSISTANT_MIN_WEIGHTED_LEN,
+    _MIN_SIGNAL_ASSISTANT,
+    _MIN_SIGNAL_USER,
     _ROLE_WEIGHTS,
     _TITLE_FRAGMENT_MAX_WEIGHT,
     _fact_signal_score,
@@ -269,10 +271,10 @@ class TestSignalScore:
                 > _fact_signal_score(sentence, "assistant"))
 
     def test_role_weights_are_applied(self):
-        base = _fact_signal_score("部署方案确定用 Docker Compose")
-        assert _fact_signal_score("部署方案确定用 Docker Compose", "user") == (
+        base = _fact_signal_score("部署方案确定用 Docker Compose，因为要支持多服务编排")
+        assert _fact_signal_score("部署方案确定用 Docker Compose，因为要支持多服务编排", "user") == (
             base + _ROLE_WEIGHTS["user"])
-        assert _fact_signal_score("部署方案确定用 Docker Compose", "assistant") == (
+        assert _fact_signal_score("部署方案确定用 Docker Compose，因为要支持多服务编排", "assistant") == (
             base + _ROLE_WEIGHTS["assistant"])
 
     def test_default_role_is_neutral(self):
@@ -325,7 +327,7 @@ class TestRoleWeightedExtraction:
         """'_signals' is sort metadata and must be stripped before returning."""
         queue = WriteQueue(config)
         facts = queue._extract_atomic_facts([
-            {"role": "user", "content": "我们决定用 PostgreSQL 作为主数据库"},
+            {"role": "user", "content": "我们决定用 PostgreSQL 作为主数据库，因为它更稳定"},
         ])
         assert facts
         assert all("_signals" not in fact for fact in facts)
@@ -358,14 +360,14 @@ class TestRoleWeightedExtraction:
 
 class TestPreexistingBehaviour:
     @pytest.mark.parametrize("text", [
-        "我们决定用 PostgreSQL 作为主数据库",
-        "部署方案确定用 Docker Compose",
+        "我们决定用 PostgreSQL 作为主数据库，因为它更稳定",
+        "部署方案确定用 Docker Compose，因为要支持多服务编排",
         "以后都用 pnpm 而不是 npm",
         "记住我的偏好是深色主题",
         "我们用 Postgres",
         "这个项目的规则是所有接口必须带版本号",
         "I always prefer dark mode in every editor",
-        "The project deadline is next Friday",
+        "The project deadline is next Friday because the vendor slipped",
         "We decided to use Postgres instead of MySQL",
     ])
     def test_known_facts_still_pass(self, text):
@@ -394,7 +396,7 @@ class TestPreexistingBehaviour:
         queue = WriteQueue(config)
         facts = queue._extract_atomic_facts([
             {"role": "user", "content": "The weather is nice today in the park"},
-            {"role": "user", "content": "We decided to use PostgreSQL for the store"},
+            {"role": "user", "content": "We decided to use PostgreSQL for the store because it has better tooling"},
         ])
         assert len(facts) == 1
         assert "decided" in facts[0]["content"]
@@ -416,3 +418,211 @@ class TestThresholdSanity:
 
     def test_assistant_length_floor_exists(self):
         assert _ASSISTANT_MIN_WEIGHTED_LEN > 0
+
+
+# ---------------------------------------------------------------------------
+# P0 (2026-09-16 evening) — the signal score must be an ADMISSION GATE
+# ---------------------------------------------------------------------------
+#
+# Before this, `_fact_signal_score` only fed `facts.sort()`. Nothing compared
+# it against a threshold, so assistant process narration (role baseline -1)
+# entered L2 anyway. Measured over one day of real traffic: 79 of 99 rows
+# scored <= 0 under the assistant rule. L2 grew 12 -> 99 in a single day and
+# the noise pushed the unrelated-query recall floor up until the 0.76
+# threshold stopped working.
+#
+# The second half of the fix: the gate counts ONLY strong signals. The generic
+# word list (`方案` / `以后` / `使用`) is far too easy to hit —
+# "还没想好，我网上找找类似的方案" scored 3 on the total-score version and
+# walked straight through.
+
+class TestAdmissionFloor:
+    """`_extract_atomic_facts` must drop sentences below the strong-signal floor."""
+
+    @pytest.mark.parametrize("text", [
+        # assistant run logs — the exact shape that flooded L2
+        "网关已重启，飞书在线",
+        "备份在 config.yaml.bak.before-deepseek-curation",
+        "想让 deepseek-flash 直接当默认主模型，说一声我一条命令切",
+        "- 配置 fallback：deepseek-flash（备份 config.yaml.bak.xxx）",
+    ])
+    def test_assistant_run_logs_are_rejected(self, config, text):
+        queue = WriteQueue(config)
+        assert queue._extract_atomic_facts([{"role": "assistant", "content": text}]) == []
+
+    @pytest.mark.parametrize("text", [
+        # bare chatter that used to clear the total-score bar
+        "还没想好，我网上找找类似的方案，整理下思路先",
+        "都配吧，免得以后每次都弹窗",
+        "我怎么添加SSH信息比较方便呢",
+        "我已经移了两个，把剩下两个移进去，其它不要动",
+    ])
+    def test_user_chatter_is_rejected(self, config, text):
+        queue = WriteQueue(config)
+        assert queue._extract_atomic_facts([{"role": "user", "content": text}]) == []
+
+    @pytest.mark.parametrize("role, text", [
+        ("assistant", "`governed_health` 工具报错是因为引用了未定义的变量 `total`"),
+        ("assistant", "SecretStore 使用 `ROCKET_TLS` 而不是 `SSL_CERT_FILE`"),
+        ("assistant", "1. **DHCP DNS 必须指向 策略服务B** — 否则设备无法走代理"),
+        ("assistant", "- ⚠️ **必须同步 `rsa.key`**，否则两边加密的数据不兼容"),
+        ("user", "我在NAS有装secretstore，但本地布署好像不能同步给其它地方装的secretstore"),
+        ("user", "我家里用的是虚拟机软路由，我打算换回硬件路由器，还要装tailscale进行组网"),
+    ])
+    def test_real_knowledge_still_passes(self, config, role, text):
+        queue = WriteQueue(config)
+        assert len(queue._extract_atomic_facts([{"role": role, "content": text}])) == 1, text
+
+    def test_strong_only_excludes_the_generic_word_list(self):
+        """`方案` 是弱信号：它能影响排序，但绝不能单独放行一条记录。"""
+        chatter = "还没想好，我网上找找类似的方案，整理下思路先"
+        assert _fact_signal_score(chatter, "user") == _MIN_SIGNAL_USER + 1
+        assert _fact_signal_score(chatter, "user", strong_only=True) == _MIN_SIGNAL_USER
+
+    def test_strong_only_keeps_real_signals(self):
+        text = "我在NAS有装secretstore，但本地布署不能同步"
+        assert _fact_signal_score(text, "user", strong_only=True) > _MIN_SIGNAL_USER
+
+    def test_floors_are_asymmetric_by_role(self):
+        """Assistant must clear a lower bar than user, because its baseline is negative."""
+        assert _MIN_SIGNAL_ASSISTANT < _MIN_SIGNAL_USER
+
+
+class TestContentTypeRejects:
+    """Multimodal placeholders / credentials / bare paths can never be facts."""
+
+    @pytest.mark.parametrize("text", [
+        "[Image]",
+        "[screenshot]",
+        "[Image attached at: C://Users//example//AppData//Local//hermes//cache//images//img_c68.jpg",
+        "[图片] 这是报错截图",
+    ])
+    def test_media_placeholders_are_rejected(self, text):
+        assert not WriteQueue._looks_like_fact(text, "assistant")
+        assert not WriteQueue._looks_like_fact(text, "user")
+
+    @pytest.mark.parametrize("text", [
+        "Liu@19820496",                       # the real row found in L2
+        "password: hunter2xyz",
+        "密码：mysecretvalue",
+        "token: sk-abcdefghijklmnopqrstuvwx",
+        "-----BEGIN RSA PRIVATE KEY",
+    ])
+    def test_credentials_are_rejected(self, text):
+        assert not WriteQueue._looks_like_fact(text, "user"), text
+
+    @pytest.mark.parametrize("text", [
+        "C://Users//example//AppData//Local//hermes//plugins//model-providers//deepseek//__init__.py",
+        "\\\\nas\\share\\secretstore\\docker-compose.yml",
+    ])
+    def test_bare_absolute_paths_are_rejected(self, text):
+        assert not WriteQueue._looks_like_fact(text, "assistant"), text
+
+    def test_normal_text_mentioning_a_path_is_kept(self):
+        """路径出现在句子里不是拒绝理由 —— 只有"整行就是路径"才算噪声。"""
+        text = "备份脚本在 scripts/secretstore_read.py，因为要读取 NAS 上的凭据"
+        assert WriteQueue._looks_like_fact(text, "user")
+
+
+# ---------------------------------------------------------------------------
+# P0 (2026-09-16 evening) — the signal score must be an ADMISSION GATE
+# ---------------------------------------------------------------------------
+#
+# Before this, `_fact_signal_score` only fed `facts.sort()`. Nothing compared
+# it against a threshold, so assistant process narration (role baseline -1)
+# entered L2 anyway. Measured over one day of real traffic: 79 of 99 rows
+# scored <= 0 under the assistant rule. L2 grew 12 -> 99 in a single day and
+# the noise pushed the unrelated-query recall floor up until the 0.76
+# threshold stopped working.
+#
+# The second half of the fix: the gate counts ONLY strong signals. The generic
+# word list (`方案` / `以后` / `使用`) is far too easy to hit —
+# "还没想好，我网上找找类似的方案" scored 3 on the total-score version and
+# walked straight through.
+
+class TestAdmissionFloor:
+    """`_extract_atomic_facts` must drop sentences below the strong-signal floor."""
+
+    @pytest.mark.parametrize("text", [
+        # assistant run logs — the exact shape that flooded L2
+        "网关已重启，飞书在线",
+        "备份在 config.yaml.bak.before-deepseek-curation",
+        "想让 deepseek-flash 直接当默认主模型，说一声我一条命令切",
+        "- 配置 fallback：deepseek-flash（备份 config.yaml.bak.xxx）",
+    ])
+    def test_assistant_run_logs_are_rejected(self, config, text):
+        queue = WriteQueue(config)
+        assert queue._extract_atomic_facts([{"role": "assistant", "content": text}]) == []
+
+    @pytest.mark.parametrize("text", [
+        # bare chatter that used to clear the total-score bar
+        "还没想好，我网上找找类似的方案，整理下思路先",
+        "都配吧，免得以后每次都弹窗",
+        "我怎么添加SSH信息比较方便呢",
+        "我已经移了两个，把剩下两个移进去，其它不要动",
+    ])
+    def test_user_chatter_is_rejected(self, config, text):
+        queue = WriteQueue(config)
+        assert queue._extract_atomic_facts([{"role": "user", "content": text}]) == []
+
+    @pytest.mark.parametrize("role, text", [
+        ("assistant", "`governed_health` 工具报错是因为引用了未定义的变量 `total`"),
+        ("assistant", "SecretStore 使用 `ROCKET_TLS` 而不是 `SSL_CERT_FILE`"),
+        ("assistant", "1. **DHCP DNS 必须指向 策略服务B** — 否则设备无法走代理"),
+        ("assistant", "- ⚠️ **必须同步 `rsa.key`**，否则两边加密的数据不兼容"),
+        ("user", "我在NAS有装secretstore，但本地布署好像不能同步给其它地方装的secretstore"),
+        ("user", "我家里用的是虚拟机软路由，我打算换回硬件路由器，还要装tailscale进行组网"),
+    ])
+    def test_real_knowledge_still_passes(self, config, role, text):
+        queue = WriteQueue(config)
+        assert len(queue._extract_atomic_facts([{"role": role, "content": text}])) == 1, text
+
+    def test_strong_only_excludes_the_generic_word_list(self):
+        """`方案` 是弱信号：它能影响排序，但绝不能单独放行一条记录。"""
+        chatter = "还没想好，我网上找找类似的方案，整理下思路先"
+        assert _fact_signal_score(chatter, "user") == _MIN_SIGNAL_USER + 1
+        assert _fact_signal_score(chatter, "user", strong_only=True) == _MIN_SIGNAL_USER
+
+    def test_strong_only_keeps_real_signals(self):
+        text = "我在NAS有装secretstore，但本地布署不能同步"
+        assert _fact_signal_score(text, "user", strong_only=True) > _MIN_SIGNAL_USER
+
+    def test_floors_are_asymmetric_by_role(self):
+        """Assistant must clear a lower bar than user, because its baseline is negative."""
+        assert _MIN_SIGNAL_ASSISTANT < _MIN_SIGNAL_USER
+
+
+class TestContentTypeRejects:
+    """Multimodal placeholders / credentials / bare paths can never be facts."""
+
+    @pytest.mark.parametrize("text", [
+        "[Image]",
+        "[screenshot]",
+        "[Image attached at: C:\\Users\\example\\AppData\\Local\\hermes\\cache\\images\\img_c68.jpg",
+        "[图片] 这是报错截图",
+    ])
+    def test_media_placeholders_are_rejected(self, text):
+        assert not WriteQueue._looks_like_fact(text, "assistant")
+        assert not WriteQueue._looks_like_fact(text, "user")
+
+    @pytest.mark.parametrize("text", [
+        "Liu@19820496",                       # the real row found in L2
+        "password: hunter2xyz",
+        "密码：mysecretvalue",
+        "token: sk-abcdefghijklmnopqrstuvwx",
+        "-----BEGIN RSA PRIVATE KEY",
+    ])
+    def test_credentials_are_rejected(self, text):
+        assert not WriteQueue._looks_like_fact(text, "user"), text
+
+    @pytest.mark.parametrize("text", [
+        "C:\\Users\\example\\AppData\\Local\\hermes\\plugins\\model-providers\\deepseek\\__init__.py",
+        "\\\\nas\\share\\secretstore\\docker-compose.yml",
+    ])
+    def test_bare_absolute_paths_are_rejected(self, text):
+        assert not WriteQueue._looks_like_fact(text, "assistant"), text
+
+    def test_normal_text_mentioning_a_path_is_kept(self):
+        """路径出现在句子里不是拒绝理由 —— 只有"整行就是路径"才算噪声。"""
+        text = "备份脚本在 scripts/secretstore_read.py，因为要读取 NAS 上的凭据"
+        assert WriteQueue._looks_like_fact(text, "user")

@@ -189,10 +189,54 @@ _FACT_SIGNALS_USER_ZH = (
 # hard user constraint. (Never blocks extraction on its own — ranking only.)
 _FACT_SIGNALS_SOFT = ("可能", "建议", "试试", "或许", "大概", "一般来说")
 
+# Technical conclusions — causal / diagnostic phrasing.
+#
+# Assistant turns split into two kinds that otherwise look identical to the
+# scorer: "I just restarted the gateway" (a run log) and "the tool errored
+# because `total` was undefined" (knowledge). The second kind is what makes
+# an assistant turn worth remembering, so it gets a real weight.
+_FACT_SIGNALS_TECH = (
+    "因为", "是因为", "原因是", "根因", "根本原因", "解决办法", "导致", "报错是因为",
+    "而不是", "应该用", "正确做法",
+    "instead of", "because", "root cause", "workaround",
+)
+_TECH_SIGNAL_WEIGHT = 2
+
+# Inline code identifiers (`` `like_this` ``) mark a sentence as being about
+# concrete named entities rather than chatter. Weighted BELOW a real signal on
+# purpose: a decorated run log ("备份在 `config.yaml.bak.x`") must still fail
+# the floor.
+_CODE_IDENT_RE = re.compile(r"`[^`\n]{2,60}`")
+_CODE_IDENT_WEIGHT = 1
+
 # Durable knowledge comes overwhelmingly from USER turns: preferences,
 # constraints and requirements. Assistant turns mostly narrate execution
 # ("让我检查一下…"), which is a run log rather than knowledge.
 _ROLE_WEIGHTS: Dict[str, int] = {"user": 2, "assistant": -1}
+
+# Admission floors for the STRONG-signal score (see `_fact_signal_score`).
+# The score is a GATE, not merely a ranking hint.
+#
+# Why strong-only (P0, 2026-09-16): the first version of the role weighting
+# only fed `facts.sort()`, so assistant narration (baseline -1) was admitted
+# anyway — 79 of the day's 99 rows scored <= 0 under the assistant rule, e.g.
+# "网关已重启，飞书在线", "备份在 config.yaml.bak.xxx".
+#
+# The second problem showed up immediately after wiring a naive total-score
+# floor: the generic word list (`_FACT_SIGNALS_ZH`: 方案 / 以后 / 使用 / 注意…)
+# is so easy to hit that bare chatter cleared the bar —
+# "还没想好，我网上找找类似的方案" scored 3 (user baseline 2 + 方案 1).
+# So the gate counts ONLY strong signals:
+#   * user constraints   (_FACT_SIGNALS_USER_ZH: 我需要 / 必须 / 不能 / 否则…)
+#   * technical conclusions (_FACT_SIGNALS_TECH: 是因为 / 而不是 / 根因…)
+#   * inline code identifiers (`like_this`)
+# The generic word list still contributes to RANKING, just not to admission.
+#
+# Floors are asymmetric because the role baselines are:
+#   * user      baseline +2 -> must clear 2, i.e. carry a real constraint.
+#   * assistant baseline -1 -> must clear 0, i.e. carry a real signal.
+_MIN_SIGNAL_USER = 2
+_MIN_SIGNAL_ASSISTANT = 0
 
 # Pure chatter: never a durable fact.
 _GREETINGS = {
@@ -291,6 +335,44 @@ _MD_BRACKET_LABEL_RE = re.compile(r"^【[^】]{0,24}】")
 _MD_TREE_RE = re.compile(r"^[├└│─\s]*[├└│]")
 _DIR_COUNT_RE = re.compile(r"^[A-Za-z0-9_./\-]+\s+[-–—]\s+\S.{0,40}$")
 
+# --- content-type hard rejects (2026-09-16 evening) ------------------------
+# These three classes were absent from the first version of the gate and cost
+# a day of L2 pollution (12 → 99 rows, ~2/3 noise).
+
+# Multimodal placeholders: the text stand-in for an image/attachment, never
+# knowledge. The short form `[Image]` was already caught by the length rule,
+# but the LONG variant passes every other check because it looks like an
+# ordinary sentence:
+#     "[Image attached at: C:\Users\...\cache\images\img_c68df9eac1b1.jpg"
+# 10 such rows observed in one day of traffic.
+_MEDIA_PLACEHOLDER_RE = re.compile(
+    r"^\[(?:image|img|screenshot|图片|截图|附件|file|photo|video|audio|voice)"
+    r"[\s\]#._-]",
+    re.IGNORECASE,
+)
+
+# Credentials (passwords / tokens / private keys). Hard reject, because L2 is
+# a VECTOR store: a credential row gets recalled and injected straight into the
+# model context, which is a far wider blast radius than the L3 archive (which
+# is expected to hold raw conversation). Observed: one plaintext password
+# (`Liu@****96`) extracted from a user message.
+_CREDENTIAL_RE = re.compile(
+    # "LETTERS<sep>digits" — the shape of most hand-made passwords
+    r"(?<![A-Za-z0-9])[A-Za-z]{2,12}[@#$!]\d{6,}"
+    # explicit key/value credential rows
+    r"|(?:pass(?:word|wd)?|pwd|密码|口令|token|secret|密钥)\s*[:=：]\s*\S{3,}"
+    # API tokens
+    r"|\b(?:sk|ak|ghp|xoxb|glpat)-[A-Za-z0-9_\-]{16,}"
+    # PEM private key blocks
+    r"|BEGIN\s+(?:RSA|OPENSSH|EC|DSA|PGP)?\s*PRIVATE\s+KEY",
+    re.IGNORECASE,
+)
+
+# A line that is nothing but a local absolute path (Windows drive / UNC). This
+# is machine state, not durable knowledge, and it goes stale the moment the
+# file moves ("C:\Users\...\plugins\model-providers\deepseek\__init__.py").
+_ABS_PATH_RE = re.compile(r"^(?:[A-Za-z]:[\\/]|\\\\)\S+$")
+
 # Metadata "key: value" rows out of status reports. Matched against the
 # UNDECORATED copy so that "- **Provider**: `governed`", "**Provider**: …"
 # and "Provider: …" all hit the same rule. Deliberately a closed list: a
@@ -371,11 +453,20 @@ def _undecorate(text: str) -> str:
     return body
 
 
-def _fact_signal_score(sentence: str, role: str = "") -> int:
+def _fact_signal_score(sentence: str, role: str = "",
+                       *, strong_only: bool = False) -> int:
     """Score how much durable value a sentence carries.
 
-    Higher is better: the score decides which facts survive when the per-turn
-    cap in :meth:`WriteQueue._extract_atomic_facts` bites.
+    Higher is better. Two consumers:
+
+    * ``strong_only=False`` (default) — a RANKING key, used to decide which
+      facts survive when the per-turn cap in
+      :meth:`WriteQueue._extract_atomic_facts` bites.
+    * ``strong_only=True`` — the ADMISSION score, compared against
+      :data:`_MIN_SIGNAL_USER` / :data:`_MIN_SIGNAL_ASSISTANT`. Only the
+      strong pools count (user constraints, technical conclusions, inline code
+      identifiers); the generic word list is excluded because it is far too
+      easy to hit to serve as a gate.
 
     Args:
         sentence: Candidate fact text.
@@ -384,24 +475,32 @@ def _fact_signal_score(sentence: str, role: str = "") -> int:
             exists to remember, so they are weighted UP; assistant turns are
             mostly narration about how the request was fulfilled, so they are
             weighted DOWN. Unknown/empty roles are neutral.
+        strong_only: Count only strong signals (see above).
 
     Returns:
         An integer that may be negative.
     """
     lowered = sentence.lower()
     score = 0
-    for signal in _FACT_SIGNALS_EN:
-        if signal in lowered:
-            score += 1
-    for signal in _FACT_SIGNALS_ZH:
-        if signal in sentence:
-            score += 1
+    if not strong_only:
+        for signal in _FACT_SIGNALS_EN:
+            if signal in lowered:
+                score += 1
+        for signal in _FACT_SIGNALS_ZH:
+            if signal in sentence:
+                score += 1
+        for signal in _FACT_SIGNALS_SOFT:
+            if signal in sentence:
+                score -= _SOFT_SIGNAL_WEIGHT
     for signal in _FACT_SIGNALS_USER_ZH:
         if signal in sentence:
             score += _USER_SIGNAL_WEIGHT
-    for signal in _FACT_SIGNALS_SOFT:
-        if signal in sentence:
-            score -= _SOFT_SIGNAL_WEIGHT
+    for signal in _FACT_SIGNALS_TECH:
+        if signal in sentence or signal in lowered:
+            score += _TECH_SIGNAL_WEIGHT
+            break
+    if _CODE_IDENT_RE.search(sentence):
+        score += _CODE_IDENT_WEIGHT
     score += _ROLE_WEIGHTS.get(role, 0)
     return score
 
@@ -1076,14 +1175,24 @@ class WriteQueue:
             for sentence in self._split_sentences(content):
                 # Pass the role so the gate can be stricter on assistant
                 # narration, and so ranking prefers user-stated constraints.
-                if self._looks_like_fact(sentence, role):
-                    facts.append({
-                        "content": sentence.strip(),
-                        "category": self._categorize(sentence),
-                        "source": "auto-extract",
-                        "timestamp": datetime.now().isoformat(),
-                        "_signals": _fact_signal_score(sentence, role),
-                    })
+                if not self._looks_like_fact(sentence, role):
+                    continue
+                # The score is a GATE before it is a ranking key: a sentence
+                # that carries no durable signal must not enter L2 at all.
+                # Without this check assistant run logs flooded the store
+                # (see _MIN_SIGNAL_ASSISTANT for the measurements).
+                admission = _fact_signal_score(sentence, role, strong_only=True)
+                floor = (_MIN_SIGNAL_ASSISTANT if role == "assistant"
+                         else _MIN_SIGNAL_USER)
+                if admission <= floor:
+                    continue
+                facts.append({
+                    "content": sentence.strip(),
+                    "category": self._categorize(sentence),
+                    "source": "auto-extract",
+                    "timestamp": datetime.now().isoformat(),
+                    "_signals": _fact_signal_score(sentence, role),
+                })
 
         # Ranking: keep the strongest facts when the per-turn cap bites.
         # (Stable sort — equal-scored facts keep their original order.)
@@ -1156,6 +1265,16 @@ class WriteQueue:
             return False
 
         lowered = text.lower().rstrip(".!。！；;")
+
+        # --- 1.5 content-type hard rejects ------------------------------
+        # Checked before everything else: none of these can ever become a
+        # durable fact, and each one is cheap to test.
+        if _MEDIA_PLACEHOLDER_RE.match(text):
+            return False
+        if _CREDENTIAL_RE.search(text):
+            return False
+        if _ABS_PATH_RE.match(text):
+            return False
 
         # Pure greetings / acknowledgements
         if lowered in _GREETINGS:
