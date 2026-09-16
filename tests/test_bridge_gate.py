@@ -21,7 +21,9 @@ import pytest
 from plugin.memory_governed import GovernedMemoryProvider
 from plugin.memory_governed._bridge import screen_bridge_content
 from plugin.memory_governed._sync import (
+    has_template_scaffold,
     is_ephemeral_content,
+    is_memory_aggregate,
     is_template_placeholder,
     strip_template_fragments,
 )
@@ -146,7 +148,9 @@ class TestTemplate:
 class TestScreenBridgeContent:
     @pytest.mark.parametrize("text, reason", [
         ("我儿子的准考证，考试前一天记得提醒我", "ephemeral"),
-        (_USER_TEMPLATE, "template"),
+        # 夹具含 `_Generated:` 等强痕迹 → 走更严的 template_scaffold
+        # （原因见 has_template_scaffold 的 docstring）
+        (_USER_TEMPLATE, "template_scaffold"),
         ("[Image]\n为什么你每次要弹这个", "media"),
         ("[Image attached at: C:\\Users\\example\\cache\\images\\img_c68.jpg", "media"),
         ("C:\\Users\\example\\AppData\\Local\\hermes\\plugins\\deepseek\\__init__.py",
@@ -155,6 +159,13 @@ class TestScreenBridgeContent:
     ])
     def test_rejections_carry_a_reason(self, text, reason):
         assert screen_bridge_content(text) == reason
+
+    def test_weak_only_template_is_still_rejected(self):
+        """只剩弱痕迹（H1 标题）时没有强痕迹，走 ``template`` 而非
+        ``template_scaffold`` —— 两级判据各司其职。"""
+        weak_only = "# User Profile\n\n## 身份\n<!-- x -->\n\n## 偏好\n"
+        assert not has_template_scaffold(weak_only)
+        assert screen_bridge_content(weak_only) == "template"
 
     def test_credentials_are_left_to_the_quarantine_channel(self):
         """凭据不归本闸门管 —— 它走 quarantine（脱敏 + 计数 + 审计）。
@@ -172,6 +183,101 @@ class TestScreenBridgeContent:
     ])
     def test_real_knowledge_passes(self, text):
         assert screen_bridge_content(text) is None, text
+
+
+# ---------------------------------------------------------------------------
+# 3b) 脚手架残留 / 记忆系统自身聚合快照（2026-09-16 追加）
+# ---------------------------------------------------------------------------
+
+#: 生产环境候选池里的真实一行（2026-09-16 抓取，id 前缀 hermes-ddfa3ccc）。
+#: 它是 persona.md 被整篇导出的产物：USER.md + Memory Rules 两套模板骨架，
+#: 后面跟着 24 条 L2 事实转储、Knowledge Areas 计数与 Stats 统计。
+#: 一旦 promote，这些陈旧诊断（"L1手写规则层空的"、"刚才在修复 … bug 时
+#: 网关重启了"）会变成永久 L1 规则。
+_PERSONA_DUMP_CANDIDATE = """# User Profile
+_Generated: 2026-09-16T00:54:43.681897_
+
+## User
+# User Profile
+
+> 手写用户信息。直接编辑此文件。
+
+## 身份
+<!-- 你的名字、角色、时区等 -->
+
+## Rules & Preferences
+# Memory Rules
+
+> 手写规则层。直接编辑此文件。
+
+## 项目规则
+<!-- 在此添加项目相关的规则 -->
+
+测试：governed memory system 与原 memory 系统对接正常。
+
+SecretStore 已配置为 Hermes 凭证库：
+- 服务器: https://192.0.2.62:8787 (本地IP HTTPS)
+
+## Knowledge Areas
+- other: 24 facts
+- life: 3 facts
+
+## Known Facts
+- ⚠ 问题: L1作为最高信任层，目前没有实际的手写规则
+- 刚才在修复 `governed_health` 的 bug 时网关重启了
+
+## Stats
+- Conversations archived: 261
+- Messages archived (all roles): 657
+"""
+
+
+class TestScaffoldAndAggregate:
+    def test_persona_dump_is_rejected(self):
+        """整篇 persona 转储必须被拦下 —— 这是本轮修复的那条真实脏数据。"""
+        assert screen_bridge_content(_PERSONA_DUMP_CANDIDATE) in (
+            "template_scaffold", "aggregate",
+        )
+
+    def test_scaffold_is_detected_even_beside_real_content(self):
+        """关键回归：夹带真实内容**不能**成为放行理由。
+
+        旧判据（is_template_placeholder）只看「剥掉骨架后还剩不剩东西」，
+        所以这条会被放行 —— 24 条转储就跟着进来了。
+        """
+        assert not is_template_placeholder(_PERSONA_WITH_REAL_CONTENT)
+        assert has_template_scaffold(_PERSONA_WITH_REAL_CONTENT)
+        assert screen_bridge_content(_PERSONA_WITH_REAL_CONTENT) == "template_scaffold"
+
+    @pytest.mark.parametrize("text", [
+        "## Stats\n- Conversations archived: 261\n- Messages archived: 657",
+        "## Knowledge Areas\n- other: 24 facts",
+        "## Known Facts\n- SecretStore 用 ROCKET_TLS\n",
+    ])
+    def test_memory_aggregates_are_detected(self, text):
+        assert is_memory_aggregate(text), text
+
+    @pytest.mark.parametrize("text", [
+        "SecretStore 使用 `ROCKET_TLS` 而不是 `SSL_CERT_FILE`",
+        "我在NAS有装secretstore，但本地布署不能同步给其它地方装的secretstore",
+        # 真实知识笔记可以有标题 —— 不能因为像文档就判成聚合
+        "## 代理方案对比\n- 香港节点组需要支持手动指定，不可用时才回退自动",
+    ])
+    def test_real_content_is_not_an_aggregate(self, text):
+        assert not is_memory_aggregate(text), text
+
+    def test_persona_is_not_a_bridge_source(self):
+        """persona.md 是派生聚合，不该再作为候选来源（整篇导出＝闭环污染）。"""
+        import importlib.util
+        from pathlib import Path
+
+        src = (Path(__file__).resolve().parent.parent
+               / "scripts" / "scope_recall_bridge.py").read_text(encoding="utf-8")
+        # collect_candidates 里不得再出现 persona 的 source_record 调用
+        body = src.split("def collect_candidates", 1)[1]
+        assert 'source_record(persona_path' not in body
+        # 守卫必须存在，避免将来被静默加回
+        assert 'if source_kind == "persona":' in src
 
 
 # ---------------------------------------------------------------------------

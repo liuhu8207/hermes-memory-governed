@@ -444,21 +444,36 @@ def is_ephemeral_content(text: str) -> bool:
 # Template skeletons — Bridge-only gate
 # ---------------------------------------------------------------------------
 # The vault/memory files ship with commented-out scaffolding. `source_record`
-# in scripts/scope_recall_bridge.py treats a whole FILE as one candidate, so
-# an untouched USER.md becomes a candidate whose only content is the skeleton.
-# Promoting it copies the scaffold into L1, and the next persona build reads
-# L1 back into persona.md — a closed loop that keeps re-injecting the
-# scaffold. Strip first, then judge on what is left.
+# in scripts/scope_recall_bridge.py treats a whole FILE as one candidate, so a
+# file that was never edited becomes a candidate whose only content is the
+# skeleton. Promoting it copies the scaffold into L1, and the next persona
+# build reads L1 back into persona.md — a closed loop that keeps re-injecting
+# the scaffold. Strip first, then judge on what is left.
+#
+# Two consumers, deliberately different in strictness:
+#   * strip_template_fragments() — used by PRODUCERS, before a candidate exists;
+#   * the predicates below — used by the GATE, as the last line before L1.
+# A producer that forgets to strip is exactly what the gate must catch, so the
+# gate cannot treat "there is real content after the scaffold" as a pass.
 _HTML_COMMENT_RE = re.compile(r"<!--.*?-->", re.DOTALL)
 
-_TEMPLATE_MARKERS = (
+#: 强痕迹：**只有脚手架才会出现**，正常用户陈述/知识笔记里不可能有。
+#: 命中任意一条即判定「脚手架残留」—— 语句可以引用"user profile"这个词，
+#: 但不会说出"直接编辑此文件"。
+_TEMPLATE_MARKERS_STRONG = (
     "直接编辑此文件",
     "在此添加",
     "手写用户信息",
     "手写规则层",
-    "手写规则",
     "_generated:",
     "your name here",
+)
+
+#: 弱痕迹：模板的 H1/章节标题。它们**同时可能出现在真实内容里**
+#: （笔记标题、正文引用），所以只用来判「整条是否只剩骨架」，
+#: 不参与「脚手架残留」的硬拦。
+_TEMPLATE_MARKERS_WEAK = (
+    "手写规则",
     # 模板的 H1 标题本身也算痕迹：USER.md 的 "# User Profile" 与
     # MEMORY.md 的 "# Memory Rules" 会被 persona 构建原样吞进去，
     # 只靠 "手写…" 那几行清不干净（实测 summary 里仍残留
@@ -466,6 +481,23 @@ _TEMPLATE_MARKERS = (
     "user profile",
     "memory rules",
 )
+
+#: 全部痕迹（净化时使用；判据上按强弱分别处理）。
+_TEMPLATE_MARKERS = _TEMPLATE_MARKERS_STRONG + _TEMPLATE_MARKERS_WEAK
+
+#: 记忆系统**自身聚合产物**的指纹。persona.md 末尾会把「知识领域计数」
+#: 「已知事实转储」「归档统计」整段渲染出来，这些是某一时刻的**派生快照**：
+#: 一方面立刻过时，另一方面它们是内部诊断对话的搬运（实测混进了
+#: "L1手写规则层空的" "刚才在修复 governed_health 的 bug 时网关重启了"
+#: 这类过程噪声）。这类内容进 L1 没有任何价值，只会变成永久垃圾规则。
+_MEMORY_AGGREGATE_MARKERS = (
+    "conversations archived",
+    "messages archived",
+    "facts\n- ",
+)
+
+#: 「## Stats」这类统计小节标题（小写匹配）。
+_MEMORY_AGGREGATE_HEADINGS = ("stats", "knowledge areas")
 
 #: 净化后至少要有这么多实质字符，才不算「只是模板骨架」。
 _TEMPLATE_MIN_SUBSTANTIVE_CHARS = 40
@@ -538,6 +570,61 @@ def is_template_placeholder(text: str) -> bool:
             continue
         substantive += len(s)
     return substantive < _TEMPLATE_MIN_SUBSTANTIVE_CHARS
+
+
+def has_template_scaffold(text: str) -> bool:
+    """内容里是否**残留**脚手架文字（强痕迹）。
+
+    与 :func:`is_template_placeholder` 的分工：
+
+    - ``is_template_placeholder`` 问「这条**是不是只有**骨架」——用于生产端
+      判断「剥掉骨架后还有没有东西」，所以夹带真实内容的放行；
+    - 本函数问「骨架**还在不在**」——用于闸门（进 L1 前的最后一道）。
+
+    为什么闸门要更严：生产端本该先 :func:`strip_template_fragments` 再建候选。
+    如果到了闸门还能看到 ``直接编辑此文件`` / ``_Generated:`` 这种强痕迹，
+    说明**上游某条路径漏了净化**（历史遗留行、新加的写入者、或插件不可用时的
+    降级分支）。此时整条丢弃比"边净化边放行"更安全 —— 候选是给人复核的，
+    丢掉可以手工补，而脚手架一旦进 L1 就会被下一轮 persona 构建读回去，
+    形成闭环污染。
+    """
+    raw = (text or "")
+    if not raw.strip():
+        return False
+    low = raw.lower()
+    return any(m in raw or m in low for m in _TEMPLATE_MARKERS_STRONG)
+
+
+def is_memory_aggregate(text: str) -> bool:
+    """是否是记忆系统自身的聚合快照（persona 渲染产物 / 统计块）。
+
+    实测 ``persona.md`` 被整文件当作一个 ``target=user`` 候选导出，内容里
+    除了模板骨架，还跟着：
+
+    - ``## Knowledge Areas`` → ``- other: 24 facts`` 这类计数
+    - ``## Known Facts``     → 24 条 L2 事实的**转储**（含过程噪声）
+    - ``## Stats``           → ``Conversations archived: 261``
+
+    这些是 L2/L3 的**派生视图**，不是新信息；把它们 promote 进 L1 等于让
+    派生数据回流成规则。真正的做法是在生产端拆成单条事实（见
+    ``scripts/scope_recall_bridge.py`` 的 ``persona_fact_records``），
+    走到闸门还整块出现就只能整条拒绝。
+    """
+    raw = (text or "")
+    if not raw.strip():
+        return False
+    low = raw.lower()
+    if any(m in low for m in _MEMORY_AGGREGATE_MARKERS):
+        return True
+    for line in raw.splitlines():
+        s = line.strip()
+        if not _MD_HEADING_RE.match(s):
+            continue
+        # 去掉前导 '#' 取标题正文（_MD_HEADING_RE 无捕获组）
+        heading = s.lstrip("#").strip().lower()
+        if heading in _MEMORY_AGGREGATE_HEADINGS:
+            return True
+    return False
 
 # Metadata "key: value" rows out of status reports. Matched against the
 # UNDECORATED copy so that "- **Provider**: `governed`", "**Provider**: …"

@@ -49,10 +49,13 @@ def _governed_helpers():
     """导入统一准入闸门（dev / installed 两种布局），结果缓存。
 
     桥接的门槛只应有一份实现：插件侧 ``on_session_end``、``memory_promote``、
-    本脚本、``import_approved`` 共用 ``screen_bridge_content``。实测本脚本
-    此前把 persona.md 全文（其实是 USER.md 模板骨架 + 真实内容混在一起）
-    当作 target=user 候选导出，promote 之后模板会写进 L1 —— 而 L1 又会被
-    下一次 persona 构建读回去，形成闭环污染。
+    本脚本、``import_approved`` 共用 ``screen_bridge_content``。
+
+    本脚本历史上把 persona.md 全文（USER.md 模板骨架 + L2 事实转储 + 统计块）
+    当作 target=user 候选导出，promote 之后脚手架会写进 L1 —— 而 L1 又会被
+    下一次 persona 构建读回去，形成闭环污染。**该来源已移除**（见
+    ``source_record`` 的守卫）；这里的净化 + 闸门继续服务于 induction / wiki
+    等文件来源，它们同样可能出现骨架或聚合内容。
 
     导入失败时降级为「不过滤 + 不净化」，绝不因为插件不可用而中断导出。
     """
@@ -143,6 +146,15 @@ def extract_title(text: str, fallback: str) -> str:
 
 
 def source_record(path: Path, target: str, source_kind: str, source_trust: float) -> dict | None:
+    # persona.md 是 L2/L3 的**派生聚合**，它的内容天然属于 L2，而 Bridge 队列
+    # 通向 L1（规则层）—— 给它排队是范畴错误，且会构成
+    # 「L2 → persona → 候选 → L1 → 下一轮 persona」的闭环污染。
+    # 实测把它当单一候选导出时，池子里躺着的是「模板骨架 + 24 条 L2 事实转储
+    # + Stats 计数」的整篇文档。这里显式挡住，避免将来有人重新加回调用。
+    if source_kind == "persona":
+        logger.info("skip_persona_source=%s (derived aggregate, not a bridge source)", path)
+        return None
+
     content = read_text(path)
     if not content.strip():
         return None
@@ -167,10 +179,7 @@ def source_record(path: Path, target: str, source_kind: str, source_trust: float
     summary = compact_summary(content)
     safe_content = content[:6000].strip()
 
-    if source_kind == "persona":
-        memory_type = "user"
-        tags = ["persona", "review-required"]
-    elif source_kind == "ops":
+    if source_kind == "ops":
         memory_type = "ops"
         tags = ["ops", "review-required"]
     else:
@@ -199,15 +208,19 @@ def source_record(path: Path, target: str, source_kind: str, source_trust: float
 
 
 def collect_candidates() -> list[dict]:
-    """Collect Bridge candidates from all sources."""
-    candidates = []
+    """Collect Bridge candidates from all sources.
 
-    # L4 persona
-    persona_path = MEMORY_DIR / "persona.md"
-    if persona_path.exists():
-        rec = source_record(persona_path, "user", "persona", 0.9)
-        if rec:
-            candidates.append(rec)
+    **persona.md 不是候选来源**（2026-09-16 移除）。原因见 ``source_record``
+    里的守卫：它是 L2/L3 的派生聚合（L4 每轮已注入），把它整篇当一个
+    ``target=user`` 候选导出，等于让派生数据回流成 L1 规则 —— 实测池子里
+    那条就是「USER.md 模板骨架 + Memory Rules 骨架 + 24 条 L2 事实转储 +
+    Knowledge Areas 计数 + Stats 统计」的整篇文档，promote 之后模板会写进
+    L1，而 L1 又会被下一轮 persona 构建读回去。
+
+    想把某条事实提升为 L1 规则，正确通路是 ``memory_promote.py``（L3 里
+    反复出现的模式）或人工手写 —— 这两条才是有意义的信号源。
+    """
+    candidates = []
 
     # Induction outputs
     induction_patterns = [

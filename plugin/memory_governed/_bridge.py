@@ -26,7 +26,9 @@ from ._diag import log_data_loss
 from ._sync import (
     _ABS_PATH_RE,
     _MEDIA_PLACEHOLDER_RE,
+    has_template_scaffold,
     is_ephemeral_content,
+    is_memory_aggregate,
     is_template_placeholder,
 )
 
@@ -52,16 +54,25 @@ def screen_bridge_content(content: str) -> Optional[str]:
     闸门是它们的**唯一共同入口**。
 
     Returns:
-        拒绝原因（``ephemeral`` / ``template`` / ``media`` / ``abs_path``
-        / ``empty``），或 ``None`` 表示放行。
+        拒绝原因（``ephemeral`` / ``template`` / ``template_scaffold``
+        / ``aggregate`` / ``media`` / ``abs_path`` / ``empty``），
+        或 ``None`` 表示放行。
     """
     text = (content or "").strip()
     if not text:
         return "empty"
     if is_ephemeral_content(text):
         return "ephemeral"
+    # 骨架残留：生产端本该先 strip_template_fragments。走到这里还能看到
+    # 「直接编辑此文件」「_Generated:」这类强痕迹，说明上游漏了净化 ——
+    # 整条丢弃，绝不带着脚手架进 L1（会被下轮 persona 构建读回去）。
+    if has_template_scaffold(text):
+        return "template_scaffold"
     if is_template_placeholder(text):
         return "template"
+    # 记忆系统自身的派生快照（persona 的 Known Facts 转储 / Stats 计数）。
+    if is_memory_aggregate(text):
+        return "aggregate"
     if _MEDIA_PLACEHOLDER_RE.match(text):
         return "media"
     if _ABS_PATH_RE.match(text):
@@ -429,6 +440,12 @@ class BridgeExporter:
         check so that entry-point regressions and historical rows already in
         the feed can never reach L1.
 
+        CONTENT HARD GATE (added 2026-09-16): :func:`screen_bridge_content` is
+        re-run here, with the same unconditional posture as the secret gate.
+        The export-time check only guards rows being *created*; this one guards
+        the moment they would become permanent L1 rules. Blocked rows are
+        counted under ``blocked_content`` (never silently dropped).
+
         Already-imported rows (imported=true) are skipped.
 
         Ordering (crash-safety): rows are marked imported and written back
@@ -442,12 +459,14 @@ class BridgeExporter:
         jsonl_path = self._bridge_dir / "candidates.jsonl"
         if not jsonl_path.exists():
             return {"imported": 0, "skipped": 0, "corrupt_lines": 0,
-                    "blocked_secrets": 0, "reason": "no candidates file"}
+                    "blocked_secrets": 0, "blocked_content": 0,
+                    "reason": "no candidates file"}
 
         l1_file = Path(l1_path)
         imported = 0
         skipped = 0
         blocked_secrets = 0
+        blocked_content = 0
         corrupt_lines: List[str] = []
 
         # (raw_line, parsed_row or None) — the raw line is kept so corrupt
@@ -487,6 +506,28 @@ class BridgeExporter:
             if row.get("imported"):
                 skipped += 1
                 continue
+
+            # Content gate — the LAST line of defence, at L1's doorstep.
+            #
+            # Same posture as the secret gate above: it runs BEFORE the review
+            # gate, ignores ``auto_approve``, and is deliberately independent of
+            # the export-time check. Rationale: the export check only guards
+            # NEW rows. Rows already sitting in candidates.jsonl (written before
+            # a rule existed, or by an entry point that regressed) would
+            # otherwise still reach L1 — and L1 is re-read by the next persona
+            # build, so one bad row recirculates forever. Measured case: the
+            # 2026-09-16 pool held a whole rendered persona document (template
+            # scaffolding + 24 stale L2 rows + Stats), which promote would have
+            # turned into permanent rules.
+            reason = screen_bridge_content(row.get("content", ""))
+            if reason is not None:
+                blocked_content += 1
+                logger.info(
+                    "Bridge row blocked at L1 gate (%s): id=%s",
+                    reason, row.get("id", "?"),
+                )
+                continue
+
             tags = row.get("tags", [])
             if not auto_approve:
                 if "review-required" in tags or "approved" not in tags:
@@ -498,14 +539,17 @@ class BridgeExporter:
             self._quarantine_corrupt(corrupt_lines)
 
         if not to_import:
-            return {"imported": 0, "skipped": skipped, "corrupt_lines": len(corrupt_lines),
-                    "blocked_secrets": blocked_secrets}
+            return {"imported": 0, "skipped": skipped,
+                    "corrupt_lines": len(corrupt_lines),
+                    "blocked_secrets": blocked_secrets,
+                    "blocked_content": blocked_content}
 
         # 1) Mark imported + atomic rewrite FIRST (no duplicate imports).
         if not self._mark_imported(jsonl_path, rows, {r.get("id") for r in to_import}):
             return {"imported": 0, "skipped": skipped,
                     "corrupt_lines": len(corrupt_lines),
-                    "blocked_secrets": blocked_secrets, "errors": 1}
+                    "blocked_secrets": blocked_secrets,
+                    "blocked_content": blocked_content, "errors": 1}
 
         # 2) Then land them in L1 (a failure here only loses an import).
         try:
@@ -530,12 +574,14 @@ class BridgeExporter:
             skipped += len(to_import) - imported
 
         logger.info(
-            "Bridge import_approved: %d imported, %d skipped, %d corrupt, %d secret-blocked",
-            imported, skipped, len(corrupt_lines), blocked_secrets,
+            "Bridge import_approved: %d imported, %d skipped, %d corrupt, "
+            "%d secret-blocked, %d content-blocked",
+            imported, skipped, len(corrupt_lines), blocked_secrets, blocked_content,
         )
         return {"imported": imported, "skipped": skipped,
                 "corrupt_lines": len(corrupt_lines),
-                "blocked_secrets": blocked_secrets}
+                "blocked_secrets": blocked_secrets,
+                "blocked_content": blocked_content}
 
     @staticmethod
     def _row_has_secret(row: dict) -> bool:

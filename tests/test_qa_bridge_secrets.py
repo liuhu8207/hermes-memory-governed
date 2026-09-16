@@ -185,3 +185,66 @@ class TestL1HardGate:
 
         report = bridge.import_approved(config.l1_memory_path)
         assert report["imported"] == 1, f"legitimate memory was blocked: {report}"
+
+
+# --- 6: content gate at the L1 boundary (2026-09-16) -------------------------
+#
+# The export-time screen only guards rows being CREATED. Rows already sitting in
+# candidates.jsonl — written before a rule existed, or by an entry point that
+# regressed — would otherwise still reach L1, and L1 is re-read by the next
+# persona build, so one bad row recirculates forever. Measured case: the
+# 2026-09-16 pool held a whole rendered persona document.
+
+class TestContentGateAtL1Boundary:
+    _PERSONA_DUMP = (
+        "# User Profile\n_Generated: 2026-09-16T00:54:43.681897_\n\n"
+        "> 手写用户信息。直接编辑此文件。\n\n"
+        "## Known Facts\n- 刚才在修复 `governed_health` 的 bug 时网关重启了\n\n"
+        "## Stats\n- Conversations archived: 261\n"
+    )
+
+    def _seed(self, bridge, config, content: str) -> Path:
+        jsonl = Path(config.bridge_dir) / "candidates.jsonl"
+        jsonl.parent.mkdir(parents=True, exist_ok=True)
+        jsonl.write_text(json.dumps({
+            "id": "hermes-legacy-dump",
+            "content": content,
+            "target": "user",
+            "tags": ["approved"],
+            "source": "hermes-memory-governed",
+            "source_path": "persona.md",
+        }) + "\n", encoding="utf-8")
+        return jsonl
+
+    def test_historical_dump_cannot_reach_l1(self, bridge, config):
+        self._seed(bridge, config, self._PERSONA_DUMP)
+        report = bridge.import_approved(config.l1_memory_path)
+        assert report["imported"] == 0, f"persona dump reached L1: {report}"
+        assert report["blocked_content"] == 1, report
+        body = Path(config.l1_memory_path).read_text(encoding="utf-8")
+        assert "手写用户信息" not in body
+        assert "Conversations archived" not in body
+
+    def test_auto_approve_cannot_bypass_the_content_gate(self, bridge, config):
+        self._seed(bridge, config, self._PERSONA_DUMP)
+        report = bridge.import_approved(config.l1_memory_path, auto_approve=True)
+        assert report["imported"] == 0, (
+            f"auto_approve=True bypassed the content gate: {report}"
+        )
+        assert report["blocked_content"] == 1, report
+
+    def test_clean_row_is_unaffected(self, bridge, config):
+        """Control: the new gate must not narrow what legitimately imports."""
+        jsonl = Path(config.bridge_dir) / "candidates.jsonl"
+        jsonl.parent.mkdir(parents=True, exist_ok=True)
+        jsonl.write_text(json.dumps({
+            "id": "hermes-clean-2",
+            "content": "SecretStore 使用 `ROCKET_TLS` 而不是 `SSL_CERT_FILE`",
+            "target": "memory",
+            "tags": ["approved"],
+            "source": "hermes-memory-governed",
+        }) + "\n", encoding="utf-8")
+
+        report = bridge.import_approved(config.l1_memory_path)
+        assert report["imported"] == 1, report
+        assert report["blocked_content"] == 0, report

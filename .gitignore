@@ -42,3 +42,6 @@ desktop.ini
 # --- 临时验证输出 ---
 docs/_chk.txt
 docs/_verify_out.txt
+# tmp/ 存放一次性标定/验证脚本（calibrate_kb.py、verify_*.py 等），
+# 结论已固化进代码注释与报告，脚本本身无长期价值
+tmp/
