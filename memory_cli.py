@@ -113,6 +113,18 @@ _AGENT_ENV_MARKERS = (
 _AGENT_NAME_RE = re.compile(r"[^A-Za-z0-9_.\-]")
 _AGENT_NAME_MAX = 32
 
+#: Project identifiers are *labels*, not security boundaries, so unlike agent
+#: names they keep CJK — this machine's checkouts live under
+#: ``D:\repos\Drive\项目\...`` and stripping the ideographs would collapse
+#: several distinct projects onto the same empty string. Only path separators,
+#: whitespace and shell-hostile characters are removed.
+_PROJECT_NAME_RE = re.compile(r"[^0-9A-Za-z_.\-\u4e00-\u9fff]")
+_PROJECT_NAME_MAX = 64
+
+#: Entries that mark a project root when walking up from a cwd. ``.git`` covers
+#: real repositories; the others cover working trees that are not repos yet.
+_PROJECT_MARKERS = (".git", ".workbuddy", "pyproject.toml", "package.json")
+
 #: Names that may legitimately appear as a note's writer. Used only to
 #: interpret the legacy ``source`` field — see :func:`note_agent`.
 _KNOWN_AGENTS = frozenset({
@@ -284,6 +296,56 @@ def plugin_module(name: str):
     return mod
 
 
+# -- project attribution ----------------------------------------------------
+def normalize_project(raw) -> str:
+    """Fold a directory name into a stable project label.
+
+    Unlike :func:`normalize_agent` this preserves CJK and does **not**
+    lowercase: the label is shown back to the user, so mangling its case makes
+    the report harder to read for no benefit.
+    """
+    return _PROJECT_NAME_RE.sub("", str(raw or "").strip())[:_PROJECT_NAME_MAX]
+
+
+def infer_project(cwd: str = "") -> str:
+    """Best-effort project label for a working directory.
+
+    Walks up from ``cwd`` to the first directory carrying a project marker, so
+    a hook invoked from ``<repo>/scripts`` still reports ``<repo>`` rather than
+    ``scripts``. Falls back to the leaf directory name when no marker is found:
+    the label exists to *find* related facts, and an empty one finds nothing —
+    a truthful "this is where you are" beats a blank.
+
+    Never raises. A caller is only decorating its output; a malformed cwd must
+    not be allowed to take down the call.
+    """
+    try:
+        start = Path(cwd).expanduser() if cwd else Path(os.getcwd())
+        if start.is_file():
+            start = start.parent
+        if not start.exists():
+            # A working directory that does not exist is not a project. Falling
+            # back to its leaf name here would attribute facts to a place that
+            # is not there, so answer honestly with nothing instead.
+            return ""
+        # Stop at the home directory rather than walking past it. ``~/.workbuddy``
+        # is WorkBuddy's *user-level* config, not a project marker — letting it
+        # count would attribute every path under ``~`` (including every temp
+        # directory on the machine) to a project named after the user.
+        home = Path.home()
+        for cand in (start, *start.parents):
+            if cand == home:
+                break
+            try:
+                if any((cand / m).exists() for m in _PROJECT_MARKERS):
+                    return normalize_project(cand.name)
+            except OSError:
+                continue
+        return normalize_project(start.name)
+    except Exception:  # noqa: BLE001 — decoration must never be fatal
+        return ""
+
+
 # -- config -----------------------------------------------------------------
 def hermes_home() -> str:
     return os.environ.get("HERMES_HOME") or DEFAULT_HERMES_HOME
@@ -385,13 +447,17 @@ def search_l3(query: str, top_k: int, errors: list = None) -> list:
 
 
 # -- L2: LanceDB keyword scan (no embeddings) -------------------------------
-def search_l2(query: str, top_k: int, errors: list = None) -> list:
+def search_l2(query: str, top_k: int, errors: list = None,
+              project: str = "") -> list:
     """Keyword-scan L2 without an embedding model.
 
     ``errors`` is an optional sink. L2 used to fail silently — an ImportError
     from a bare interpreter produced the same ``[]`` as a genuine no-match, and
     a caller could not tell "nothing remembered" from "cannot read memory".
     Every failure path now records why.
+
+    ``project`` narrows the result to one project *plus* the global facts that
+    belong to no project in particular.
     """
     def _fail(msg: str) -> list:
         if errors is not None:
@@ -422,17 +488,27 @@ def search_l2(query: str, top_k: int, errors: list = None) -> list:
         contents = arr["content"].to_pylist()
         agents = (arr["agent"].to_pylist() if "agent" in arr.column_names
                   else [None] * len(contents))
+        projects = (arr["project"].to_pylist() if "project" in arr.column_names
+                    else [None] * len(contents))
         tokens = re.findall(r"[\w\u4e00-\u9fff]+", query)
         hits = []
-        for c, ag in zip(contents, agents):
+        for c, ag, pj in zip(contents, agents, projects):
             c = str(c or "")
             if not c:
+                continue
+            pj = str(pj) if pj else ""
+            # A project-scoped query still sees global facts (project IS NULL):
+            # "SecretStore runs on the NAS" is true wherever you ask from. What
+            # it must not see is *another* project's facts.
+            if project and pj and pj != project:
                 continue
             score = sum(1 for t in tokens if t.lower() in c.lower())
             if score > 0:
                 hit = {"layer": "l2", "content": c[:600], "score": 0.9}
                 if ag:
                     hit["agent"] = ag
+                if pj:
+                    hit["project"] = pj
                 hits.append(hit)
                 if len(hits) >= top_k:
                     break
@@ -449,11 +525,11 @@ def plugin_config():
 
 
 def open_l2_table(cfg):
-    """Open the L2 table, adding the ``agent`` column to a pre-sharing table.
+    """Open the L2 table, backfilling the sharing columns on a legacy table.
 
     Migration is additive and in-place: existing rows simply carry a null
-    ``agent``, which reads back as "written before provenance was tracked"
-    rather than being guessed at.
+    ``agent``/``project``, which reads back as "written before this dimension
+    was tracked" rather than being guessed at.
     """
     import lancedb
     import pyarrow as pa
@@ -467,11 +543,13 @@ def open_l2_table(cfg):
     if "memories" not in table_names:
         return None
     table = db.open_table("memories")
-    if "agent" not in [f.name for f in table.schema]:
-        # lancedb takes a pa.Field here (new column, null-filled), NOT a
-        # {name: pa.array} mapping — the array form raises TypeError. Existing
-        # rows stay null, which honestly reads as "predates provenance".
-        table.add_columns(pa.field("agent", pa.string()))
+    # lancedb takes a pa.Field here (new column, null-filled), NOT a
+    # {name: pa.array} mapping — the array form raises TypeError, and when that
+    # happens inside a best-effort block the migration fails invisibly.
+    existing = {f.name for f in table.schema}
+    for col in ("agent", "project"):
+        if col not in existing:
+            table.add_columns(pa.field(col, pa.string()))
     return table
 
 
@@ -491,19 +569,33 @@ def _l2_existing_contents(table) -> set:
 
 
 def cmd_remember(config: dict, text: str, agent: str,
-                 category: str = "other", dry_run: bool = False) -> dict:
+                 category: str = "other", dry_run: bool = False,
+                 project: str = None) -> dict:
     """Admit ``text`` into L2 as a durable fact attributed to ``agent``.
 
     The gate is the shared one (``external_write_verdict``) — the same rules
     Hermes applies to its own extractions, so an agent cannot write something
     Hermes itself would have rejected. A rejection always names its reason;
     nothing is dropped silently.
+
+    ``project`` controls attribution, and the three values are deliberately
+    distinct:
+
+    * ``None`` — the argument was not supplied; infer from the current working
+      directory. This is the common case, and it exists because an agent
+      working inside a checkout should not have to remember to say where it is.
+    * ``""`` — explicitly global. Use it for infrastructure knowledge that
+      holds wherever you happen to be standing.
+    * anything else — that project, folded by :func:`normalize_project`.
     """
     sync = plugin_module("_sync")
     cleaned = " ".join(str(text or "").split())
     admitted, reason = sync.external_write_verdict(cleaned)
+    resolved_project = (infer_project() if project is None
+                        else normalize_project(project))
 
-    base = {"agent": agent, "category": category, "admitted": admitted}
+    base = {"agent": agent, "category": category, "admitted": admitted,
+            "project": resolved_project}
     if not admitted:
         base.update({
             "ok": False,
@@ -556,6 +648,11 @@ def cmd_remember(config: dict, text: str, agent: str,
         "source_rowid": None,
         "role": "agent",
         "agent": agent,
+        # NULL rather than "" when global. LanceDB keeps the two distinct, and
+        # "belongs to no project" is a real fact rather than a missing string —
+        # search_l2 relies on the difference to decide what a project-scoped
+        # query is allowed to see.
+        "project": resolved_project or None,
     }
     try:
         table.add([row])
@@ -848,6 +945,9 @@ def build_parser() -> argparse.ArgumentParser:
     p = sub.add_parser("recall", parents=[common], help="Search L1+L2+L3+L4 + KB")
     p.add_argument("query")
     p.add_argument("--top-k", type=int, default=10)
+    p.add_argument("--project", default="",
+                   help="Narrow L2 to this project plus global facts "
+                        "(default: no narrowing — search every project)")
 
     ks = sub.add_parser("kb-search", parents=[common],
                         help="Search the Obsidian knowledge base")
@@ -875,6 +975,10 @@ def build_parser() -> argparse.ArgumentParser:
     rm.add_argument("--category", default="other")
     rm.add_argument("--dry-run", action="store_true",
                     help="Run the gate and report the verdict without writing")
+    rm.add_argument("--project", default=None,
+                    help="Project to attribute the fact to. Omit to infer from "
+                         "the current directory, or pass '' for a fact that "
+                         "holds everywhere")
 
     sub.add_parser("l1", parents=[common], help="Print the standing L1 rules + L4 persona")
     sub.add_parser("agents", parents=[common], help="Who has written what (provenance)")
@@ -915,10 +1019,11 @@ def main():
 
     if args.cmd == "recall":
         degraded: list = []
+        scoped = normalize_project(getattr(args, "project", "") or "")
         out = {
             "query": args.query,
             "l1": cmd_l1(),
-            "l2": search_l2(args.query, args.top_k, degraded),
+            "l2": search_l2(args.query, args.top_k, degraded, project=scoped),
             "l3": search_l3(args.query, args.top_k, degraded),
             "kb": cmd_kb_search(config, args.query, args.top_k, ""),
         }
@@ -926,6 +1031,11 @@ def main():
         # "memory could not be read" must not look the same to the caller.
         if degraded:
             out["degraded"] = degraded
+        # Same principle for the filter: a caller that scoped the query must be
+        # able to confirm it, and one that did not must not be left wondering
+        # whether another project's facts were silently withheld.
+        if scoped:
+            out["project"] = scoped
     elif args.cmd == "kb-search":
         out = {"results": cmd_kb_search(config, args.query, args.top_k, args.section)}
     elif args.cmd == "kb-get":
@@ -936,7 +1046,8 @@ def main():
                          agent=agent, overwrite=args.overwrite)
     elif args.cmd == "remember":
         out = cmd_remember(config, args.fact, agent,
-                           category=args.category, dry_run=args.dry_run)
+                           category=args.category, dry_run=args.dry_run,
+                           project=args.project)
     else:
         parser.print_help()
         return 2

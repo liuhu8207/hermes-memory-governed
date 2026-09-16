@@ -91,6 +91,31 @@ python "{cli}" kb-add "<标题>" "<正文>"    # 写 KB 笔记
 `.workbuddy/memory/`）**互不感知**。它们各自独立，不要假设一处写入会在另一处可见。
 """
 
+#: Injected only when the payload carries a working directory. This block is
+#: the whole point of project attribution: without it an agent has no way to
+#: learn that the facts it produces are invisible to every other agent, and it
+#: will keep writing into its own local memory by default.
+PROJECT_HINT = """
+### 当前项目
+
+工作目录：`{cwd}`
+项目标识：`{project}`
+
+**跨 agent 约定**。这个存储是和 Hermes Gateway、DSH 等其他 agent 共用的。
+同一份代码库，你可能换一个 agent 再来——但只写在你自己会话里的东西，
+别的 agent 看不见。项目里发生的事，写进来才算共享：
+
+```
+python "{cli}" recall "<查询>" --project {project}   # 本项目 + 全局事实，屏蔽其他项目
+python "{cli}" remember "<具体事实>"                  # 不传 --project 时自动归属本项目
+python "{cli}" remember "<通用事实>" --project ""     # 显式标为全局（主机、拓扑、凭据位置等）
+```
+
+判断标准很简单：**换一台机器、换一个项目还成立**的，就是全局事实；
+**只有这个代码库才成立**的，就归属本项目。标错了不会丢数据，
+但会让它在别的项目里查不到。
+"""
+
 
 def read_payload() -> dict:
     """Hook payload from stdin. Missing or malformed input is not fatal."""
@@ -105,6 +130,30 @@ def read_payload() -> dict:
     except (ValueError, TypeError):
         return {}
     return data if isinstance(data, dict) else {}
+
+
+def resolve_project(cwd: str) -> str:
+    """Project label for ``cwd``, reusing the CLI's own definition.
+
+    Importing the CLI instead of re-implementing the walk keeps the two from
+    drifting apart: a hook that disagreed with ``remember --project`` about what
+    "the current project" means would silently partition the store. The import
+    is cheap — ``memory_cli`` loads LanceDB and the embedding backend lazily, so
+    this costs a path operation and nothing else.
+
+    Returns ``""`` on any problem, and the caller then omits the block rather
+    than injecting a guess.
+    """
+    if not cwd:
+        return ""
+    try:
+        if str(REPO) not in sys.path:
+            sys.path.insert(0, str(REPO))
+        import memory_cli  # noqa: PLC0415 — deliberate; see docstring
+
+        return memory_cli.infer_project(cwd)
+    except Exception:  # noqa: BLE001 — decoration only, never fatal
+        return ""
 
 
 def fetch_l1() -> dict:
@@ -164,7 +213,7 @@ def _clean(text) -> str:
     return body if meaningful else ""
 
 
-def build_context(l1: dict) -> str:
+def build_context(l1: dict, cwd: str = "") -> str:
     """Assemble the injected block, capped at :data:`MAX_CHARS`."""
     parts = [HEADER, ""]
     parts.append(f"你已接入共享记忆存储 `hermes-memory-governed`（agent 身份：`{AGENT}`）。")
@@ -183,6 +232,13 @@ def build_context(l1: dict) -> str:
             parts.append(cleaned)
             parts.append("")
 
+    # Placed after the rules deliberately: the cap truncates from the bottom,
+    # and "where am I" matters less than "how must I behave".
+    project = resolve_project(cwd)
+    if project:
+        parts.append(PROJECT_HINT.format(cwd=cwd, project=project,
+                                         cli=CLI.as_posix()))
+
     parts.append(CAPABILITY.format(cli=CLI.as_posix()))
 
     text = "\n".join(parts).strip()
@@ -197,7 +253,11 @@ def build_context(l1: dict) -> str:
 def main() -> int:
     payload = read_payload()
     l1 = fetch_l1()
-    context = build_context(l1)
+    # WorkBuddy sends the working directory on every SessionStart. It is the
+    # only signal that says *which* project this session belongs to, so it
+    # drives both the project block and the write-attribution advice.
+    cwd = str(payload.get("cwd") or "")
+    context = build_context(l1, cwd)
 
     out = {
         "continue": True,

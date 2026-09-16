@@ -1330,6 +1330,14 @@ class WriteQueue:
                     pa.field("source_rowid", pa.int64()),  # L3 message rowid for audit
                     pa.field("role", pa.string()),         # originating turn role
                     pa.field("agent", pa.string()),        # writing agent identity
+                    # Owning project, or NULL for a fact that holds everywhere.
+                    # Deliberately left NULL by the local extractor: a fact
+                    # lifted out of a conversation has no reliable project
+                    # attribution, and guessing one would be worse than
+                    # admitting we do not know. Callers that *do* know — an
+                    # external agent working inside a checkout — declare it via
+                    # ``memory_cli.py remember --project``.
+                    pa.field("project", pa.string()),
                 ])
                 self._l2_store = db.create_table("memories", schema=schema)
 
@@ -1350,7 +1358,8 @@ class WriteQueue:
                 col_names = [f.name for f in self._l2_store.schema]
                 for col, typ in (("source_rowid", pa.int64()),
                                  ("role", pa.string()),
-                                 ("agent", pa.string())):
+                                 ("agent", pa.string()),
+                                 ("project", pa.string())):
                     if col not in col_names:
                         self._l2_store.add_columns(pa.field(col, typ))
                         logger.info("L2 legacy table backfilled with %s column", col)

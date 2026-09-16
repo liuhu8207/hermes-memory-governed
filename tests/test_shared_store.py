@@ -466,3 +466,190 @@ class TestRuntimeReport:
         report = cli.runtime_report()
         assert "requested_interpreter" not in report
         assert "interpreter" in report
+
+
+# -- project attribution ----------------------------------------------------
+class TestProjectLabelling:
+    """Folding a working directory into a project label."""
+
+    def test_normalize_keeps_cjk(self):
+        # Checkouts on this machine live under D:\repos\Drive\项目\... . Agent
+        # names drop non-ASCII, but doing that here would collapse several
+        # distinct projects onto one empty label.
+        assert cli.normalize_project("我的项目-v2") == "我的项目-v2"
+
+    def test_normalize_strips_separators_and_whitespace(self):
+        assert cli.normalize_project("a/b\\c d") == "abcd"
+
+    def test_normalize_tolerates_none(self):
+        assert cli.normalize_project(None) == ""
+
+    def test_infer_walks_up_to_the_marker(self, tmp_path):
+        # A hook fires with the cwd the user opened, which is often a subdir.
+        repo = tmp_path / "myrepo"
+        (repo / ".git").mkdir(parents=True)
+        deep = repo / "src" / "pkg"
+        deep.mkdir(parents=True)
+        assert cli.infer_project(str(deep)) == "myrepo"
+
+    def test_infer_falls_back_to_leaf_without_marker(self, tmp_path):
+        leaf = tmp_path / "somewhere"
+        leaf.mkdir()
+        assert cli.infer_project(str(leaf)) == "somewhere"
+
+    def test_infer_refuses_a_nonexistent_directory(self, tmp_path):
+        # Attributing facts to a directory that is not there is worse than
+        # admitting we cannot tell where we are.
+        assert cli.infer_project(str(tmp_path / "nope" / "deeper")) == ""
+
+    def test_infer_treats_a_file_path_as_its_directory(self, tmp_path):
+        repo = tmp_path / "repo2"
+        (repo / ".git").mkdir(parents=True)
+        f = repo / "notes.md"
+        f.write_text("x", encoding="utf-8")
+        assert cli.infer_project(str(f)) == "repo2"
+
+    def test_infer_prefers_the_nearest_marker(self, tmp_path):
+        # A nested checkout belongs to the inner project, not the outer one.
+        outer = tmp_path / "outer"
+        (outer / ".git").mkdir(parents=True)
+        inner = outer / "vendor" / "inner"
+        (inner / ".git").mkdir(parents=True)
+        assert cli.infer_project(str(inner)) == "inner"
+
+
+class TestRememberAttribution:
+    """The three intents of ``--project``, which must stay distinguishable."""
+
+    def test_unspecified_infers_from_cwd(self, shared, monkeypatch, tmp_path):
+        repo = tmp_path / "inferred-proj"
+        (repo / ".git").mkdir(parents=True)
+        monkeypatch.chdir(repo)
+        out = cli.cmd_remember({}, "任意文本", "workbuddy", dry_run=True)
+        assert out["project"] == "inferred-proj"
+
+    def test_empty_string_means_global(self, shared, monkeypatch, tmp_path):
+        # Explicitly global must NOT fall back to the cwd: that is the whole
+        # point of distinguishing "" from "not supplied".
+        repo = tmp_path / "cwdproj"
+        (repo / ".git").mkdir(parents=True)
+        monkeypatch.chdir(repo)
+        out = cli.cmd_remember({}, "任意文本", "workbuddy", dry_run=True,
+                               project="")
+        assert out["project"] == ""
+
+    def test_explicit_project_beats_the_cwd(self, shared, monkeypatch, tmp_path):
+        repo = tmp_path / "cwdproj"
+        (repo / ".git").mkdir(parents=True)
+        monkeypatch.chdir(repo)
+        out = cli.cmd_remember({}, "任意文本", "workbuddy", dry_run=True,
+                               project="other-proj")
+        assert out["project"] == "other-proj"
+
+
+class TestProjectScopedRecall:
+    """A scoped query sees its own project plus globals — and nothing else."""
+
+    @staticmethod
+    def _seed(home, rows):
+        import lancedb
+
+        l2 = home / "memory" / "l2"
+        l2.mkdir(parents=True, exist_ok=True)
+        db = lancedb.connect(str(l2))
+        if "memories" in db.table_names():
+            db.drop_table("memories")
+        db.create_table("memories", data=rows)
+
+    @staticmethod
+    def _row(text, project):
+        return {
+            "content": text, "category": "other", "source": "test",
+            "timestamp": "2026-09-16T00:00:00", "vector": [0.0, 0.0],
+            "source_rowid": None, "role": "agent", "agent": "tester",
+            "project": project,
+        }
+
+    def _seeded(self, shared):
+        self._seed(shared.home, [
+            self._row("alpha 事项属于 p1", "p1"),
+            self._row("alpha 事项属于 p2", "p2"),
+            self._row("alpha 是全局事实", None),
+        ])
+
+    def test_scoped_query_keeps_own_project_and_globals(self, shared):
+        self._seeded(shared)
+        hits = cli.search_l2("alpha", 10, [], project="p1")
+        body = " | ".join(h["content"] for h in hits)
+        assert "属于 p1" in body
+        assert "全局事实" in body
+        assert "属于 p2" not in body
+
+    def test_scoped_query_hides_other_projects(self, shared):
+        self._seeded(shared)
+        hits = cli.search_l2("alpha", 10, [], project="p2")
+        body = " | ".join(h["content"] for h in hits)
+        assert "属于 p2" in body
+        assert "属于 p1" not in body
+
+    def test_unscoped_query_sees_everything(self, shared):
+        self._seeded(shared)
+        hits = cli.search_l2("alpha", 10, [])
+        body = " | ".join(h["content"] for h in hits)
+        assert "属于 p1" in body and "属于 p2" in body
+
+    def test_unknown_project_still_sees_globals(self, shared):
+        # A project with no facts of its own must not be blinded to the
+        # infrastructure knowledge that applies everywhere.
+        self._seeded(shared)
+        hits = cli.search_l2("alpha", 10, [], project="never-heard-of-it")
+        body = " | ".join(h["content"] for h in hits)
+        assert "全局事实" in body
+        assert "属于 p1" not in body and "属于 p2" not in body
+
+    def test_hits_carry_their_project(self, shared):
+        self._seeded(shared)
+        hits = cli.search_l2("alpha", 10, [])
+        by_content = {h["content"]: h for h in hits}
+        assert by_content["alpha 事项属于 p1"]["project"] == "p1"
+        # A global fact has no project key at all — absent, not empty.
+        assert "project" not in by_content["alpha 是全局事实"]
+
+
+class TestL2SchemaDeclaresProject:
+    """Guards a regression that actually happened.
+
+    The ``project`` column was added to the backfill list but *not* to the
+    table schema, so an existing table gained the column while a freshly
+    created one never would. Behaviour tests cannot see that: they all run
+    against a table that already has the column. Only the schema declaration
+    itself catches it.
+    """
+
+    @staticmethod
+    def _source():
+        path = Path(__file__).resolve().parents[1] / "plugin" / "memory_governed" / "_sync.py"
+        return path.read_text(encoding="utf-8")
+
+    def test_schema_lists_project(self):
+        assert 'pa.field("project", pa.string())' in self._source()
+
+    def test_backfill_list_includes_project(self):
+        assert '("project", pa.string())' in self._source()
+
+    def test_open_l2_table_backfills_project_on_a_legacy_table(self, shared):
+        import lancedb
+
+        l2 = shared.home / "memory" / "l2"
+        db = lancedb.connect(str(l2))
+        if "memories" in db.table_names():
+            db.drop_table("memories")
+        db.create_table("memories", data=[{
+            "content": "legacy row", "category": "other", "source": "test",
+            "timestamp": "2026-09-16T00:00:00", "vector": [0.0, 0.0],
+        }])
+        cfg = types.SimpleNamespace(l2_db_path=str(l2))
+        table = cli.open_l2_table(cfg)
+        assert table is not None
+        assert "project" in [f.name for f in table.schema]
+
