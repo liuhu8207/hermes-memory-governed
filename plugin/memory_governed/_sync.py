@@ -27,7 +27,7 @@ import time
 import weakref
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 from ._config import GovernedMemoryConfig
 from ._diag import log_data_loss, log_degraded, record_metric
@@ -237,6 +237,54 @@ _ROLE_WEIGHTS: Dict[str, int] = {"user": 2, "assistant": -1}
 #   * assistant baseline -1 -> must clear 0, i.e. carry a real signal.
 _MIN_SIGNAL_USER = 2
 _MIN_SIGNAL_ASSISTANT = 0
+
+#: Agent name recorded on rows this plugin writes itself. Hermes is the only
+#: in-process writer; external agents go through ``memory_cli.py`` and carry
+#: their own identity in the same column. Without this a shared store cannot
+#: answer "who wrote this row", which single-writer deployments never needed.
+_LOCAL_AGENT = "hermes"
+
+# ---------------------------------------------------------------------------
+# Floors for EXTERNAL writes (multi-agent sharing)
+# ---------------------------------------------------------------------------
+# An external agent submits a fact with NO dialogue context: the text is a
+# knowledge claim, not a turn in a conversation. The role weights above
+# therefore do not apply. Measured 2026-09-16 against 10 positive / 10 negative
+# real samples, `role="user"` kept 10/10 but LEAKED 8/10 — its +2 baseline lifts
+# every short acknowledgement ("嗯嗯", "好的，我明白了") over the bar. Empty role
+# is the only honest choice when no dialogue context is known.
+#
+# The strong-signal word lists alone keep just 6/10: they are tuned for user
+# constraints, so a noun-shaped fact scores ZERO. Measured examples that score 0
+# yet are exactly what an agent is asked to remember:
+#     "示例主路由 192.0.2.1 的 SSH 端口是 8022，走 PPPoE 拨号"
+#     "家用NAS 192.0.2.62 上重度使用 Docker 部署服务"
+#     "mosdns client_proxy_mode=whitelist 已启用"
+# Structural evidence is the complement: an IP, a path, an inline identifier, a
+# digit, a latin run. Combining the two:
+#
+#     admit  <=>  signal >= 2  OR  (weighted_len >= 40 AND structure >= 2)
+#
+# re-measured with the REAL _weighted_len(): 9/10 kept, 0/10 leaked. Separation
+# is clean — no negative sample exceeds structure 1, and every positive that
+# misses the word lists carries structure >= 3. The single miss ("我计划 55 岁
+# 提前退休，需要筹备孩子的教育基金") is a life-plan preference, which belongs in
+# L1/KB rather than the fact layer.
+#
+# Deliberately NOT screened here: credentials. They stay on the existing secret
+# channel (matched_secret_patterns + quarantine) so the security event keeps its
+# redacted audit record instead of collapsing into a bare counter.
+_EXTERNAL_MIN_SIGNAL = 2
+_EXTERNAL_MIN_WEIGHTED_LEN = 40
+_EXTERNAL_MIN_STRUCTURE = 2
+
+_EXTERNAL_IP_RE = re.compile(r"\b\d{1,3}(?:\.\d{1,3}){3}\b")
+_EXTERNAL_PATH_RE = re.compile(r"[A-Za-z]:[\\/]|/[\w.-]+/[\w.-]+|`[^`]*\.\w{1,4}`")
+_EXTERNAL_IDENT_RE = re.compile(
+    r"`[^`]+`|\b[A-Za-z_][A-Za-z0-9_]{2,}(?:[._-][A-Za-z0-9_]+)+\b"
+)
+_EXTERNAL_DIGIT_RE = re.compile(r"\d")
+_EXTERNAL_LATIN_RE = re.compile(r"[A-Za-z]{2,}")
 
 # Pure chatter: never a durable fact.
 _GREETINGS = {
@@ -758,6 +806,67 @@ def _fact_signal_score(sentence: str, role: str = "",
     return score
 
 
+def external_structural_evidence(text: str) -> int:
+    """Count independent structural markers that a factual statement carries.
+
+    Complements :func:`_fact_signal_score` for external writes, whose word lists
+    do not recognise noun-shaped facts (see the floors block above). Each marker
+    is independent evidence that the text *names* something concrete rather than
+    expressing a mood or a request.
+    """
+    if not text:
+        return 0
+    return sum((
+        bool(_EXTERNAL_IP_RE.search(text)),
+        bool(_EXTERNAL_PATH_RE.search(text)),
+        bool(_EXTERNAL_IDENT_RE.search(text)),
+        bool(_EXTERNAL_DIGIT_RE.search(text)),
+        bool(_EXTERNAL_LATIN_RE.search(text)),
+    ))
+
+
+def external_write_verdict(text: str) -> Tuple[bool, str]:
+    """Decide whether an EXTERNAL agent may write ``text`` into L2.
+
+    The gate is deliberately *looser* than :func:`screen_bridge_content`: Bridge
+    candidates are promoted into L1, where a wrong row becomes a standing rule
+    injected every turn, whereas L2 is only a recall layer where a wrong row
+    costs one misleading hint. It is still far stricter than the word-list-only
+    floor, because an external writer has no dialogue context to vouch for it.
+
+    Returns:
+        ``(admitted, reason)``. ``reason`` is ``"ok"`` when admitted; otherwise a
+        short machine-readable tag (``empty`` / ``ephemeral`` / ``template`` /
+        ``media`` / ``abs_path`` / ``weak_signal``) that the caller **must**
+        surface to the user. A silent drop here would look identical to success.
+    """
+    raw = (text or "").strip()
+    if not raw:
+        return False, "empty"
+
+    cleaned = _undecorate(raw)
+
+    # Same content-shape checks the Bridge gate applies. Kept in sync by living
+    # in this module, which is the single definition site for all of them.
+    if is_ephemeral_content(cleaned):
+        return False, "ephemeral"
+    if is_template_placeholder(cleaned):
+        return False, "template"
+    if _MEDIA_PLACEHOLDER_RE.match(cleaned):
+        return False, "media"
+    if _ABS_PATH_RE.match(cleaned):
+        return False, "abs_path"
+
+    if _fact_signal_score(cleaned, "", strong_only=True) >= _EXTERNAL_MIN_SIGNAL:
+        return True, "ok"
+
+    if (_weighted_len(cleaned) >= _EXTERNAL_MIN_WEIGHTED_LEN
+            and external_structural_evidence(cleaned) >= _EXTERNAL_MIN_STRUCTURE):
+        return True, "ok"
+
+    return False, "weak_signal"
+
+
 # ---------------------------------------------------------------------------
 # Write queue
 # ---------------------------------------------------------------------------
@@ -998,6 +1107,13 @@ class WriteQueue:
 
             self._attach_vectors(facts)
 
+            # Project onto the table's real columns. `facts` also carries
+            # internal keys (`_signals`), and `agent` is absent on a table that
+            # predates the provenance column — filtering here makes the write
+            # safe whether or not the migration has run yet.
+            cols = {f.name for f in self._l2_store.schema}
+            facts = [{k: v for k, v in f.items() if k in cols} for f in facts]
+
             self._l2_store.add(facts)
         except Exception as e:  # noqa: BLE001 - L2 failure must not kill the turn
             log_degraded("l2_write", "index_failed", exc=e)
@@ -1213,24 +1329,33 @@ class WriteQueue:
                     pa.field("vector", pa.list_(pa.float32(), dim)),
                     pa.field("source_rowid", pa.int64()),  # L3 message rowid for audit
                     pa.field("role", pa.string()),         # originating turn role
+                    pa.field("agent", pa.string()),        # writing agent identity
                 ])
                 self._l2_store = db.create_table("memories", schema=schema)
 
             # Backfill legacy columns (best-effort). `role` carries the
             # originating turn's role so the quality gate can be replayed with
             # the real rule instead of assuming "user" (see _extract_atomic_facts).
-            # Existing rows get NULL; scripts/l2_backfill_role.py fills them from
-            # the L3 archive via source_rowid.
+            # `agent` carries who wrote the row, which single-writer deployments
+            # never needed but a shared store cannot do without.
+            #
+            # NOTE the argument form: lancedb's add_columns takes a pa.Field /
+            # pa.Schema (new columns initialised to null) or a {name: SQL}
+            # mapping — NOT a {name: pa.array} mapping. The array form raises
+            # TypeError, and because this whole block is best-effort the failure
+            # was swallowed into a debug line, so the migration silently never
+            # ran. Existing rows correctly stay NULL: "written before provenance
+            # was tracked" is the truth, and guessing would be worse.
             try:
                 col_names = [f.name for f in self._l2_store.schema]
-                if "source_rowid" not in col_names:
-                    self._l2_store.add_columns({"source_rowid": pa.array([], type=pa.int64())})
-                    logger.info("L2 legacy table backfilled with source_rowid column")
-                if "role" not in col_names:
-                    self._l2_store.add_columns({"role": pa.array([], type=pa.string())})
-                    logger.info("L2 legacy table backfilled with role column")
+                for col, typ in (("source_rowid", pa.int64()),
+                                 ("role", pa.string()),
+                                 ("agent", pa.string())):
+                    if col not in col_names:
+                        self._l2_store.add_columns(pa.field(col, typ))
+                        logger.info("L2 legacy table backfilled with %s column", col)
             except Exception as e:  # noqa: BLE001
-                logger.debug("L2 column backfill skipped: %s", e)
+                log_degraded("l2_write", "column_backfill_failed", exc=e)
         except Exception as e:  # noqa: BLE001
             log_degraded("l2_write", "store_init_failed", exc=e)
             return
@@ -1456,6 +1581,9 @@ class WriteQueue:
                     # 复算分数，而过去 L2 表里根本没有这个字段，只好一律按
                     # user 判定（偏松，会把该拦的助手叙述放过去）。
                     "role": role,
+                    # 写入者身份（2026-09-16 多 agent 共享）：共享存储必须能回答
+                    # 「这行是谁写的」，单写者时代不需要这个字段。
+                    "agent": _LOCAL_AGENT,
                     "_signals": _fact_signal_score(sentence, role),
                 })
 

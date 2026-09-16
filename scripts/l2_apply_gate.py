@@ -28,6 +28,7 @@ from __future__ import annotations
 
 import argparse
 import datetime as _dt
+import os
 import sys
 from pathlib import Path
 from typing import List
@@ -41,6 +42,7 @@ from plugin.memory_governed._sync import (  # noqa: E402
     _MIN_SIGNAL_USER,
     WriteQueue,
     _fact_signal_score,
+    external_write_verdict,
 )
 
 
@@ -49,11 +51,28 @@ def admits(text: str, role: str = "user") -> bool:
 
     role 影响很大：user 基线 +2、assistant 基线 -1，两边门槛也不同。
     回填 role 之前这里只能一律按 user 走（偏松，助手叙述会漏删）。
+
+    ``role == "agent"`` 是外部 agent 经 ``memory_cli.py remember`` 写入的行，
+    必须走**同一个** ``external_write_verdict``。否则回放会用对话角色的信号
+    门槛去判它们，把靠结构证据进来的行全部误删 —— 例如
+    「示例主路由 192.0.2.1 的 SSH 端口是 8022」，信号分 0，但它含 IP /
+    专有名词 / 端口，正是该层要留的东西。写入与回放必须用同一把尺子。
     """
+    if role == "agent":
+        return external_write_verdict(text)[0]
     if not WriteQueue._looks_like_fact(text, role):
         return False
     floor = _MIN_SIGNAL_ASSISTANT if role == "assistant" else _MIN_SIGNAL_USER
     return _fact_signal_score(text, role, strong_only=True) > floor
+
+
+def _default_l2_dir() -> str:
+    """Locate the L2 directory without hardcoding one machine's layout."""
+    home = os.environ.get("HERMES_HOME")
+    if not home:
+        local = Path(os.environ.get("LOCALAPPDATA", "")) / "hermes"
+        home = str(local if local.exists() else Path.home() / ".hermes")
+    return str(Path(home) / "memory" / "l2")
 
 
 def _row_roles(arrow) -> List[str]:
@@ -66,7 +85,7 @@ def _row_roles(arrow) -> List[str]:
     roles = []
     missing = 0
     for v in arrow.column("role").to_pylist():
-        if v in ("user", "assistant"):
+        if v in ("user", "assistant", "agent"):
             roles.append(str(v))
         else:
             roles.append("user")
@@ -78,7 +97,7 @@ def _row_roles(arrow) -> List[str]:
 
 def main(argv: List[str] | None = None) -> int:
     ap = argparse.ArgumentParser(description="Replay the L2 quality gate over existing rows.")
-    ap.add_argument("--l2-dir", default=str(Path.home() / ".hermes" / "memory" / "l2"))
+    ap.add_argument("--l2-dir", default=_default_l2_dir())
     ap.add_argument("--table", default="memories")
     ap.add_argument("--drop-extra", action="append", default=[],
                     help="额外剔除的内容子串（人工补刀），可重复")
