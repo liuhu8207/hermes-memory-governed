@@ -50,6 +50,7 @@ Contract
 """
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import re
@@ -161,18 +162,37 @@ _HOST_BLOCK_RE = re.compile(r"<[a-zA-Z_][\w:-]*(?:\s[^>]*)?>.*?</[a-zA-Z_][\w:-]
 _OWN_BLOCK_RE = re.compile(
     r"###\s*共享记忆里的相关事实[^\n]*\n(?:.*\n)*?>[^\n]*自动匹配[^\n]*", re.S)
 
+#: This hook's own stdout. The host appends it verbatim — observed twice in one
+#: context — so an *empty* answer arrives as a bare ``{"continue": true, ...}``
+#: line with no header for :data:`_OWN_BLOCK_RE` to anchor on. It is emitted on
+#: one line by design, which is what makes a line-anchored pattern safe.
+_OWN_JSON_RE = re.compile(r'^[ \t]*\{[ \t]*"continue".*$', re.M)
+
+#: Any tag, paired or not. Removing only balanced pairs leaves the closers of
+#: nested blocks behind (``</additional_data> </system-reminder>``) — measured —
+#: and those names then enter the term pool: the residual matched facts through
+#: ``system`` / ``reminder`` / ``additional_data``, i.e. pure markup.
+_TAG_RE = re.compile(r"</?[a-zA-Z_][\w:.-]*[^>]*>")
+
 
 def clean_prompt(prompt: str) -> str:
     """The part of ``prompt`` that the user actually typed.
 
     Returns ``""`` when nothing is left, which the caller treats as "no match"
     — the right answer for a turn that carried only host scaffolding.
+
+    Four passes, each answering something observed rather than imagined:
+    balanced host blocks (their *content* must go, not just their tags), this
+    hook's own injection, this hook's own stdout, and finally any tag left over
+    from a nested block. Skipping the last one cost a false positive on markup.
     """
     text = str(prompt or "")
     if not text:
         return ""
     text = _HOST_BLOCK_RE.sub(" ", text)
     text = _OWN_BLOCK_RE.sub(" ", text)
+    text = _OWN_JSON_RE.sub(" ", text)
+    text = _TAG_RE.sub(" ", text)
     return re.sub(r"\s+", " ", text).strip()
 
 
@@ -344,6 +364,31 @@ def log_run(event: str, session: str, note: str) -> None:
         pass
 
 
+def payload_shape(payload: dict) -> str:
+    """Field names and value sizes of the hook payload — never the values.
+
+    Logging the prompt's *length* was not enough to understand this input. A
+    21-character question arrived as ``prompt`` of length 28 and matched nothing,
+    while the very same text matched two facts when run by hand; elsewhere the
+    field carried 991 characters, of which cleaning removed 487. So ``prompt``
+    does not hold what the user typed, and the way to find out which field does
+    is to look at the payload's shape rather than at its text.
+
+    Sizes and type names only: a diagnostic that quietly accumulates the user's
+    words would be a worse bug than the one it is hunting.
+    """
+    parts = []
+    for key in sorted(payload):
+        value = payload[key]
+        if isinstance(value, str):
+            parts.append(f"{key}:str{len(value)}")
+        elif isinstance(value, (list, tuple, dict, set)):
+            parts.append(f"{key}:{type(value).__name__}{len(value)}")
+        else:
+            parts.append(f"{key}:{type(value).__name__}")
+    return ",".join(parts) or "(empty)"
+
+
 def main() -> int:
     payload = read_payload()
     raw_prompt = str(payload.get("prompt") or "")
@@ -357,10 +402,17 @@ def main() -> int:
     # Both lengths are logged: the gap between them is the host scaffolding, and
     # watching that gap is how the feedback loop was found. If raw_len keeps
     # growing while clean_len stays flat, the scaffolding is accumulating.
+    # ``shape`` is here because lengths alone could not answer which field
+    # actually carries the user's sentence; ``clean_sha`` is here because they
+    # could not answer *what* that field contains either. A short hash of the
+    # cleaned text lets a candidate string be identified by hashing it locally —
+    # no content in the log, and unlike a length it is exact.
     log_run("prompt", str(payload.get("session_id") or ""),
             f"raw_len={len(raw_prompt)} clean_len={len(prompt)} "
+            f"clean_sha={hashlib.sha1(prompt.encode('utf-8')).hexdigest()[:12]} "
             f"facts={len(facts)} matched={len(matches)} "
-            f"injected={len(context)} problem={problem or '-'}")
+            f"injected={len(context)} problem={problem or '-'} "
+            f"shape=[{payload_shape(payload)}]")
 
     out = {
         "continue": True,

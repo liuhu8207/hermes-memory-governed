@@ -240,6 +240,56 @@ class TestCleanPrompt:
         raw = "<system-reminder>\n一些宿主附加内容\n</system-reminder>"
         assert hook.clean_prompt(raw) == ""
 
+    def test_nested_block_closers_are_removed_too(self):
+        """Balanced-pair removal alone leaves the inner closers behind.
+
+        Measured: the residue `</additional_data> </system-reminder>` then fed
+        the term pool through the names additional_data / system / reminder —
+        pure markup matching as if it were a topic.
+        """
+        raw = ('<system-reminder data-role="hook">点东西</system-reminder>\n'
+               '<system-reminder data-role="user-context">\n<additional_data>\n'
+               '<current_time>Thu</current_time>\n</additional_data>\n'
+               '</system-reminder>\n现在几点了')
+        cleaned = hook.clean_prompt(raw)
+        assert cleaned == "现在几点了", cleaned
+        assert "<" not in cleaned and ">" not in cleaned
+
+    def test_tag_names_never_become_terms(self):
+        raw = '<system-reminder>a</system-reminder></additional_data>正文'
+        for term in hook.strong_terms(hook.clean_prompt(raw)):
+            assert term not in {"system", "reminder", "additional_data"}
+
+    def test_our_own_stdout_line_is_removed(self):
+        """An *empty* answer has no header for the block pattern to anchor on."""
+        raw = ('{"continue": true, "hookSpecificOutput": {"hookEventName": '
+               '"UserPromptSubmit", "additionalContext": ""}}\n今天天气怎么样')
+        cleaned = hook.clean_prompt(raw)
+        assert cleaned == "今天天气怎么样", cleaned
+        assert "hookSpecificOutput" not in cleaned
+
+    def test_a_real_identifiers_underscore_is_kept(self):
+        """The residual was markup, but not everything with a _ is markup."""
+        cleaned = hook.clean_prompt("memory_cli.py 的 snapshot 子命令是什么")
+        assert "memory_cli" in cleaned or "memory" in cleaned
+
+
+class TestPayloadShape:
+    """Field names and sizes — the only way to ask "which field is the prompt?"."""
+
+    def test_it_reports_names_and_sizes_only(self):
+        shape = hook.payload_shape({"prompt": "秘密内容", "session_id": "abc",
+                                    "cwd": "D:/x", "source": "startup"})
+        assert "prompt:str4" in shape
+        assert "session_id:str3" in shape
+        assert "cwd:str4" in shape
+        assert "秘密内容" not in shape and "abc" not in shape
+
+    def test_it_handles_non_strings_and_emptiness(self):
+        assert hook.payload_shape({}) == "(empty)"
+        assert "n:int" in hook.payload_shape({"n": 3})
+        assert "items:list2" in hook.payload_shape({"items": [1, 2]})
+
 
 class TestSelfReinforcement:
     """The loop the run log exposed, and the reason this class exists.
