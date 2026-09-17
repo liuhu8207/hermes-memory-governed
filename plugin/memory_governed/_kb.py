@@ -68,6 +68,19 @@ _KEYWORD_SCORE_DENOM = 5.0
 _KB_KW_WEIGHT = 0.4
 _KB_SEM_WEIGHT = 0.6
 
+#: 删除旧笔记的重试参数（Windows 文件占用，见 :func:`_unlink_with_retry`）。
+#:
+#: WinError 32（``PermissionError`` / ``errno 13``）在 Windows 上是**瞬时**
+#: 占用于是多半靠一次退避就能解开：杀软扫盘、Windows Search 索引器、另一个
+#: 线程的读句柄都会短时间占住文件。旧实现 unlink 失败只 ``logger.warning``
+#: 然后照常返回 ``ok=True`` —— 于是笔记同时留在 inbox 和 notes 里（重复数据），
+#: 而 ``approve`` 告诉调用方「批准成功」。
+_UNLINK_RETRIES = 4
+
+#: 指数退避基数（秒）：实际等待 0.02 / 0.04 / 0.08，累计约 0.14s。
+#: 相对一次真实向量检索（≈273ms）可以忽略，却刚好覆盖常见的瞬时占用窗口。
+_UNLINK_BACKOFF_BASE = 0.02
+
 #: mtime 比对容差（秒）：差值不超过它就认为「索引与正本一致」。
 #:
 #: 不能取 0：文件系统/同步盘的时间戳精度不一致（FAT/exFAT 1s、某些网盘 2s），
@@ -99,6 +112,46 @@ def _file_mtime(path: Path) -> float:
         return float(path.stat().st_mtime)
     except OSError:
         return 0.0
+
+
+def _unlink_with_retry(
+    path: Path,
+    *,
+    attempts: int = _UNLINK_RETRIES,
+    base_delay: float = _UNLINK_BACKOFF_BASE,
+) -> Optional[str]:
+    """删除 ``path``；瞬时占用（Windows WinError 32）时退避重试。
+
+    Windows 上另一个进程/线程只要持有该文件的句柄，``unlink`` 就会抛
+    ``PermissionError``（errno 13 / WinError 32）。这种占用绝大多数是
+    **瞬时**的（杀软扫盘、Windows Search 索引器、并发读），退避重试即可解开。
+    直接放弃则会把「移动」变成「复制」，把这一层留给调用方去假装成功就是本次
+    要消灭的缺陷。
+
+    ``FileNotFoundError`` 视为**成功**：目标状态（文件不存在）已经达成 ——
+    「早就没了」不是错误，把它报成失败反而会让调用方拒绝一次实际成功的移动。
+
+    Args:
+        path: 要删除的文件。
+        attempts: 最大尝试次数，``>= 1``。
+        base_delay: 退避基数，第 i 次失败后等待 ``base_delay * 2**i`` 秒。
+
+    Returns:
+        ``None`` 表示删除成功；否则返回含 errno 的失败原因字符串，供调用方
+        **如实上报** —— 调用方必须据此判定本次移动失败。
+    """
+    last_reason = "unknown error"
+    for i in range(max(1, attempts)):
+        try:
+            path.unlink()
+            return None
+        except FileNotFoundError:
+            return None          # 已经不存在 —— 目的已经达到
+        except OSError as e:     # noqa: BLE001 - 需要 errno，不吞
+            last_reason = "errno=%s: %s" % (getattr(e, "errno", None), e)
+            if i < max(1, attempts) - 1:
+                time.sleep(base_delay * (2 ** i))
+    return last_reason
 
 
 def _bigrams(s: str) -> set:
@@ -1341,6 +1394,57 @@ class KnowledgeBase:
                 break
         return out
 
+    def _relocation_blocked(
+        self, note: "_Note", new_path: Path, target_section: str, reason: str,
+    ) -> Dict[str, Any]:
+        """旧笔记删不掉时的失败收尾（见 :meth:`_relocate`）。
+
+        到这里时**新文件已经写好了**，所以第一件事是尽量把现场还原成「只存在于
+        inbox」—— 删掉刚写的副本，让一次失败的 ``approve`` 不留副作用。回滚也
+        失败时（同一篇笔记 inbox 和 notes 各一份 = 重复数据）必须**明说**：
+        调用方要能区分「什么都没发生」和「现在库里有两份」。
+
+        Returns:
+            ``ok=False`` 的结果 dict。带 ``rolled_back`` / ``partial`` /
+            ``stale_path`` 三个字段，让调用方知道现场到底是什么样子，而不是拿到
+            一个孤零零的 False。
+        """
+        logger.error(
+            "[kb] relocate: wrote '%s' but could not remove the original '%s' "
+            "(%s) — attempting rollback", new_path, note.path, reason)
+
+        rolled_back = _unlink_with_retry(new_path) is None
+        if rolled_back:
+            return {
+                "ok": False,
+                "error": (
+                    "could not move '%s' to %s: original still in inbox (%s); "
+                    "rolled back, the note is untouched in inbox"
+                    % (note.title, target_section, reason)),
+                "title": note.title,
+                "rolled_back": True,
+                "partial": False,
+                "stale_path": self._rel(note.path),
+            }
+
+        logger.error(
+            "[kb] relocate: ROLLBACK FAILED — '%s' now exists in BOTH inbox and "
+            "%s; manual cleanup required", note.path.name, target_section)
+        return {
+            "ok": False,
+            "error": (
+                "could not move '%s' to %s: original still in inbox (%s); "
+                "rollback ALSO failed, so the note now exists in BOTH places "
+                "(%s and %s) — remove one copy manually to avoid duplicates"
+                % (note.title, target_section, reason,
+                   self._rel(note.path), self._rel(new_path))),
+            "title": note.title,
+            "rolled_back": False,
+            "partial": True,
+            "stale_path": self._rel(note.path),
+            "new_path": self._rel(new_path),
+        }
+
     def _relocate(
         self,
         title: str,
@@ -1350,6 +1454,13 @@ class KnowledgeBase:
         """把 inbox 笔记移到 target_section（改 frontmatter + 移文件 + 更新索引）。
 
         仅允许从 ``inbox`` 移出；目标已存在同名文件时拒绝（不覆盖）。
+
+        旧笔记删不掉时返回 ``ok=False``（详见 :meth:`_relocation_blocked`）。
+        历史上这一步只 ``logger.warning`` 然后照常 ``ok=True`` —— 于是 Windows
+        上文件被别的线程/进程打开（WinError 32）时，``approve`` 报告成功、旧文件
+        却留在 inbox，笔记**同时存在于 inbox 和 notes**。重复数据是真实产品缺陷，
+        而调用方毫不知情：把一次没做完的移动说成成功，正是本项目一直在清的那种
+        静默失败。
         """
         for note in self._iter_notes():
             if note.title != title and note.path.stem != title:
@@ -1376,10 +1487,10 @@ class KnowledgeBase:
             body = note.body
             _vault.write_note(new_path, meta, body)
             if new_path != note.path:
-                try:
-                    note.path.unlink()
-                except OSError as e:  # noqa: BLE001
-                    logger.warning("unlink old note failed for %s: %s", note.path, e)
+                reason = _unlink_with_retry(note.path)
+                if reason is not None:
+                    return self._relocation_blocked(
+                        note, new_path, target_section, reason)
 
             idx = self._index_get()
             idx.delete(self._rel(note.path))
