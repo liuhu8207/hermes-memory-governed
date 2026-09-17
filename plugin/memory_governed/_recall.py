@@ -63,6 +63,55 @@ L3_RECALL_ROLES: tuple = ("user", "assistant")
 _RECALL_KB_POOL_FACTOR: int = 10
 _RECALL_KB_POOL_MIN: int = 30
 
+#: 项目作用域生效时，向量检索的候选放大倍数（仅在 `where` 预过滤不可用时使用）。
+#:
+#: LanceDB 的 `search().where(..., prefilter=True)` 是**先过滤再取 top-N**，
+#: 与 CLI 的全表扫描语义完全一致，所以正常情况下不需要放大。只有在 prefilter
+#: 不可用（旧版 LanceDB）时，才退化为「多取候选 → Python 侧过滤 → 截断」：
+#: 此时放大倍数越小，越可能因为其它项目的行占满名额而漏掉本项目的行。
+_L2_SCOPE_OVERFETCH: int = 5
+
+
+def _project_of(row: Any) -> str:
+    """行里的 project 归一成 ``str``；NULL / 空 → ``""``（= 全局事实）。"""
+    value = row.get("project") if hasattr(row, "get") else None
+    return str(value) if value else ""
+
+
+def l2_project_allows(scope: Optional[str], row_project: Any) -> bool:
+    """行级项目过滤，语义与 ``memory_cli.recall_l2`` 一致。
+
+    CLI 的原文是 ``if project and pj and pj != project: continue`` —— 也就是
+    「保留本项目 **+** 全局（``project IS NULL``）」：笔记本里的通用知识
+    （"SecretStore 跑在 NAS 上"）在任何项目下问都成立，而**别的项目**的事实
+    才是必须挡住的。这里刻意复用同一套语义而不是另发明一套，否则同一个问题
+    在 CLI 与插件两条读路径上又会得出两个答案 —— 那正是本次要修的缺陷本身。
+
+    三态：
+        * ``scope is None`` —— 不过滤（向后兼容，行为与修复前一致）
+        * ``scope == ""`` —— 只看全局（CLI 读路径表达不出的那个取值）
+        * 其它 —— 该项目 + 全局
+    """
+    if scope is None:
+        return True
+    pj = str(row_project) if row_project else ""
+    if not scope:
+        return not pj
+    return not pj or pj == scope
+
+
+def l2_project_where(scope: str) -> str:
+    """把作用域翻成 LanceDB 的 ``where`` 谓词（配 ``prefilter=True`` 用）。
+
+    单引号按 SQL 字面量转义（``'`` → ``''``），与 ``_kb._sql_literal`` 同一套
+    规矩：项目名来自目录名，虽然通常很干净，但不能让一个含引号的目录名把谓词
+    拼坏。
+    """
+    if not scope:
+        return "project IS NULL"
+    literal = "'" + str(scope).replace("'", "''") + "'"
+    return f"project IS NULL OR project = {literal}"
+
 
 def layer_score_floor(layer: str, recall_cfg=None, *,
                       l2_min_score: "float | None" = None) -> float:
@@ -189,6 +238,9 @@ class RecallEngine:
         self._l4_cache: Optional[str] = None
         self._l4_cache_time: float = 0
         self._l2_store = None  # Lazy-loaded LanceDB
+        #: 最近一次 L2 检索实际生效的项目作用域（``None`` = 未过滤）。
+        #: 供调用方/诊断读取：作用域生效这件事必须可观测，不能只是静默过滤。
+        self.last_l2_scope: Optional[str] = None
         self._embed_fn = None  # Lazy-loaded embedding function
         self._embed_model = None  # Lazy-loaded SentenceTransformer
         self._embed_service: Optional[EmbeddingService] = None
@@ -272,13 +324,25 @@ class RecallEngine:
 
     # -- L2: Semantic search (LanceDB) -------------------------------------
 
-    def _search_l2(self, query: str) -> List[RecallResult]:
+    def _search_l2(self, query: str, project: Optional[str] = None) -> List[RecallResult]:
         """Search L2 semantic memory.
 
         Strategy:
         - If LanceDB + embedding model available: vector search
         - If LanceDB available but no embedding: FTS-like text scan
         - If LanceDB not available: return empty (L2 disabled)
+
+        Args:
+            project: 项目作用域，三态见 :func:`l2_project_allows`
+                （``None`` = 不过滤 / ``""`` = 只看全局 / ``"名字"`` = 该项目+全局）。
+                调用方通常传 ``config.recall.project_scope``；默认 ``None``
+                保持修复前的行为不变。
+
+        作用域生效时会留下可观测痕迹（缺了这一条，就只是把「两套答案」换成
+        「一套答案但没人知道被过滤过」）：
+        - ``self.last_l2_scope`` 记下这次实际生效的作用域；
+        - 每条命中的 ``metadata["project"]`` 带上它自己的归属（全局行不带）；
+        - 有过滤时打一条 ``logger.info``。
         """
         try:
             # 双重检查锁懒初始化：冷启动并发时只加载一次嵌入模型。
@@ -291,48 +355,91 @@ class RecallEngine:
             if self._l2_store is None:
                 return []
 
+            self.last_l2_scope = project
+            if project is not None:
+                logger.info("L2 recall narrowed to project scope %r "
+                            "(globals always included)", project)
+
             # Try vector search first (requires embedding model)
             if self._embed_fn is not None:
-                return self._search_l2_vector(query)
+                return self._search_l2_vector(query, project)
 
             # Fallback: scan table for text matches (slow but works)
-            return self._search_l2_text(query)
+            return self._search_l2_text(query, project)
 
         except Exception as e:
             logger.debug("L2 search failed: %s", e)
             return []
 
-    def _search_l2_vector(self, query: str) -> List[RecallResult]:
-        """L2 vector search using embedding model."""
+    def _search_l2_vector(self, query: str,
+                          project: Optional[str] = None) -> List[RecallResult]:
+        """L2 vector search using embedding model.
+
+        ``project`` 非 ``None`` 时按项目过滤，语义与 CLI 一致（本项目 + 全局）。
+        优先用 ``where(..., prefilter=True)``：LanceDB 在**取 top-N 之前**过滤，
+        因此「先过滤再排名」与 CLI 的全表扫描完全等价。若当前 LanceDB 版本
+        不支持（抛异常），退回「多取候选 → Python 侧过滤」，并记一条 degraded
+        说明 —— 静默降级成一个可能漏结果的近似实现，比不降级更糟。
+        """
         try:
             query_vec = self._embed_fn(query)
+            search = (self._l2_store.search(query_vec)
+                      .metric("cosine"))
+            limit = int(self._config.recall.l2_max_results)
+            prefilt = None
+            if project is not None:
+                try:
+                    search = search.where(l2_project_where(project), prefilter=True)
+                    prefilt = "where"
+                except Exception as e:  # noqa: BLE001 — 旧版 LanceDB 没有 prefilter
+                    prefilt = "post"
+                    limit = limit * _L2_SCOPE_OVERFETCH
+                    log_degraded(
+                        "l2",
+                        "project_prefilter_unsupported",
+                        detail=f"{type(e).__name__}: {e}; "
+                               f"falling back to over-fetch x{_L2_SCOPE_OVERFETCH} "
+                               f"then filtering in Python",
+                    )
             # metric 必须显式指定 cosine：LanceDB 默认是 L2 欧氏距离，其量纲与
             # distance_to_score() 的 [0, 2] 假设不符（旧 P0 的根因之一）。
-            results = (
-                self._l2_store.search(query_vec)
-                .metric("cosine")
-                .limit(self._config.recall.l2_max_results)
-                .to_list()
-            )
-            return [
-                RecallResult(
+            results = search.limit(limit).to_list()
+
+            out: List[RecallResult] = []
+            for r in results:
+                if project is not None and prefilt == "post" \
+                        and not l2_project_allows(project, r.get("project")):
+                    continue
+                meta = {"category": r.get("category", ""),
+                        "source_rowid": r.get("source_rowid")}
+                pj = _project_of(r)
+                if pj:
+                    meta["project"] = pj
+                if project is not None:
+                    meta["project_scope"] = project
+                out.append(RecallResult(
                     layer="l2",
                     content=r.get("content", ""),
                     # 余弦距离 → 相关性分数的唯一换算入口（见 distance_to_score
                     # 的 P0 说明）。_distance 缺失时按正交兜底（score = 0.5）。
                     score=row_to_score(r),
                     source="lance",
-                    metadata={"category": r.get("category", ""),
-                              "source_rowid": r.get("source_rowid")},
-                )
-                for r in results
-            ]
+                    metadata=meta,
+                ))
+                if len(out) >= int(self._config.recall.l2_max_results):
+                    break
+            return out
         except Exception as e:
             logger.debug("L2 vector search failed: %s", e)
             return []
 
-    def _search_l2_text(self, query: str) -> List[RecallResult]:
-        """L2 text fallback: scan all rows for substring matches."""
+    def _search_l2_text(self, query: str,
+                        project: Optional[str] = None) -> List[RecallResult]:
+        """L2 text fallback: scan all rows for substring matches.
+
+        ``project`` 非 ``None`` 时在同一趟扫描里按项目过滤 —— 这里本来就是
+        全表扫描，过滤不增加任何成本，语义与向量路径（以及 CLI）一致。
+        """
         try:
             table = self._l2_store.to_arrow()
             if table.num_rows == 0:
@@ -341,19 +448,29 @@ class RecallEngine:
             content_col = table.column("content").to_pylist()
             has_ref = "source_rowid" in table.column_names
             ref_col = table.column("source_rowid").to_pylist() if has_ref else [None] * table.num_rows
+            has_pj = "project" in table.column_names
+            pj_col = table.column("project").to_pylist() if has_pj else [None] * table.num_rows
             query_lower = query.lower()
             results = []
             for i, content in enumerate(content_col):
+                if project is not None and not l2_project_allows(project, pj_col[i]):
+                    continue
                 if query_lower in content.lower():
                     # Score: more matches = higher score
                     match_count = content.lower().count(query_lower)
                     score = min(0.5 + match_count * 0.1, 1.0)
+                    meta = {"row": i, "source_rowid": ref_col[i]}
+                    pj = _project_of({"project": pj_col[i]}) if has_pj else ""
+                    if pj:
+                        meta["project"] = pj
+                    if project is not None:
+                        meta["project_scope"] = project
                     results.append(RecallResult(
                         layer="l2",
                         content=content,
                         score=score,
                         source="lance",
-                        metadata={"row": i, "source_rowid": ref_col[i]},
+                        metadata=meta,
                     ))
             # Sort descending by score (more matches first)
             results.sort(key=lambda r: r.score, reverse=True)
@@ -724,7 +841,7 @@ class RecallEngine:
         )
         try:
             futures = {
-                pool.submit(self._search_l2, query): "l2",
+                pool.submit(self._search_l2, query, self.l2_scope()): "l2",
                 pool.submit(self._search_l3, query): "l3",
                 pool.submit(self._get_l4_result): "l4",
                 pool.submit(self._search_kb, query): "kb",
@@ -769,9 +886,15 @@ class RecallEngine:
     def _sequential_recall(self, query: str) -> List[RecallResult]:
         """Fallback sequential recall when thread pool is unavailable."""
         results: List[RecallResult] = []
+        scope = self.l2_scope()
         for fn in (self._search_l2, self._search_l3, self._get_l4_result, self._search_kb):
             try:
-                r = fn(query) if fn != self._get_l4_result else fn()
+                if fn == self._get_l4_result:
+                    r = fn()
+                elif fn == self._search_l2:
+                    r = fn(query, scope)
+                else:
+                    r = fn(query)
                 if isinstance(r, list):
                     results.extend(r)
                 elif isinstance(r, RecallResult):
@@ -780,6 +903,17 @@ class RecallEngine:
                 logger.debug("Sequential recall layer failed: %s", e)
         results.sort(key=lambda r: r.score, reverse=True)
         return results
+
+    def l2_scope(self) -> Optional[str]:
+        """当前生效的 L2 项目作用域（``config.recall.project_scope``）。
+
+        抽成方法而不是各处直接读属性：配置段缺失 / 属性不存在时都退回 ``None``
+        （不过滤），保证旧配置与替身对象的行为与修复前一致。
+        """
+        recall_cfg = getattr(self._config, "recall", None)
+        if recall_cfg is None:
+            return None
+        return getattr(recall_cfg, "project_scope", None)
 
     def _search_kb(self, query: str) -> List[RecallResult]:
         """知识库提示通道（layer="kb"）。

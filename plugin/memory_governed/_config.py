@@ -13,6 +13,7 @@ import os
 import re
 from dataclasses import dataclass, field
 from pathlib import Path
+from typing import Dict, Optional
 
 logger = logging.getLogger(__name__)
 
@@ -39,6 +40,27 @@ class RecallConfig:
     #: 标定依据（2026-09-16，L2=29 条）：无关查询 top1 0.731~0.741，
     #: 相关查询 top1 0.782~0.912 → 0.76 是两者之间唯一的干净切点。
     l2_min_score: float = 0.0
+    #: L2 检索的**项目作用域**，三态：
+    #:
+    #: * ``None``（不设，默认）—— 不过滤，看得到所有项目的事实（历史行为不变）
+    #: * ``""`` —— 只看全局事实（``project IS NULL``）
+    #: * ``"名字"`` —— 该项目 **+** 全局事实，看不到别的项目
+    #:
+    #: 为什么需要它（P0，2026-09-17）：``project`` 维度此前只装在 CLI 的一条读
+    #: 路径（``memory_cli.py`` 的 ``search_l2`` / ``recall_l2``）上，而 Hermes
+    #: 插件走 ``_recall.py`` —— 同一份存储、两个入口、两套答案：插件会把所有
+    #: 项目的事实一锅端注入上下文。
+    #:
+    #: 行级过滤语义与 CLI 完全一致（``project and pj and pj != project`` →
+    #: 保留本项目 + 全局）。唯一的差异：CLI 的 ``project=""`` 表示「不缩小」，
+    #: 读路径上无法表达「只看全局」；这里把 ``""`` 定为「只看全局」，因为它
+    #: 是三态里唯一能表达该意图的取值。
+    #:
+    #: **注意仍存在的缺口**：插件的写入路径（本地事实抽取）按设计不给事实
+    #: 打 ``project``（见 ``_sync.L2_PROVENANCE_COLUMNS`` 的说明），所以插件
+    #: 自己抽出来的事实全是全局的 —— 作用域能挡住别的项目经 CLI 写入的事实，
+    #: 但挡不住别的项目会话里抽出的事实。
+    project_scope: Optional[str] = None
 
 
 @dataclass
