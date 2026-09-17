@@ -61,6 +61,12 @@ FACTS = [
      "agent": "unattributed", "timestamp": 500},
     {"content": "key太麻烦了，我希望有一个能让你读取，但又安全的办法",
      "agent": "unattributed", "timestamp": 600},
+    # The real fact that kept being injected every turn — see
+    # TestSelfReinforcement. Its terms (governed / hgm / memory) are exactly the
+    # ones the hook's own previous injection contains.
+    {"content": "satellite-memory-a 是 DSH 的独立记忆插件，通过 execFile 调用 "
+                "HGM 的 memory_cli.py，不直接读写 LanceDB",
+     "agent": "workbuddy", "timestamp": 700},
 ]
 
 
@@ -205,6 +211,57 @@ class TestTheCalibrationFoundThese:
         the module docstring as the price of the design.
         """
         assert hook.match("解释一下什么是反向代理", FACTS) != []
+
+
+class TestCleanPrompt:
+    """``payload["prompt"]`` is not the user's text, and matching proved it."""
+
+    def test_a_plain_prompt_is_untouched(self):
+        assert hook.clean_prompt("怎么免密登录") == "怎么免密登录"
+
+    def test_host_reminder_blocks_are_stripped(self):
+        raw = ("今天天气怎么样\n\n<system-reminder>\n"
+               "### 共享记忆里的相关事实（HGM · L2）\n- 某条事实\n"
+               "</system-reminder>\n")
+        assert "今天天气怎么样" in hook.clean_prompt(raw)
+        assert "某条事实" not in hook.clean_prompt(raw)
+
+    def test_our_own_injection_is_stripped(self):
+        raw = hook.build_context(hook.match("怎么免密登录", FACTS)) + "\n今天天气怎么样"
+        cleaned = hook.clean_prompt(raw)
+        assert "共享记忆里的相关事实" not in cleaned
+        assert "今天天气怎么样" in cleaned
+
+    def test_empty_stays_empty(self):
+        assert hook.clean_prompt("") == ""
+        assert hook.clean_prompt(None) == ""
+
+    def test_a_prompt_that_is_only_scaffolding_yields_nothing(self):
+        raw = "<system-reminder>\n一些宿主附加内容\n</system-reminder>"
+        assert hook.clean_prompt(raw) == ""
+
+
+class TestSelfReinforcement:
+    """The loop the run log exposed, and the reason this class exists.
+
+    Every turn injected the same two facts. The terms that matched them —
+    ``governed`` / ``hgm`` / ``memory`` — appear in this hook's *own* previous
+    output, which the host puts back into ``prompt``. So the matcher was reading
+    its own answer and confirming it, and no amount of re-calibrating the gate
+    would have shown it: the gate was working exactly as designed on text the
+    user never wrote.
+    """
+
+    def test_a_neutral_question_with_a_pasted_injection_does_not_match(self):
+        raw = ("今天天气怎么样\n\n"
+               + hook.build_context(hook.match("governed hgm memory", FACTS)))
+        assert hook.match(hook.clean_prompt(raw), FACTS) == [], (
+            "宿主的脚手架被当成了提问内容 —— 匹配器在读自己的输出")
+
+    def test_the_same_question_matches_once_the_scaffolding_is_cleaned_away(self):
+        """Guards against fixing this by making the gate blunter than it needs."""
+        assert hook.match(hook.clean_prompt("satellite-memory-a 是怎么接进来的"),
+                          FACTS) != []
 
 
 class TestRunLog:

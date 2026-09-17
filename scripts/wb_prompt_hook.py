@@ -52,6 +52,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import sys
 from pathlib import Path
 
@@ -139,6 +140,40 @@ def _is_function_bigram(term: str) -> bool:
     if term.isascii() or len(term) != 2:
         return False
     return term[0] in FUNCTION_CHARS
+
+
+#: Blocks the host wraps its own additions in. Matching must not see them: they
+#: are not what the user asked, and one of them is this hook's **own output**.
+#:
+#: Measured 2026-09-17 from the run log, which is why the log exists. A message
+#: whose visible text was 11 characters arrived with ``prompt`` of length 17; a
+#: touch earlier, a run carried length 991. Two consequences, both observed:
+#: the matcher judged text the user never wrote, and — because a previous
+#: injection is part of that text — it kept matching the same two facts every
+#: turn off terms like ``governed`` / ``hgm`` / ``memory`` that came from its
+#: own last answer. A matcher that reads its own output is a feedback loop.
+_HOST_BLOCK_RE = re.compile(r"<[a-zA-Z_][\w:-]*(?:\s[^>]*)?>.*?</[a-zA-Z_][\w:-]*>",
+                            re.S)
+
+#: This hook's own injection, in case the host returns it inside ``prompt``
+#: rather than as a separate block. Matched on the header and the trailing
+#: disclaimer so the whole thing goes, not just its first line.
+_OWN_BLOCK_RE = re.compile(
+    r"###\s*共享记忆里的相关事实[^\n]*\n(?:.*\n)*?>[^\n]*自动匹配[^\n]*", re.S)
+
+
+def clean_prompt(prompt: str) -> str:
+    """The part of ``prompt`` that the user actually typed.
+
+    Returns ``""`` when nothing is left, which the caller treats as "no match"
+    — the right answer for a turn that carried only host scaffolding.
+    """
+    text = str(prompt or "")
+    if not text:
+        return ""
+    text = _HOST_BLOCK_RE.sub(" ", text)
+    text = _OWN_BLOCK_RE.sub(" ", text)
+    return re.sub(r"\s+", " ", text).strip()
 
 
 def snapshot_file() -> Path:
@@ -311,15 +346,20 @@ def log_run(event: str, session: str, note: str) -> None:
 
 def main() -> int:
     payload = read_payload()
-    prompt = str(payload.get("prompt") or "")
+    raw_prompt = str(payload.get("prompt") or "")
+    # Judge only what the user typed — see clean_prompt(). Feeding the host's
+    # scaffolding back in is what made every turn match the same two facts.
+    prompt = clean_prompt(raw_prompt)
     facts, problem = load_snapshot(snapshot_file())
     matches = match(prompt, facts) if facts else []
     context = build_context(matches)
 
-    # Recorded before printing: if the write itself fails the print still
-    # happens, and if the print fails the record of the attempt survives.
+    # Both lengths are logged: the gap between them is the host scaffolding, and
+    # watching that gap is how the feedback loop was found. If raw_len keeps
+    # growing while clean_len stays flat, the scaffolding is accumulating.
     log_run("prompt", str(payload.get("session_id") or ""),
-            f"prompt_len={len(prompt)} facts={len(facts)} matched={len(matches)} "
+            f"raw_len={len(raw_prompt)} clean_len={len(prompt)} "
+            f"facts={len(facts)} matched={len(matches)} "
             f"injected={len(context)} problem={problem or '-'}")
 
     out = {
