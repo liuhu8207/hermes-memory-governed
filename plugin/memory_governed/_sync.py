@@ -215,6 +215,11 @@ _FACT_SIGNALS_ZH = (
     "决定", "确定", "采用", "使用", "选择", "改为", "方案", "原因", "结论",
     "约定", "规则", "注意", "记住", "以后", "计划", "打算", "目标是",
     "必须", "不能", "禁止", "偏好", "喜欢", "讨厌", "命名", "规范",
+    # Moved here from the STRONG table 2026-09-17 (see the rationale on
+    # `_FACT_SIGNALS_USER_ZH`). Ranking-only by construction: this list is read
+    # solely in the `strong_only=False` branch, so the generic word list ranks
+    # and never decides admission — the project invariant.
+    "我的", "我在", "太麻烦",
 )
 _FACT_SIGNALS_EN = (
     "prefer", "always", "never", "decided", "decide", "will use", "we use",
@@ -228,14 +233,47 @@ _FACT_SIGNALS_EN = (
 _USER_SIGNAL_WEIGHT = 2
 _SOFT_SIGNAL_WEIGHT = 1
 
-# First-person user statements — the core payload of a memory system.
-# "我需要/我一般/太麻烦/必须/不能/否则" encode constraints and preferences that
-# stay true across sessions, so they must outrank generic prose when the
-# per-turn cap bites.
+# First-person user statements that COMMIT to something — the core payload of a
+# memory system. "我需要/必须/不能/否则" encode constraints and preferences that
+# stay true across sessions, so they carry a full signal weight and may decide
+# admission on their own.
+#
+# High-frequency first-person FUNCTION words moved OUT of this table
+# (2026-09-17): 我的 / 我在 / 太麻烦. They are among the commonest tokens in
+# Chinese prose, and once one token was worth the whole external threshold each
+# became a skeleton key — "我的天哪" / "我在干嘛呢" / "太麻烦了" were admitted as
+# facts. Same category error as the earlier "我不" bypass: an admission table
+# must hold COMMITMENTS, not tokens that merely happen to be frequent. They now
+# live in the ranking-only `_FACT_SIGNALS_ZH` list, where frequency is exactly
+# what you want — they lift a sentence when the per-turn cap bites and decide
+# nothing.
+#
+# Kept here after review: each still needs corroboration to pass the external
+# gate (see the tiers below), but each asserts *whose* or *how* something is
+# configured rather than merely that the speaker exists —
+#    我想要 / 我一般 / 我家里 / 我装 / 我用的
+# "我家里用的是软路由+策略服务A" is a deployment fact; "我在" (an aspect marker) is not.
 _FACT_SIGNALS_USER_ZH = (
-    "我需要", "我想要", "我一般", "我家里", "我的", "我装", "我在", "我用的",
-    "太麻烦", "必须", "不能", "否则",
+    "我需要", "我想要", "我一般", "我家里", "我装", "我用的",
+    "必须", "不能", "否则",
 )
+
+# First-person MARKERS for the SHAPE rules (2026-09-17).
+#
+# `_FACT_SIGNALS_USER_ZH` used to serve two masters: the strong admission pool
+# AND a "this line carries a first-person marker" test inside
+# `WriteQueue._looks_like_fact` — used to spare a short CJK fragment from the
+# heading rule ("记住我的偏好是深色主题") and to exempt a short assistant reply
+# from the narrator-length rule. Those two jobs pull in opposite directions: the
+# admission pool must hold COMMITMENTS only, while the shape test legitimately
+# wants every first-person marker, including the function words just evicted.
+#
+# So the marker set is kept whole here — identical to the pool as it stood
+# before 2026-09-17, i.e. `_FACT_SIGNALS_USER_ZH + the three evicted words`. It
+# only ever loosens a *shape* check; it can never admit a row, so breadth costs
+# nothing.
+_USER_MARKERS = _FACT_SIGNALS_USER_ZH + ("我的", "我在", "太麻烦")
+
 # Why "我不" is NOT in the pool above (removed 2026-09-16):
 #
 # It weighed 2 — exactly `_EXTERNAL_MIN_SIGNAL` — and the strong-signal branch
@@ -305,11 +343,21 @@ _ROLE_WEIGHTS: Dict[str, int] = {"user": 2, "assistant": -1}
 #   * inline code identifiers (`like_this`)
 # The generic word list still contributes to RANKING, just not to admission.
 #
-# Floors are asymmetric because the role baselines are:
-#   * user      baseline +2 -> must clear 2, i.e. carry a real constraint.
-#   * assistant baseline -1 -> must clear 0, i.e. carry a real signal.
+# These are CONTENT floors (2026-09-17). They used to be expressed *relative to
+# the role baseline* ("user baseline +2 -> must clear 2"), which silently made
+# the baseline a piece of evidence: a user sentence carrying one generic word
+# scored 2 + 2 = 4 and cleared the bar on identity alone. The role prior no
+# longer reaches the gate (see `_fact_signal_score(include_role=...)`), so the
+# floors are now read directly against the sentence's own signals:
+#   * user      -> more than ONE strong unit. A bare generic word scores 2, so
+#                  `> 2` demands real corroboration; a self-sufficient modal
+#                  (我需要 / 必须 / 不能) is admitted separately as a rule in its
+#                  own right. Equivalent to the old intent, minus the padding.
+#   * assistant -> more than a lone decoration (floor 1). A run log decorated
+#                  with one inline identifier scores 1 and must still fail —
+#                  this is the old `content - 1 > 0` restated without the prior.
 _MIN_SIGNAL_USER = 2
-_MIN_SIGNAL_ASSISTANT = 0
+_MIN_SIGNAL_ASSISTANT = 1
 
 #: Agent name recorded on rows this plugin writes itself. Hermes is the only
 #: in-process writer; external agents go through ``memory_cli.py`` and carry
@@ -401,6 +449,52 @@ _EXTERNAL_MIN_STRUCTURE = 2
 #   before  relevant 7/8, constraints 6/6, payload leaked 8/8, structure-hole 3/4
 #   after   relevant 7/8, constraints 6/6, payload leaked 0/8, structure-hole 0/4
 _SELF_SUFFICIENT_SIGNALS = ("我需要", "必须", "不能")
+
+# Polar interrogative frames that MENTION a modal without committing to it
+# (2026-09-17). Chinese marks a yes/no question by embedding the modal in an
+# A-不-A frame ("能不能" = "can, or cannot?") or with 否 ("能否" / "可否"). A bare
+# substring match on _SELF_SUFFICIENT_SIGNALS therefore fired on the QUESTION
+# rather than the commitment: "能不能帮我改一下配置" *contains* "不能" and was
+# admitted as if it asserted a constraint. Measured, all ADMIT before the fix:
+#     能不能帮我改一下配置 / 能不能做成免密 / 这个能不能行 / 我能不能先看看
+# None of them asserts anything — each merely asks. Stripping the frame first
+# restores the distinction the substring test threw away.
+#
+# Ordered longest-first so "可不可以" is consumed before the shorter prefix scan,
+# and so no partial strip can leave a stray "不能" behind.
+_INTERROGATIVE_MODAL_FORMS = (
+    "可不可以", "能不能", "是否能", "行不行", "能否", "可否",
+)
+
+
+def _has_self_sufficient_modal(text: str) -> bool:
+    """True when ``text`` ASSERTS a self-sufficient modal commitment.
+
+    A modal commitment (我需要 / 必须 / 不能) is a rule in its own right — "不能
+    明文存密码" is a rule in seven characters, with nothing else in the sentence
+    to corroborate it. The same characters, however, also appear inside POLAR
+    QUESTIONS, where they commit to nothing: "能不能帮我改一下配置" asks for
+    permission, it does not state a constraint. A plain substring test cannot
+    tell the two apart, so the question frames in
+    :data:`_INTERROGATIVE_MODAL_FORMS` are removed before the modals are sought.
+
+    A genuine constraint never sits inside one of those frames, so stripping is
+    lossless on the positive side: "不能同时写入 — 同一时间只在一个实例操作"
+    keeps its 不能 and is still admitted.
+
+    Args:
+        text: Candidate sentence text (already undecorated by the caller).
+
+    Returns:
+        True when a modal commitment survives the removal of any question frame.
+    """
+    if not text:
+        return False
+    asserted = text
+    for form in _INTERROGATIVE_MODAL_FORMS:
+        asserted = asserted.replace(form, "")
+    return any(s in asserted for s in _SELF_SUFFICIENT_SIGNALS)
+
 
 _EXTERNAL_IP_RE = re.compile(r"\b\d{1,3}(?:\.\d{1,3}){3}\b")
 _EXTERNAL_PATH_RE = re.compile(r"[A-Za-z]:[\\/]|/[\w.-]+/[\w.-]+|`[^`]*\.\w{1,4}`")
@@ -879,7 +973,8 @@ def _undecorate(text: str) -> str:
 
 
 def _fact_signal_score(sentence: str, role: str = "",
-                       *, strong_only: bool = False) -> int:
+                       *, strong_only: bool = False,
+                       include_role: bool = True) -> int:
     """Score how much durable value a sentence carries.
 
     Higher is better. Two consumers:
@@ -893,6 +988,21 @@ def _fact_signal_score(sentence: str, role: str = "",
       identifiers); the generic word list is excluded because it is far too
       easy to hit to serve as a gate.
 
+    Role prior vs. evidence — why ``include_role`` exists (2026-09-17)
+    ---------------------------------------------------------------
+    ``_ROLE_WEIGHTS["user"]`` is ``+2``, exactly ``_MIN_SIGNAL_USER``. When the
+    same call feeds both the ranking key AND the admission gate, that prior is
+    silently promoted into EVIDENCE: a sentence carrying one strong signal
+    scores ``2 + 2 = 4 > 2`` and passes, so a single word decides admission
+    because of WHO said it, not WHAT was said. Measured, a bare
+    "我的天哪" / "我想要不还是算了" cleared the gate on the role padding alone.
+
+    Admission callers therefore pass ``include_role=False`` so the gate sees the
+    content score only — one piece of evidence is not evidence. Ranking callers
+    keep the default ``True``: there the prior is doing its legitimate job
+    (prefer user turns when the per-turn cap bites), and a prior belongs in a
+    sort key.
+
     Args:
         sentence: Candidate fact text.
         role: Role of the originating message (``"user"`` / ``"assistant"``).
@@ -901,6 +1011,8 @@ def _fact_signal_score(sentence: str, role: str = "",
             mostly narration about how the request was fulfilled, so they are
             weighted DOWN. Unknown/empty roles are neutral.
         strong_only: Count only strong signals (see above).
+        include_role: Add the role prior to the score. Leave ``True`` for
+            ranking; pass ``False`` for admission (see above).
 
     Returns:
         An integer that may be negative.
@@ -926,8 +1038,56 @@ def _fact_signal_score(sentence: str, role: str = "",
             break
     if _CODE_IDENT_RE.search(sentence):
         score += _CODE_IDENT_WEIGHT
-    score += _ROLE_WEIGHTS.get(role, 0)
+    if include_role:
+        score += _ROLE_WEIGHTS.get(role, 0)
     return score
+
+
+def dialogue_fact_admits(text: str, role: str = "") -> bool:
+    """The dialogue-path admission gate — ONE definition, two consumers.
+
+    Consumers: :meth:`WriteQueue._extract_atomic_facts` (the write path) and
+    ``scripts/l2_apply_gate.py`` (the replay). Writes and replays must use the
+    same ruler, so the rule lives here instead of in either caller. The caller
+    still owns the shape checks (:meth:`WriteQueue._looks_like_fact`); this only
+    scores and thresholds.
+
+    Rule (2026-09-17): a self-sufficient modal commitment (我需要 / 必须 / 不能)
+    may be admitted alone — it is a rule in its own right. Otherwise the
+    sentence's own CONTENT must clear the floor for its role, or present ONE
+    strong unit CORROBORATED by a named/structural thing. The role prior is
+    deliberately absent: it ranks (see ``_fact_signal_score``'s ``include_role``)
+    but never decides admission.
+
+    The corroboration clause is the external gate's rule restated for dialogue
+    text, and it is load-bearing: without it, removing the role prior would have
+    deleted a whole family of real one-signal facts —
+    "我们决定用 PostgreSQL 因为它更稳定" (one conclusion signal + one identifier),
+    "我家里用的是虚拟机软路由…" (one marker + named hardware), and every
+    "…because…" conclusion. Those carry exactly one strong unit; the old gate let
+    them in on the +2 role baseline, so the baseline was doing the corroboration's
+    job. Now the sentence has to.
+
+    Args:
+        text: Candidate sentence, already known to look like a fact.
+        role: ``"user"`` / ``"assistant"``; anything else is treated as user.
+
+    Returns:
+        True when the sentence may enter L2.
+    """
+    if _has_self_sufficient_modal(text):
+        return True
+    floor = _MIN_SIGNAL_ASSISTANT if role == "assistant" else _MIN_SIGNAL_USER
+    score = _fact_signal_score(text, role, strong_only=True, include_role=False)
+    if score > floor:
+        return True
+    # One strong unit (score == _USER_SIGNAL_WEIGHT) is not evidence by itself;
+    # one unit PLUS a named/structural thing is. `score >= _USER_SIGNAL_WEIGHT`
+    # is implied by the floor for assistants, so this only ever adds the
+    # one-unit case for users — it never loosens the assistant rule.
+    if score >= _USER_SIGNAL_WEIGHT and external_structural_evidence(text) >= 1:
+        return True
+    return False
 
 
 def external_structural_evidence(text: str) -> int:
@@ -1023,8 +1183,10 @@ def external_write_verdict(text: str) -> Tuple[bool, str]:
         return False, "abs_path"
 
     # --- admission: one token is not evidence (see _SELF_SUFFICIENT_SIGNALS) --
-    # A genuine modal commitment is a rule in its own right.
-    if any(s in cleaned for s in _SELF_SUFFICIENT_SIGNALS):
+    # A genuine modal commitment is a rule in its own right. Checked through
+    # `_has_self_sufficient_modal` rather than a bare `in`, so that a POLAR
+    # QUESTION ("能不能…") is not mistaken for the constraint it quotes.
+    if _has_self_sufficient_modal(cleaned):
         return True, "ok"
 
     # Otherwise the text must present _EXTERNAL_MIN_SIGNAL worth of evidence
@@ -1744,13 +1906,12 @@ class WriteQueue:
                 if not self._looks_like_fact(sentence, role):
                     continue
                 # The score is a GATE before it is a ranking key: a sentence
-                # that carries no durable signal must not enter L2 at all.
-                # Without this check assistant run logs flooded the store
-                # (see _MIN_SIGNAL_ASSISTANT for the measurements).
-                admission = _fact_signal_score(sentence, role, strong_only=True)
-                floor = (_MIN_SIGNAL_ASSISTANT if role == "assistant"
-                         else _MIN_SIGNAL_USER)
-                if admission <= floor:
+                # that carries no durable signal must not enter L2 at all
+                # (assistant run logs flooded the store — see
+                # _MIN_SIGNAL_ASSISTANT for the measurements). The gate itself
+                # lives in `dialogue_fact_admits`, shared verbatim with the
+                # replay script so the write path and the replay cannot drift.
+                if not dialogue_fact_admits(sentence, role):
                     continue
                 facts.append({
                     "content": sentence.strip(),
@@ -1885,7 +2046,7 @@ class WriteQueue:
                 and _TITLE_FRAGMENT_RE.match(text)
                 and ":" not in text and "：" not in text
                 and _weighted_len(text) < _TITLE_FRAGMENT_MAX_WEIGHT
-                and not any(marker in text for marker in _FACT_SIGNALS_USER_ZH)):
+                and not any(marker in text for marker in _USER_MARKERS)):
             return False
 
         # --- 2. system noise / politeness / outcome reports -------------
@@ -1936,7 +2097,7 @@ class WriteQueue:
         # --- 7. assistant outcome reports -------------------------------
         if (role == "assistant"
                 and _weighted_len(text) < _ASSISTANT_MIN_WEIGHTED_LEN
-                and not any(marker in text for marker in _FACT_SIGNALS_USER_ZH)):
+                and not any(marker in text for marker in _USER_MARKERS)):
             return False
 
         return True

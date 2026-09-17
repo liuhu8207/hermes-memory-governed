@@ -30,7 +30,14 @@ from plugin.memory_governed._sync import (
     _EXTERNAL_MIN_SIGNAL,
     _EXTERNAL_MIN_STRUCTURE,
     _EXTERNAL_MIN_WEIGHTED_LEN,
+    _FACT_SIGNALS_USER_ZH,
+    _INTERROGATIVE_MODAL_FORMS,
+    _ROLE_WEIGHTS,
     _SELF_SUFFICIENT_SIGNALS,
+    _USER_MARKERS,
+    _fact_signal_score,
+    _has_self_sufficient_modal,
+    dialogue_fact_admits,
     external_named_evidence,
     external_signal_pools,
     external_structural_evidence,
@@ -109,6 +116,28 @@ CHINESE_CONSTRAINTS = [
     "不能把密钥提交进仓库",
     "任何对外接口都必须走鉴权",
 ]
+
+#: Defect A (2026-09-17) — a POLAR QUESTION *mentions* a modal without asserting
+#: it. Chinese marks a yes/no question with an A-不-A frame ("能不能") or 否
+#: ("能否"/"可否"), so `能不能…` literally contains `不能`. A bare substring test
+#: therefore admitted every one of these as if it stated a constraint. Measured:
+#: the first four all ADMIT before the fix.
+POLAR_QUESTIONS = [
+    "能不能帮我改一下配置",
+    "能不能做成免密",
+    "这个能不能行",
+    "我能不能先看看",
+    "是否能用 root 账号登录",
+    "可不可以每周自动备份",
+    "行不行这样配一次就好",
+    "能否直接覆盖原来的配置",
+]
+
+#: Defect C (2026-09-17) — high-frequency first-person FUNCTION words that used
+#: to sit in the admission table. Each is common enough that, once one token was
+#: worth the whole threshold, it became a skeleton key ("我的天哪" / "我在干嘛呢" /
+#: "太麻烦了" were admitted as facts). Evicted to the ranking-only list.
+GENERIC_WORDS_EVICTED = ["我的", "我在", "太麻烦"]
 
 
 class TestExternalWriteGate:
@@ -209,6 +238,18 @@ class TestExternalWriteGate:
         from plugin.memory_governed._sync import _FACT_SIGNALS_USER_ZH
         assert "我不" not in _FACT_SIGNALS_USER_ZH
 
+    def test_the_evicted_generic_words_are_not_in_the_strong_pool(self):
+        """Defect C, pinned at the source (2026-09-17).
+
+        Same shape as the '我不' guard above: 我的 / 我在 / 太麻烦 are among the
+        commonest tokens in Chinese prose and must not decide admission. They
+        may still MARK a line as user-authored for the *shape* rules, which only
+        ever loosens a heading/length check and can never admit a row.
+        """
+        for word in GENERIC_WORDS_EVICTED:
+            assert word not in _FACT_SIGNALS_USER_ZH, word
+            assert word in _USER_MARKERS, word
+
     def test_self_sufficient_set_is_exactly_the_modal_commitments(self):
         """Only modal commitments may admit a row on their own.
 
@@ -221,11 +262,17 @@ class TestExternalWriteGate:
     def test_one_pool_alone_is_exactly_the_old_threshold(self):
         """Documents why one token used to suffice, so the rule reads honestly."""
         assert _EXTERNAL_MIN_SIGNAL == 2
-        assert external_signal_pools("我的天哪") == 1
-        assert external_structural_evidence("我的天哪") == 0
-        assert not external_named_evidence("我的天哪")
+        # One pool is still worth exactly _EXTERNAL_MIN_SIGNAL — which is why a
+        # single token used to clear the bar on its own.
+        assert external_signal_pools("我想要一个能自动同步的方案") == 1
         # "因为这样吧" hits the TECH pool; a bare conjunction is still one pool.
         assert external_signal_pools("因为这样吧") == 1
+        # "我的天哪" no longer hits ANY pool (2026-09-17): 我的/我在/太麻烦 were
+        # evicted, so the canonical "one token == one pool == admission" example
+        # is now a zero-pool input. See `GENERIC_WORDS_EVICTED`.
+        assert external_signal_pools("我的天哪") == 0
+        assert external_structural_evidence("我的天哪") == 0
+        assert not external_named_evidence("我的天哪")
 
     def test_the_two_pools_are_counted_independently(self):
         """Two *kinds* of evidence admit; repetition inside one list does not."""
@@ -251,6 +298,80 @@ class TestExternalWriteGate:
         chatter = "好的，我明白了"
         assert _fact_signal_score(chatter, "user", strong_only=True) >= _EXTERNAL_MIN_SIGNAL
         assert _fact_signal_score(chatter, "", strong_only=True) < _EXTERNAL_MIN_SIGNAL
+
+
+# ---------------------------------------------------------------------------
+# Defect A (2026-09-17) — a question is not a commitment
+# ---------------------------------------------------------------------------
+
+class TestInterrogativeIsNotACommitment:
+    """`能不能…` contains `不能`, so a substring test read the question as a rule."""
+
+    @pytest.mark.parametrize("text", POLAR_QUESTIONS)
+    def test_polar_questions_are_refused_with_a_reason(self, text):
+        admitted, reason = external_write_verdict(text)
+        assert not admitted, f"a question was read as a commitment: {text}"
+        assert reason == "weak_signal"
+
+    def test_every_interrogative_frame_is_stripped(self):
+        for form in _INTERROGATIVE_MODAL_FORMS:
+            assert not _has_self_sufficient_modal(f"你{form}帮我处理一下"), form
+
+    def test_a_real_constraint_is_not_mistaken_for_a_question(self):
+        """The cost side: 不能 inside an ASSERTION is a rule, not an A-不-A frame."""
+        text = "不能同时写入 — 同一时间只在一个实例操作"
+        assert _has_self_sufficient_modal(text)
+        assert external_write_verdict(text)[0]
+
+
+# ---------------------------------------------------------------------------
+# Defect B (2026-09-17) — the role prior ranks, it does not gate
+# ---------------------------------------------------------------------------
+
+class TestRolePriorDoesNotGate:
+    """`_ROLE_WEIGHTS["user"] == +2 == _MIN_SIGNAL_USER`, so when one call feeds
+    both the ranking key and the admission gate the prior is silently promoted
+    into EVIDENCE: one generic word plus the baseline cleared the bar because of
+    WHO said it. Admission callers now pass ``include_role=False``."""
+
+    def test_admission_score_ignores_the_role_prior(self):
+        text = "部署方案确定用 Docker Compose，因为要支持多服务编排"
+        assert _fact_signal_score(text, "user", strong_only=True,
+                                  include_role=False) == (
+            _fact_signal_score(text, "", strong_only=True, include_role=False))
+
+    def test_default_still_applies_the_role_prior_for_ranking(self):
+        """Ranking keeps the prior — a prior belongs in a sort key."""
+        text = "部署方案确定用 Docker Compose，因为要支持多服务编排"
+        base = _fact_signal_score(text)
+        assert _fact_signal_score(text, "user") == base + _ROLE_WEIGHTS["user"]
+        assert _fact_signal_score(text, "assistant") == (
+            base + _ROLE_WEIGHTS["assistant"])
+
+    @pytest.mark.parametrize("text", ["我想要不还是算了", "我的一般做法吧",
+                                      "我家里呢，你懂的"])
+    def test_a_bare_generic_word_no_longer_rides_the_user_baseline(self, text):
+        assert not dialogue_fact_admits(text, "user")
+
+    @pytest.mark.parametrize("text", POLAR_QUESTIONS)
+    def test_polar_questions_do_not_ride_the_user_baseline_either(self, text):
+        assert not dialogue_fact_admits(text, "user")
+
+    def test_one_signal_with_a_named_thing_is_still_corroborated_evidence(self):
+        """The cost side, pinned: single-signal facts must NOT be lost."""
+        assert dialogue_fact_admits("我们决定用 PostgreSQL 因为它更稳定", "user")
+        assert dialogue_fact_admits(
+            "我家里用的是虚拟机软路由，我打算换回硬件路由器", "user")
+
+    def test_a_modal_commitment_is_admitted_alone(self):
+        for text in ("我需要每天都备份", "不能明文存密码",
+                     "不能同时写入 — 同一时间只在一个实例操作"):
+            assert dialogue_fact_admits(text, "user"), text
+
+    def test_a_decorated_run_log_still_fails_the_assistant_floor(self):
+        """Removing the role prior must not loosen the assistant side."""
+        assert not dialogue_fact_admits(
+            "备份在 `config.yaml.bak.before-deepseek-curation`", "assistant")
 
 
 class TestAgentIdentity:

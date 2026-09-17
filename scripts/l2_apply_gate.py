@@ -38,10 +38,8 @@ import lancedb
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from plugin.memory_governed._sync import (  # noqa: E402
-    _MIN_SIGNAL_ASSISTANT,
-    _MIN_SIGNAL_USER,
     WriteQueue,
-    _fact_signal_score,
+    dialogue_fact_admits,
     external_write_verdict,
 )
 
@@ -49,21 +47,24 @@ from plugin.memory_governed._sync import (  # noqa: E402
 def admits(text: str, role: str = "user") -> bool:
     """当前质量门是否会让这条内容进入 L2（按**真实角色**判定）。
 
-    role 影响很大：user 基线 +2、assistant 基线 -1，两边门槛也不同。
-    回填 role 之前这里只能一律按 user 走（偏松，助手叙述会漏删）。
+    role 影响很大：user 与 assistant 的内容门槛不同（`_MIN_SIGNAL_USER` /
+    `_MIN_SIGNAL_ASSISTANT`）。回填 role 之前这里只能一律按 user 走（偏松，
+    助手叙述会漏删）。
 
     ``role == "agent"`` 是外部 agent 经 ``memory_cli.py remember`` 写入的行，
     必须走**同一个** ``external_write_verdict``。否则回放会用对话角色的信号
     门槛去判它们，把靠结构证据进来的行全部误删 —— 例如
     「示例主路由 192.0.2.1 的 SSH 端口是 8022」，信号分 0，但它含 IP /
-    专有名词 / 端口，正是该层要留的东西。写入与回放必须用同一把尺子。
+    专有名词 / 端口，正是该层要留的东西。
+
+    对话角色则走**同一个** ``dialogue_fact_admits`` —— 与 ``_extract_atomic_facts``
+    逐字同源。写入与回放必须用同一把尺子，所以尺子只有一处定义。
     """
     if role == "agent":
         return external_write_verdict(text)[0]
     if not WriteQueue._looks_like_fact(text, role):
         return False
-    floor = _MIN_SIGNAL_ASSISTANT if role == "assistant" else _MIN_SIGNAL_USER
-    return _fact_signal_score(text, role, strong_only=True) > floor
+    return dialogue_fact_admits(text, role)
 
 
 def _default_l2_dir() -> str:
