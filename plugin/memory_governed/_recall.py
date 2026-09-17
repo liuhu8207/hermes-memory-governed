@@ -18,6 +18,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
+from ._persona import persona_only
+
 from ._config import GovernedMemoryConfig
 from ._embedding import EmbeddingService
 
@@ -302,7 +304,19 @@ class RecallEngine:
     # -- L4: Persona (cached, background refresh) ---------------------------
 
     def get_l4(self) -> str:
-        """L4 persona. Cached in memory, refreshed every 30 minutes."""
+        """L4 persona. Cached in memory, refreshed every 30 minutes.
+
+        The generated listings are stripped here, at the single read point, so
+        that **both** consumers are covered at once: ``system_prompt_block`` and
+        the ``score=1.0`` L4 recall result, which is part of every parallel
+        recall. Measured 2026-09-17: ``persona.md`` ends with a dump of all 23 L2
+        facts, so every session opened with 20 of them already in context and
+        nothing for the memory tools to be needed for. See ``_persona.py``.
+
+        Stripping on read, not on write: ``_bridge.py`` skips these same
+        headings when collecting promotion candidates, so the file must keep
+        them — only what an agent is *told* changes here.
+        """
         now = time.time()
         if self._l4_cache is not None and (now - self._l4_cache_time) < 1800:
             return self._l4_cache
@@ -310,7 +324,8 @@ class RecallEngine:
         p = Path(self._config.l4_persona_path)
         if p.exists():
             try:
-                self._l4_cache = p.read_text(encoding="utf-8", errors="replace").strip()
+                raw = p.read_text(encoding="utf-8", errors="replace").strip()
+                self._l4_cache = persona_only(raw)
             except Exception:
                 self._l4_cache = ""
         else:

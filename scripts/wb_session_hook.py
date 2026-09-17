@@ -172,6 +172,12 @@ WHEN_TO_LOOK = """
 #:
 #: The *persona* part (who the user is, what they prefer) is left alone; only
 #: the generated listings are cut.
+#:
+#: This is a deliberate second copy of ``plugin/memory_governed/_persona.py``:
+#: importing that package from a host adapter drags in ``_recall`` and ``_kb``,
+#: and this hook must keep working under a bare interpreter in under a second.
+#: ``tests/test_persona_sections.py`` pins the two lists equal so they cannot
+#: drift apart.
 _DERIVED_PERSONA_SECTIONS = ("## Knowledge Areas", "## Known Facts", "## Stats")
 
 
