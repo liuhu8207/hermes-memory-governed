@@ -389,6 +389,54 @@ class TestKbSearchRefusalIsALoudFailure:
         assert "refused" not in payload
 
 
+# -- P2: one refusal schema -------------------------------------------------
+class TestRefusalSchemaIsUniform:
+    """Refusals used to arrive in two shapes.
+
+    ``kb-add`` / ``kb-search`` answered ``{"ok": false, "error": "refused: ..."}``
+    while ``remember`` answered ``{"ok": false, "reason": ...}`` — so a caller
+    had to know which command it had invoked before it could read its own
+    failure, and any shared handler had to try both keys. Both are now always
+    present and carry the same cause.
+    """
+
+    def test_a_remember_refusal_carries_both_keys(self, store):
+        # No self-sufficient signal and no strong signals: the gate refuses it.
+        out = cli.cmd_remember({}, "你好啊", "dsh")
+        assert out["ok"] is False
+        assert out["error"].startswith("refused:")
+        assert out["error"] == "refused: " + out["reason"]
+
+    def test_a_kb_add_refusal_carries_both_keys(self, store):
+        out = cli.cmd_kb_add(store.cfg, "T", "body", "memory:evil", [], [], None)
+        assert out["ok"] is False
+        assert out["error"].startswith("refused:")
+        assert out["error"] == "refused: " + out["reason"]
+
+    def test_the_refused_prefix_is_not_doubled(self, store):
+        # VaultPathEscape messages are built with the prefix already, so a naive
+        # wrapper would emit "refused: refused: ...".
+        out = cli.cmd_kb_add(store.cfg, "T", "body", "../memory", [], [], None)
+        assert out["ok"] is False
+        assert out["error"].count("refused:") == 1
+        assert not out["reason"].startswith("refused:")
+
+    @pytest.mark.parametrize("argv", [
+        ["kb-add", "T", "body", "--section", "memory:evil"],
+        ["kb-add", "CON", "body", "--section", "notes"],
+        ["remember", "你好啊"],
+    ])
+    def test_every_cli_refusal_carries_both_keys(self, store, monkeypatch,
+                                                 capsys, argv):
+        monkeypatch.setattr(sys, "argv", ["memory_cli.py", *argv])
+        rc = cli.main()
+        payload = json.loads(capsys.readouterr().out)  # raises on a traceback
+        assert rc == 1
+        assert payload["ok"] is False
+        assert payload["error"].startswith("refused:")
+        assert payload["error"] == "refused: " + payload["reason"]
+
+
 # -- P2: a dot-directory is not writable ------------------------------------
 class TestDotDirectoryIsNotWritable:
     """``kb-add --section .git`` was accepted and wrote into ``.git``, but

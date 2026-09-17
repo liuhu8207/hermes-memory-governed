@@ -397,6 +397,31 @@ def read_text(path: str) -> str:
 
 
 # -- L1 / L4 ----------------------------------------------------------------
+def _refusal(reason: str, **extra) -> dict:
+    """Build one refusal payload — both keys, always, with the same cause.
+
+    The CLI used to answer refusals in two shapes: ``{"ok": false, "error":
+    "refused: ..."}`` from the kb commands and ``{"ok": false, "reason": ...}``
+    from ``remember``/``recall``. A caller therefore had to know which command
+    it had invoked before it could read its own failure, and any shared handler
+    had to try both keys. Both are now always present:
+
+    * ``error`` — ``"refused: <cause>"``, the shape the kb commands already
+      returned and that existing callers match on;
+    * ``reason`` — the bare cause, the shape ``remember`` already returned.
+
+    A cause that already carries the ``refused: `` prefix is not double-prefixed,
+    so ``VaultPathEscape`` messages (which are built with it) pass through
+    unchanged.
+    """
+    cause = str(reason)
+    if cause.startswith("refused: "):
+        cause = cause[len("refused: "):]
+    out = {"ok": False, "error": f"refused: {cause}", "reason": cause}
+    out.update(extra)
+    return out
+
+
 def cmd_l1():
     h = hermes_home()
     return {
@@ -1122,12 +1147,10 @@ def cmd_remember(config: dict, text: str, agent: str,
     base = {"agent": agent, "category": category, "admitted": admitted,
             "project": resolved_project}
     if not admitted:
-        base.update({
-            "ok": False,
-            "reason": reason,
-            "hint": ("rewrite it as a concrete statement (name the host, path, "
-                     "version or constraint), or use kb-add to file it as a note"),
-        })
+        base.update(_refusal(
+            reason,
+            hint=("rewrite it as a concrete statement (name the host, path, "
+                  "version or constraint), or use kb-add to file it as a note")))
         return base
 
     if dry_run:
@@ -1139,24 +1162,21 @@ def cmd_remember(config: dict, text: str, agent: str,
     embedding = plugin_module("_embedding").EmbeddingService.get(cfg)
     if not embedding.available:
         # Refusing loudly beats writing a row nothing can ever recall.
-        base.update({
-            "ok": False,
-            "reason": "embedding_unavailable",
-            "detail": embedding.last_error or "embedding backend reported unavailable",
-            "hint": "use kb-add instead — notes do not need an embedding to be found",
-        })
+        base.update(_refusal(
+            "embedding_unavailable",
+            detail=embedding.last_error or "embedding backend reported unavailable",
+            hint="use kb-add instead — notes do not need an embedding to be found"))
         return base
 
     vector = embedding.embed_one(cleaned)
     if vector is None:
-        base.update({"ok": False, "reason": "embedding_failed",
-                     "detail": embedding.last_error})
+        base.update(_refusal("embedding_failed", detail=embedding.last_error))
         return base
 
     table = open_l2_table(cfg)
     if table is None:
-        base.update({"ok": False, "reason": "l2_table_missing",
-                     "detail": "no 'memories' table in " + str(cfg.l2_db_path)})
+        base.update(_refusal("l2_table_missing",
+                             detail="no 'memories' table in " + str(cfg.l2_db_path)))
         return base
 
     if cleaned in _l2_existing_contents(table):
@@ -1182,8 +1202,8 @@ def cmd_remember(config: dict, text: str, agent: str,
     try:
         table.add([row])
     except Exception as e:  # noqa: BLE001 — surface the failure, never mask it
-        base.update({"ok": False, "reason": "write_failed", "detail": str(e)[:300],
-                     "vector_dim": dim})
+        base.update(_refusal("write_failed", detail=str(e)[:300],
+                             vector_dim=dim))
         return base
 
     base.update({"ok": True, "content": cleaned[:600], "vector_dim": dim,
@@ -1611,7 +1631,7 @@ def cmd_kb_add(config: dict, title: str, body: str, section: str,
     """
     for pat in SECRET_PATTERNS:
         if pat.search(body):
-            return {"ok": False, "error": "refused: body looks like it contains a secret"}
+            return _refusal("body looks like it contains a secret")
 
     threshold = float(config.get("kb", {}).get("confidence_threshold", 0.7))
     if confidence is not None:
@@ -1628,21 +1648,20 @@ def cmd_kb_add(config: dict, title: str, body: str, section: str,
         filename = slugify(title) + ".md"
         path = safe_vault_path(subdir, filename)
     except VaultPathEscape as e:
-        return {"ok": False, "error": str(e),
-                "hint": ("--section must name a directory inside the vault; "
-                         "use kb-add with a plain section name such as 'notes'")}
+        return _refusal(str(e),
+                        hint=("--section must name a directory inside the "
+                              "vault; use kb-add with a plain section name "
+                              "such as 'notes'"))
 
     if filename.split(".")[0].lower() in _WIN32_RESERVED_STEMS:
         # Refused rather than renamed: silently writing "_CON.md" would make
         # the note unfindable by the title the caller asked for.
-        return {"ok": False,
-                "error": f"refused: '{filename}' is a reserved device name",
-                "hint": "choose a different title"}
+        return _refusal(f"'{filename}' is a reserved device name",
+                        hint="choose a different title")
     if subdir.exists() and not subdir.is_dir():
         # e.g. --section "notes/seed.md", where a note already owns that name.
-        return {"ok": False,
-                "error": f"refused: '{subdir}' exists and is not a directory",
-                "hint": "pick a different section name"}
+        return _refusal(f"'{subdir}' exists and is not a directory",
+                        hint="pick a different section name")
 
     try:
         subdir.mkdir(parents=True, exist_ok=True)
@@ -1650,10 +1669,9 @@ def cmd_kb_add(config: dict, title: str, body: str, section: str,
         # Last line of defence for anything the checks above did not anticipate
         # (a read-only vault, a name only the driver objects to). A refusal the
         # caller can read beats a traceback it cannot act on.
-        return {"ok": False,
-                "error": (f"refused: cannot create section '{section}': "
-                          f"{type(e).__name__}: {e}")[:300],
-                "hint": "pick a different section name"}
+        return _refusal((f"cannot create section '{section}': "
+                         f"{type(e).__name__}: {e}")[:300],
+                        hint="pick a different section name")
 
     now = time.strftime("%Y-%m-%dT%H:%M:%S", time.localtime())
     existed = path.exists()
@@ -1666,12 +1684,10 @@ def cmd_kb_add(config: dict, title: str, body: str, section: str,
             existing_meta = {}
         owner = note_agent(existing_meta)
         if owner and owner != agent and not overwrite:
-            return {
-                "ok": False,
-                "error": f"note already exists and is owned by '{owner}'",
-                "path": str(path),
-                "hint": "choose a different title, or pass --overwrite to take it over",
-            }
+            return _refusal(
+                f"note already exists and is owned by '{owner}'",
+                path=str(path),
+                hint="choose a different title, or pass --overwrite to take it over")
         created = existing_meta.get("created") or now
 
     # Auto-link concepts, once per concept, without duplicating an existing line.
@@ -1694,9 +1710,8 @@ def cmd_kb_add(config: dict, title: str, body: str, section: str,
     try:
         fd, tmp = tempfile.mkstemp(dir=str(subdir), suffix=".tmp")
     except OSError as e:
-        return {"ok": False,
-                "error": (f"refused: cannot write into '{subdir}': "
-                          f"{type(e).__name__}: {e}")[:300]}
+        return _refusal((f"cannot write into '{subdir}': "
+                         f"{type(e).__name__}: {e}")[:300])
     try:
         with os.fdopen(fd, "w", encoding="utf-8") as f:
             f.write(text)
@@ -1706,9 +1721,8 @@ def cmd_kb_add(config: dict, title: str, body: str, section: str,
             os.unlink(tmp)
         except OSError:
             pass
-        return {"ok": False,
-                "error": (f"refused: cannot write '{path}': "
-                          f"{type(e).__name__}: {e}")[:300]}
+        return _refusal((f"cannot write '{path}': "
+                         f"{type(e).__name__}: {e}")[:300])
     except BaseException:
         try:
             os.unlink(tmp)
