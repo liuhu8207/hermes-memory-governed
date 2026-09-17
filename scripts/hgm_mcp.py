@@ -38,6 +38,7 @@ from __future__ import annotations
 
 import json
 import os
+import subprocess
 import sys
 import traceback
 from pathlib import Path
@@ -342,25 +343,35 @@ def ensure_usable_interpreter() -> None:
     ``_candidate_interpreters`` — so "which interpreter can do this" keeps a
     single definition rather than gaining a second one here.
 
-    ``execv`` rather than a subprocess: the host talks to us over stdin/stdout,
-    and those handles survive the exec, so the client sees one continuous
-    session. A flag in the environment stops a failed attempt from looping; if
-    every candidate fails we carry on and let tool calls report the missing
-    layer, which is visible — unlike silently answering "nothing remembered".
+    ``subprocess`` with inherited stdio, not ``os.execve``: measured 2026-09-17,
+    an ``execve`` into a different interpreter's ``python.exe`` **segfaulted**
+    (exit 139, nothing on stderr) before the handshake — a silent death, the
+    worst possible outcome for a surface the host expects to keep answering.
+    Handing the child our own stdin/stdout instead means the host sees one
+    continuous session, and it is the same approach ``memory_cli``'s own
+    bootstrap has used in production. A flag in the environment stops a failed
+    attempt from looping; if every candidate fails we carry on and let tool
+    calls report the missing layer, which is visible — unlike silently
+    answering "nothing remembered".
     """
     try:
         import memory_cli  # noqa: PLC0415
-        candidates = memory_cli._candidate_interpreters()
+        # Asked in this order on purpose: when nothing is missing (the normal
+        # case) the candidate list is never even built.
         missing = memory_cli._missing_modules()
+        if not missing:
+            return
+        candidates = memory_cli._candidate_interpreters()
     except Exception:  # noqa: BLE001 — no CLI import means nothing to relocate to
         return
-    if not missing or os.environ.get("HGM_MCP_BOOTSTRAPPED") == "1":
+    if os.environ.get("HGM_MCP_BOOTSTRAPPED") == "1":
         return
     try:
         current = Path(sys.executable).resolve()
     except OSError:
         current = None
     log("bootstrap", f"missing={missing} from={current}")
+    script = str(Path(__file__).resolve())
     for cand in candidates:
         target = Path(cand)
         try:
@@ -371,11 +382,13 @@ def ensure_usable_interpreter() -> None:
         env = dict(os.environ)
         env["HGM_MCP_BOOTSTRAPPED"] = "1"
         try:
-            os.execve(str(target),
-                      [str(target), str(Path(__file__).resolve()), *sys.argv[1:]],
-                      env)
+            # No capture_output: the child inherits our stdin/stdout/stderr, so
+            # it talks to the host directly and this process only forwards the
+            # exit code.
+            proc = subprocess.run([str(target), script, *sys.argv[1:]], env=env)
         except OSError:
             continue
+        sys.exit(proc.returncode)
     sys.stderr.write(f"[hgm-mcp] warning: no interpreter with {missing}; "
                      f"store calls will fail visibly\n")
 

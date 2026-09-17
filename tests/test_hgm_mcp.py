@@ -211,3 +211,101 @@ class TestEconomy:
         client.call("hgm_kb_search", {"query": "预热查询"}, msg_id=17)
         elapsed = time.time() - started
         assert elapsed < 2.8, f"常驻进程里单次调用仍要 {elapsed:.2f}s，没享受到常驻的好处"
+
+
+class TestInterpreterBootstrap:
+    """The server calls memory_cli in-process, so *this* interpreter needs LanceDB.
+
+    A host may launch it with any Python, so the server relocates — but the first
+    attempt at that used ``os.execve`` into another interpreter's ``python.exe``
+    and **segfaulted** (exit 139, empty stderr) before the handshake. Silent
+    death is the worst outcome for a surface the host expects to keep answering,
+    so the mechanism is now asserted rather than trusted.
+    """
+
+    @staticmethod
+    def _hook_module():
+        import importlib.util
+        spec = importlib.util.spec_from_file_location("hgm_mcp_under_test", SERVER)
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        return module
+
+    def test_it_does_not_execve(self):
+        """Guards the exact construct that segfaulted, by *call site* not by text.
+
+        Behavioural tests cannot catch this — the failure is an OS-level crash
+        with no Python-level signal, and it only happens on an interpreter that
+        is not the current one. So the construct itself is banned — and banned
+        via AST, because the function's docstring explains the segfault in prose
+        and a substring search would flag the explanation as the offence.
+        """
+        import ast
+        tree = ast.parse(SERVER.read_text(encoding="utf-8"))
+        offenders = [
+            (node.lineno, node.func.attr)
+            for node in ast.walk(tree)
+            if isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Attribute)
+            and node.func.attr in {"execv", "execve", "execl", "execvp"}
+        ]
+        assert not offenders, (
+            f"自举又用回了 os.exec*（第 {offenders} 行）—— 它在本机实测会段错误"
+            f"（退出码 139，stderr 为空）")
+
+    def test_the_relaunch_inherits_stdio(self):
+        """The child must talk to the host directly, or the session breaks."""
+        import ast
+        tree = ast.parse(SERVER.read_text(encoding="utf-8"))
+        for node in ast.walk(tree):
+            if (isinstance(node, ast.Call)
+                    and isinstance(node.func, ast.Attribute)
+                    and node.func.attr == "run"
+                    and isinstance(node.func.value, ast.Name)
+                    and node.func.value.id == "subprocess"):
+                kwargs = {kw.arg for kw in node.keywords}
+                assert not ({"capture_output", "stdout", "stdin"} & kwargs), (
+                    "捕获了子进程输出，宿主就看不到会话了 —— 必须让它继承 stdio")
+
+    def test_it_returns_immediately_when_nothing_is_missing(self, monkeypatch):
+        mod = self._hook_module()
+        import memory_cli
+        called = []
+        monkeypatch.setattr(memory_cli, "_missing_modules", lambda: [])
+        monkeypatch.setattr(memory_cli, "_candidate_interpreters",
+                            lambda: called.append("looked") or [])
+        mod.ensure_usable_interpreter()
+        assert called == [], "没有缺依赖时不应去找别的解释器"
+
+    def test_missing_modules_are_checked_before_candidates(self, monkeypatch):
+        """Order matters: the normal case must not build a candidate list."""
+        mod = self._hook_module()
+        import memory_cli
+        order = []
+        monkeypatch.delenv("HGM_MCP_BOOTSTRAPPED", raising=False)
+        monkeypatch.setattr(memory_cli, "_missing_modules",
+                            lambda: order.append("missing") or ["lancedb"])
+        monkeypatch.setattr(memory_cli, "_candidate_interpreters",
+                            lambda: order.append("candidates") or [])
+        mod.ensure_usable_interpreter()
+        assert order == ["missing", "candidates"], order
+
+    def test_it_gives_up_visibly_when_no_candidate_works(self, monkeypatch, capsys):
+        mod = self._hook_module()
+        import memory_cli
+        monkeypatch.delenv("HGM_MCP_BOOTSTRAPPED", raising=False)
+        monkeypatch.setattr(memory_cli, "_missing_modules", lambda: ["lancedb"])
+        monkeypatch.setattr(memory_cli, "_candidate_interpreters", lambda: [])
+        mod.ensure_usable_interpreter()          # must not raise
+        err = capsys.readouterr().err
+        assert "lancedb" in err, "放弃时要在 stderr 说清楚缺什么，不能静默"
+
+    def test_it_does_not_relaunch_twice(self, monkeypatch):
+        """A broken venv must not become an infinite relaunch loop."""
+        mod = self._hook_module()
+        import memory_cli
+        monkeypatch.setenv("HGM_MCP_BOOTSTRAPPED", "1")
+        monkeypatch.setattr(memory_cli, "_missing_modules", lambda: ["lancedb"])
+        monkeypatch.setattr(memory_cli, "_candidate_interpreters",
+                            lambda: (_ for _ in ()).throw(AssertionError("不该再找候选者")))
+        mod.ensure_usable_interpreter()
