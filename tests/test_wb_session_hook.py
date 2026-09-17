@@ -200,8 +200,22 @@ class TestBuildContext:
         ctx = hook.build_context(L1, WIN_REPO)
         assert "hgm_recall" in ctx         # the tool surface is named…
         assert "hgm_kb_search" in ctx      # …including the knowledge base
-        assert "L1 是只读" in ctx          # and the boundary is stated
+        assert "不可写" in ctx             # the boundary is stated…
         assert "互不感知" in ctx           # WorkBuddy's own memory is separate
+
+    def test_the_boundary_says_it_is_enforced_and_where_to_go(self):
+        """Stating a rule the agent can break is what failed once already.
+
+        Measured 2026-09-17: an agent asked to remember a rule edited L1 directly
+        instead of calling the tool. The wording now names the enforcement and
+        the two sanctioned routes, so a reader cannot conclude that hand-editing
+        is merely discouraged.
+        """
+        ctx = hook.build_context(L1, WIN_REPO)
+        assert "PreToolUse" in ctx, "没有说明会被钩子拦"
+        assert "会被 PreToolUse 钩子直接拒绝" in ctx or "会被拒绝" in ctx
+        assert "hgm_remember" in ctx, "只说了不许，没说该用什么"
+        assert "告诉用户" in ctx, "立规则这条路没有出口"
 
     def test_it_names_the_tools_before_the_cli(self):
         """The instruction is what the agent follows — measured, not assumed.
