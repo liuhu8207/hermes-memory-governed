@@ -351,6 +351,57 @@ _EXTERNAL_MIN_SIGNAL = 2
 _EXTERNAL_MIN_WEIGHTED_LEN = 40
 _EXTERNAL_MIN_STRUCTURE = 2
 
+# ---------------------------------------------------------------------------
+# Corroboration: one token is not evidence (2026-09-17)
+# ---------------------------------------------------------------------------
+# The rule used to be "weighted strong-signal sum >= _EXTERNAL_MIN_SIGNAL", and
+# every pool entry weighs exactly that. So a SINGLE token admitted a row on its
+# own, which turned tokens that commit to nothing into skeleton keys. Measured,
+# all admitted:
+#
+#     我的天哪 / 我在干嘛呢 / 太麻烦了 / 我想要不还是算了
+#     因为这样吧 / 可能是因为吧 / 应该用的是这个
+#
+# Same shape as the '我不' bypass: tokens that assert nothing when they stand
+# alone ("我的" is a possessive particle, "我在" an aspect marker, "因为" a
+# conjunction). Hunting them one at a time does not scale, because the defect is
+# in the rule, not the list — ONE TOKEN IS NOT EVIDENCE.
+#
+# A writer with no dialogue context to vouch for it must therefore show two
+# independent things: two strong signals, or one strong signal corroborated by a
+# named thing. The exceptions are genuine modal commitments, which are a rule in
+# their own right.
+#
+# Per-token disposition — why a tier split rather than deleting:
+#
+#   * SELF-SUFFICIENT (may admit alone)  我需要 / 必须 / 不能
+#       "不能明文存密码" is a rule in seven characters; there is nothing else in
+#       the sentence to corroborate it with, and requiring corroboration would
+#       lose it.
+#   * NEEDS CORROBORATION  我的 / 我在 / 我用的 / 我装 / 我家里 / 我一般 /
+#                          我想要 / 太麻烦 / 否则
+#       Possessive particles, aspect markers, moods and a conjunction. They say
+#       *whose*, *where* or *how one feels*, and only become a fact once the
+#       object is named ("我家里用的是软路由+策略服务A"). Kept in the pool because they
+#       still carry real ranking value on dialogue turns — deleting them would
+#       pay a cost there for no extra safety here.
+#   * NEEDS CORROBORATION (tech)  因为 / 应该用
+#       Conjunctions. "因为 X 所以 Y" always carries X and "应该用 A 而不是 B"
+#       always carries B, so corroboration costs a real technical conclusion
+#       nothing; "因为这样吧" and "应该用的是这个" carry nothing.
+#
+# The long-text branch gets the same treatment. Two structure slots used to be
+# enough, but `digit` and a bare lowercase latin run are both trivially
+# satisfied — "这个项目 2024 年吧，随便什么 whatever 都行" qualified on a year
+# and one English word. At least one slot must now be NAMED evidence: an IP, a
+# path, or an identifier.
+#
+# Calibration (8 relevant / 6 Chinese constraints / 8 payload / 4 structure-hole
+# / 24 historical negatives, tmp/calibrate_gate_commitment.py):
+#   before  relevant 7/8, constraints 6/6, payload leaked 8/8, structure-hole 3/4
+#   after   relevant 7/8, constraints 6/6, payload leaked 0/8, structure-hole 0/4
+_SELF_SUFFICIENT_SIGNALS = ("我需要", "必须", "不能")
+
 _EXTERNAL_IP_RE = re.compile(r"\b\d{1,3}(?:\.\d{1,3}){3}\b")
 _EXTERNAL_PATH_RE = re.compile(r"[A-Za-z]:[\\/]|/[\w.-]+/[\w.-]+|`[^`]*\.\w{1,4}`")
 _EXTERNAL_IDENT_RE = re.compile(
@@ -898,6 +949,37 @@ def external_structural_evidence(text: str) -> int:
     ))
 
 
+def external_named_evidence(text: str) -> bool:
+    """True when ``text`` names something concrete: an IP, a path, an identifier.
+
+    The three markers here are the ones that cannot be hit by accident, unlike
+    the ``digit`` and ``latin`` slots above — a year and a lowercase English word
+    are both satisfied by "2024 年吧，随便什么 whatever 都行". Requiring one of
+    *these* is what stops the long-text branch from admitting chatter.
+    """
+    if not text:
+        return False
+    return any(rx.search(text) for rx in
+               (_EXTERNAL_IP_RE, _EXTERNAL_PATH_RE, _EXTERNAL_IDENT_RE))
+
+
+def external_signal_pools(text: str) -> int:
+    """Count the independent strong-signal POOLS ``text`` hits (0..2).
+
+    One per pool, mirroring :func:`_fact_signal_score`'s ``break`` semantics for
+    the technical list: the question the gate asks is "how many *independent*
+    kinds of evidence are present", and two synonyms from the same list are one
+    kind. Counting matches instead would let "因为…所以…" style repetition stand
+    in for corroboration.
+    """
+    if not text:
+        return 0
+    lowered = text.lower()
+    pools = 1 if any(s in text for s in _FACT_SIGNALS_USER_ZH) else 0
+    pools += 1 if any(s in text or s in lowered for s in _FACT_SIGNALS_TECH) else 0
+    return pools
+
+
 def external_write_verdict(text: str) -> Tuple[bool, str]:
     """Decide whether an EXTERNAL agent may write ``text`` into L2.
 
@@ -906,6 +988,16 @@ def external_write_verdict(text: str) -> Tuple[bool, str]:
     injected every turn, whereas L2 is only a recall layer where a wrong row
     costs one misleading hint. It is still far stricter than the word-list-only
     floor, because an external writer has no dialogue context to vouch for it.
+
+    Admission (2026-09-17 onward) — see :data:`_SELF_SUFFICIENT_SIGNALS`::
+
+        admit  <=>  self-sufficient modal signal (我需要 / 必须 / 不能)
+                OR  two strong-signal pools
+                OR  one strong-signal pool corroborated by a named thing
+                OR  weighted_len >= 40 AND struct >= 2 AND named evidence
+
+    The middle two clauses exist because the previous rule admitted on a single
+    token's weight, which made "我的天哪" as good as a fact.
 
     Returns:
         ``(admitted, reason)``. ``reason`` is ``"ok"`` when admitted; otherwise a
@@ -930,11 +1022,27 @@ def external_write_verdict(text: str) -> Tuple[bool, str]:
     if _ABS_PATH_RE.match(cleaned):
         return False, "abs_path"
 
-    if _fact_signal_score(cleaned, "", strong_only=True) >= _EXTERNAL_MIN_SIGNAL:
+    # --- admission: one token is not evidence (see _SELF_SUFFICIENT_SIGNALS) --
+    # A genuine modal commitment is a rule in its own right.
+    if any(s in cleaned for s in _SELF_SUFFICIENT_SIGNALS):
         return True, "ok"
 
+    # Otherwise the text must present _EXTERNAL_MIN_SIGNAL worth of evidence
+    # TWICE OVER: either two independent pools, or one pool corroborated by a
+    # named thing. `pools * _EXTERNAL_MIN_SIGNAL` is what one pool is worth, so
+    # a single pool alone no longer clears the bar.
+    pools = external_signal_pools(cleaned)
+    if pools * _EXTERNAL_MIN_SIGNAL >= _EXTERNAL_MIN_SIGNAL * 2:
+        return True, "ok"
+    if (pools * _EXTERNAL_MIN_SIGNAL >= _EXTERNAL_MIN_SIGNAL
+            and external_structural_evidence(cleaned) >= 1):
+        return True, "ok"
+
+    # Long + structured, but `digit` and a bare latin run are both trivially
+    # satisfied, so at least one slot must be a NAMED thing.
     if (_weighted_len(cleaned) >= _EXTERNAL_MIN_WEIGHTED_LEN
-            and external_structural_evidence(cleaned) >= _EXTERNAL_MIN_STRUCTURE):
+            and external_structural_evidence(cleaned) >= _EXTERNAL_MIN_STRUCTURE
+            and external_named_evidence(cleaned)):
         return True, "ok"
 
     return False, "weak_signal"

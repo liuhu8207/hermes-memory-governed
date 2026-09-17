@@ -30,6 +30,9 @@ from plugin.memory_governed._sync import (
     _EXTERNAL_MIN_SIGNAL,
     _EXTERNAL_MIN_STRUCTURE,
     _EXTERNAL_MIN_WEIGHTED_LEN,
+    _SELF_SUFFICIENT_SIGNALS,
+    external_named_evidence,
+    external_signal_pools,
     external_structural_evidence,
     external_write_verdict,
 )
@@ -61,6 +64,50 @@ NEGATIVE = [
     "我不知道",
     "我不太确定",
     "我不这么认为",
+    # 单个通用虚词就能过关（2026-09-17）：权重 2 == _EXTERNAL_MIN_SIGNAL，
+    # 所以任何一个词条单独出现就够。它们单独出现时都不作事实承诺。
+    "我的天哪",
+    "我在干嘛呢",
+    "太麻烦了",
+    "我想要不还是算了",
+    "因为这样吧",
+    "可能是因为吧",
+    "应该用的是这个",
+    # 长文本分支的洞：数字 + 任意小写英文串 就凑够「结构证据 2」。
+    "这个项目 2024 年吧，随便什么 whatever 都行",
+    "好像是 2024 那个吧，随便 docker 什么的",
+    "一共有 3 个方案吧，随便 pick 一个",
+]
+
+#: The payloads QA measured as ADMIT before the corroboration rule. Kept as
+#: their own list so the test names them as the regression they are.
+GENERIC_TOKEN_PAYLOADS = [
+    "我的天哪",
+    "我在干嘛呢",
+    "太麻烦了",
+    "我想要不还是算了",
+    "因为这样吧",
+    "可能是因为吧",
+    "应该用的是这个",
+]
+
+#: The same weakness in the long-text branch: two structure slots, both of which
+#: a year and an English filler word satisfy.
+STRUCTURE_SLOT_ABUSE = [
+    "这个项目 2024 年吧，随便什么 whatever 都行",
+    "好像是 2024 那个吧，随便 docker 什么的",
+    "一共有 3 个方案吧，随便 pick 一个",
+]
+
+#: Real Chinese constraints with NO IP / path / identifier / digit / latin at
+#: all. They are why a small set of modal signals may still admit alone —
+#: requiring corroboration from them would delete rules that have nothing to be
+#: corroborated with.
+CHINESE_CONSTRAINTS = [
+    "不能明文存密码",
+    "我需要每天都备份",
+    "不能把密钥提交进仓库",
+    "任何对外接口都必须走鉴权",
 ]
 
 
@@ -110,6 +157,49 @@ class TestExternalWriteGate:
         assert not admitted, f"gate admitted a hedge: {text}"
         assert reason == "weak_signal"
 
+    @pytest.mark.parametrize("text", GENERIC_TOKEN_PAYLOADS)
+    def test_single_generic_token_is_not_evidence(self, text):
+        """One pool entry used to weigh exactly _EXTERNAL_MIN_SIGNAL, so a single
+        token admitted a row. "我的" is a possessive particle, "我在" an aspect
+        marker, "因为" a conjunction — none of them asserts anything alone.
+
+        Same shape as the '我不' bypass, and fixed the same way: the rule now
+        needs two independent pieces of evidence, not one token's weight.
+        """
+        admitted, reason = external_write_verdict(text)
+        assert not admitted, f"gate admitted a token, not a fact: {text}"
+        assert reason == "weak_signal"
+
+    @pytest.mark.parametrize("text", STRUCTURE_SLOT_ABUSE)
+    def test_long_text_branch_needs_named_evidence(self, text):
+        """`digit` and a bare lowercase latin run are trivially satisfied.
+
+        The old long-text branch asked only for two structure slots, so a year
+        plus any English word qualified. At least one slot must now name
+        something: an IP, a path, or an identifier.
+        """
+        admitted, reason = external_write_verdict(text)
+        assert not admitted, f"structure slots were mistaken for evidence: {text}"
+        assert reason == "weak_signal"
+
+    @pytest.mark.parametrize("text", CHINESE_CONSTRAINTS)
+    def test_chinese_constraints_without_any_structure_still_admit(self, text):
+        """The cost side of the corroboration rule, pinned so it stays zero.
+
+        These carry no IP, no path, no identifier, no digit and no latin — the
+        only thing standing behind them is a modal commitment. They are the
+        reason 我需要 / 必须 / 不能 may admit alone.
+        """
+        admitted, reason = external_write_verdict(text)
+        assert admitted, f"a real constraint was dropped: {text} ({reason})"
+
+    def test_corroboration_is_what_admits_a_single_generic_token(self):
+        """Same token, plus a named thing, is a fact — the token was never the
+        problem, the missing corroboration was."""
+        # "我家里" alone is a place, not a fact; with the hardware named it is one.
+        assert not external_write_verdict("我家里")[0]
+        assert external_write_verdict("我家里用的是软路由+策略服务A，打算换回硬件路由器")[0]
+
     def test_the_negation_token_is_not_in_the_strong_pool(self):
         """Pin the fix at the source, not only at the verdict.
 
@@ -118,6 +208,37 @@ class TestExternalWriteGate:
         """
         from plugin.memory_governed._sync import _FACT_SIGNALS_USER_ZH
         assert "我不" not in _FACT_SIGNALS_USER_ZH
+
+    def test_self_sufficient_set_is_exactly_the_modal_commitments(self):
+        """Only modal commitments may admit a row on their own.
+
+        Widening this set is how the original hole would come back: every entry
+        added here becomes a skeleton key for a whole family of sentences that
+        merely *contain* it.
+        """
+        assert set(_SELF_SUFFICIENT_SIGNALS) == {"我需要", "必须", "不能"}
+
+    def test_one_pool_alone_is_exactly_the_old_threshold(self):
+        """Documents why one token used to suffice, so the rule reads honestly."""
+        assert _EXTERNAL_MIN_SIGNAL == 2
+        assert external_signal_pools("我的天哪") == 1
+        assert external_structural_evidence("我的天哪") == 0
+        assert not external_named_evidence("我的天哪")
+        # "因为这样吧" hits the TECH pool; a bare conjunction is still one pool.
+        assert external_signal_pools("因为这样吧") == 1
+
+    def test_the_two_pools_are_counted_independently(self):
+        """Two *kinds* of evidence admit; repetition inside one list does not."""
+        assert external_signal_pools("必须同步 否则不兼容") == 1
+        assert external_signal_pools("应该用 cosine 而不是点积") == 1
+        assert external_signal_pools("报错是因为 total 未定义，必须改成 dict") == 2
+
+    def test_named_evidence_excludes_bare_digits_and_lowercase_latin(self):
+        assert external_named_evidence("示例主路由 192.0.2.1") is True
+        assert external_named_evidence("`rsa.key` 必须同步") is True
+        assert external_named_evidence("mosdns client_proxy_mode=whitelist") is True
+        assert external_named_evidence("2024 年吧 whatever") is False
+        assert external_named_evidence("docker 那个 config") is False
 
     def test_role_user_must_not_be_used(self):
         """Why the gate scores with an empty role.
