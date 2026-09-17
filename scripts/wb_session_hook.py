@@ -158,6 +158,35 @@ WHEN_TO_LOOK = """
 """
 
 
+#: Sections of ``persona.md`` that are a *derived dump* rather than a persona.
+#: The L4 generator appends the whole of L2 to the profile — ``## Known Facts``
+#: is literally described as a dump in ``_sync.py``. Injecting it defeats three
+#: things at once, so it is stripped before injection:
+#:
+#: 1. the tool surface — measured 2026-09-17, 20 of 23 L2 facts were already in
+#:    this injection, so an agent had no reason ever to call ``hgm_recall``;
+#: 2. project isolation — the dump is not filtered by ``project``, so a fact
+#:    scoped to one project reached every session, which is exactly what the
+#:    scope was built to prevent;
+#: 3. roughly 1KB of duplication in every session's context.
+#:
+#: The *persona* part (who the user is, what they prefer) is left alone; only
+#: the generated listings are cut.
+_DERIVED_PERSONA_SECTIONS = ("## Knowledge Areas", "## Known Facts", "## Stats")
+
+
+def _persona_only(text) -> str:
+    """Drop the generated fact listing from ``persona.md``."""
+    if not isinstance(text, str) or not text.strip():
+        return ""
+    cut = len(text)
+    for header in _DERIVED_PERSONA_SECTIONS:
+        at = text.find(header)
+        if at != -1:
+            cut = min(cut, at)
+    return text[:cut].strip()
+
+
 def read_payload() -> dict:
     """Hook payload from stdin. Missing or malformed input is not fatal."""
     try:
@@ -366,7 +395,9 @@ def build_context(l1: dict, cwd: str = "") -> str:
 
     sections = (
         ("手写规则（L1 · 必须遵守）", l1.get("memory_rules_md")),
-        ("用户画像（L4）", l1.get("persona_md")),
+        # persona.md carries a generated dump of every L2 fact; see
+        # _DERIVED_PERSONA_SECTIONS for why that must not be injected.
+        ("用户画像（L4）", _persona_only(l1.get("persona_md"))),
         ("用户自述（L1）", l1.get("user_profile_md")),
     )
     for title, body in sections:

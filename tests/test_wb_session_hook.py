@@ -122,6 +122,54 @@ L1 = {"memory_rules_md": "# Memory Rules\n必须用 schtasks 重启 gateway",
       "persona_md": ""}
 
 
+class TestPersonaDumpIsNotInjected:
+    """L4 appends a dump of every L2 fact; injecting it defeats the tool surface.
+
+    Measured 2026-09-17: 20 of 23 L2 facts were already present in the session
+    injection, because ``persona.md`` ends with ``## Known Facts`` — a listing
+    the plugin's own ``_sync.py`` calls a dump. So an agent had no reason ever to
+    call ``hgm_recall``, and since that listing is not filtered by ``project``,
+    facts scoped to one project reached every session — the exact leak the scope
+    exists to prevent.
+    """
+
+    PERSONA = ("# User Profile\n_Generated: 2026-01-01T00:00:00_\n"
+               "## User\n喜欢结构化输出\n\n"
+               "## Knowledge Areas\n- tech: 2 facts\n\n"
+               "## Known Facts\n- ⚠️ **必须同步 `rsa.key`**\n- 内网地址是 10.0.0.1\n\n"
+               "## Stats\n- Conversations archived: 329\n")
+
+    def test_the_facts_listing_is_stripped(self):
+        out = hook._persona_only(self.PERSONA)
+        assert "Known Facts" not in out
+        assert "rsa.key" not in out
+        assert "Knowledge Areas" not in out
+        assert "Stats" not in out
+
+    def test_the_real_persona_survives(self):
+        out = hook._persona_only(self.PERSONA)
+        assert "喜欢结构化输出" in out
+
+    def test_it_does_not_invent_sections_that_are_absent(self):
+        plain = "# User Profile\n只看这一句"
+        assert hook._persona_only(plain) == plain
+
+    @pytest.mark.parametrize("raw", ["", None, "   "])
+    def test_empty_input(self, raw):
+        assert hook._persona_only(raw) == ""
+
+    def test_build_context_drops_the_dump(self):
+        ctx = hook.build_context({"persona_md": self.PERSONA}, "")
+        assert "用户画像" in ctx          # the section is still there…
+        assert "rsa.key" not in ctx      # …but the dump is not
+        assert "喜欢结构化输出" in ctx
+
+    def test_a_fact_scoped_to_a_project_no_longer_leaks(self):
+        """The isolation half of the same bug: the dump ignored ``project``."""
+        scoped = {"persona_md": self.PERSONA + "\n## Known Facts\n- 只属于某项目的内部地址 10.9.9.9\n"}
+        assert "10.9.9.9" not in hook.build_context(scoped, "")
+
+
 class TestBuildContext:
     def test_project_block_appears_for_a_known_project(self):
         ctx = hook.build_context(L1, WIN_REPO)
