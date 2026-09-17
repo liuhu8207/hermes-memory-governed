@@ -28,10 +28,23 @@ The detected name lands in the L2 ``agent`` column and in the vault note's
 Write channels
 --------------
 * ``kb-add``   — vault note. Governance: rejects secrets; confidence < 0.7
-                 lands in ``inbox/`` for review.
-* ``remember`` — L2 durable fact. Governance: the shared admission gate
-                 (``external_write_verdict``), the same one Hermes applies to
-                 its own extractions. Rejections always carry a reason.
+                 lands in ``inbox/`` for review. **Not** gated by
+                 ``external_write_verdict``: a vault note is a document, not a
+                 durable fact, and it is reviewed by a human rather than
+                 admitted by a gate.
+* ``remember`` — L2 durable fact. Governance: ``external_write_verdict``, the
+                 gate for writes arriving from an *external* agent — which is
+                 what every caller of this CLI is. It is stricter than a bare
+                 word-list, because an external writer has no dialogue context
+                 to vouch for it, and deliberately **looser** than the
+                 bridge/L1 gate, because a wrong L2 row costs one misleading
+                 hint while a wrong L1 row becomes a standing rule injected
+                 every turn. It is therefore not "the same rules Hermes applies
+                 to its own extractions".
+
+Refusals are one shape across every command: ``{"ok": false, "error":
+"refused: <cause>", "reason": "<cause>"}`` — both keys, so a caller does not
+have to know which command it invoked in order to read its own failure.
 
 L1 (``MEMORY.md`` / ``USER.md``) is **human-authored** and is deliberately NOT
 writable from this CLI. No agent may rewrite the standing rules.
@@ -1067,7 +1080,29 @@ def plugin_config():
     return plugin_module("_config").load_governed_config(hermes_home())
 
 
-def open_l2_table(cfg):
+def _l2_schema(dim: int):
+    """The one L2 schema, used when a cold start has to create the table.
+
+    Provenance fields come from ``_sync.l2_provenance_fields()`` — the same
+    source the plugin's own create-table path uses — so a table built here is
+    column-for-column the table the plugin would have built. Hand-writing this
+    list is the incident that already shipped: ``project`` was added to a
+    backfill list but not to the schema, so old tables gained the column and
+    new ones never had it, and nothing failed until an external agent wrote.
+    """
+    import pyarrow as pa
+
+    return pa.schema([
+        pa.field("content", pa.string()),
+        pa.field("category", pa.string()),
+        pa.field("source", pa.string()),
+        pa.field("timestamp", pa.string()),
+        pa.field("vector", pa.list_(pa.float32(), int(dim))),
+        *plugin_module("_sync").l2_provenance_fields(),
+    ])
+
+
+def open_l2_table(cfg, create_dim: int = 0, created: list = None):
     """Open the L2 table, backfilling the sharing columns on a legacy table.
 
     The column list is *not* written here. It comes from
@@ -1077,6 +1112,23 @@ def open_l2_table(cfg):
     list but not to the schema, so old tables gained the column while new ones
     never had it, and every test stayed green because they all ran against a
     table that already had it. One definition, three consumers.
+
+    ``create_dim`` lets a *write* create the table when it does not exist yet,
+    which is the only way a brand new HERMES_HOME can ever be written to: the
+    directory gets made by ``lancedb.connect`` but the table does not, so the
+    first ``remember`` on a fresh store used to fail with ``l2_table_missing``
+    and no external agent could bootstrap its own memory.
+
+    The dimension must be passed in rather than read from config: the caller
+    has just embedded the text and knows the real width, whereas
+    ``config.vector.dim`` is the *local* model default (512) and would not match
+    an API backend (1024) — a mismatch that only shows up later, as rows that
+    cannot be searched.
+
+    ``create_dim <= 0`` (the default) keeps this read-only: ``cmd_agents`` must
+    not conjure a table just because it was asked for a report. ``created`` is
+    an optional sink that receives ``True`` when a table had to be built, so
+    the caller can say so instead of letting a cold start look routine.
     """
     import lancedb
     import pyarrow as pa
@@ -1088,8 +1140,15 @@ def open_l2_table(cfg):
         listing = getattr(listing, "tables", []) or [listing]
     table_names = [t.name if hasattr(t, "name") else str(t) for t in listing]
     if "memories" not in table_names:
-        return None
-    table = db.open_table("memories")
+        if create_dim <= 0:
+            return None
+        table = db.create_table("memories", schema=_l2_schema(create_dim))
+        if created is not None:
+            created.append(True)
+        # A freshly created table already carries every provenance column, so
+        # the backfill below is a no-op for it — it exists for legacy tables.
+    else:
+        table = db.open_table("memories")
     # lancedb takes a pa.Field here (new column, null-filled), NOT a
     # {name: pa.array} mapping — the array form raises TypeError, and when that
     # happens inside a best-effort block the migration fails invisibly.
@@ -1123,9 +1182,20 @@ def cmd_remember(config: dict, text: str, agent: str,
                  project: str = None) -> dict:
     """Admit ``text`` into L2 as a durable fact attributed to ``agent``.
 
-    The gate is the shared one (``external_write_verdict``) — the same rules
-    Hermes applies to its own extractions, so an agent cannot write something
-    Hermes itself would have rejected. A rejection always names its reason;
+    The gate is ``external_write_verdict`` — the one for writes arriving from an
+    *external* agent, which is what every caller of this CLI is. It is stricter
+    than a bare word-list, because an external writer has no dialogue context to
+    vouch for it, and deliberately looser than ``screen_bridge_content``, whose
+    candidates are promoted into L1 where a wrong row becomes a standing rule
+    injected every turn; a wrong L2 row costs one misleading hint instead.
+
+    It is therefore *not* "the same rules Hermes applies to its own
+    extractions", which is what this docstring used to claim — and the two CLI
+    write channels are not gated alike either (``kb-add`` is not admitted here
+    at all): one uniform external gate for L2, and a human review queue for the
+    vault.
+
+    A rejection always names its cause, in ``error`` and in ``reason`` alike;
     nothing is dropped silently.
 
     ``project`` controls attribution, and the three values are deliberately
@@ -1173,11 +1243,21 @@ def cmd_remember(config: dict, text: str, agent: str,
         base.update(_refusal("embedding_failed", detail=embedding.last_error))
         return base
 
-    table = open_l2_table(cfg)
+    # A fresh HERMES_HOME has no 'memories' table yet. Opening read-only here
+    # is what made the CLI unable to bootstrap a new store: the very first
+    # `remember` failed with l2_table_missing. The dimension comes from the
+    # vector we just produced, so a cold-started table matches the backend that
+    # will be searched through it.
+    cold_created: list = []
+    table = open_l2_table(cfg, create_dim=len(vector), created=cold_created)
     if table is None:
         base.update(_refusal("l2_table_missing",
                              detail="no 'memories' table in " + str(cfg.l2_db_path)))
         return base
+    if cold_created:
+        # Said rather than implied: creating the store is an event, and a caller
+        # that bootstrapped a home by accident deserves to see that it did.
+        base["cold_start"] = True
 
     if cleaned in _l2_existing_contents(table):
         base.update({"ok": True, "duplicate": True, "content": cleaned[:600]})

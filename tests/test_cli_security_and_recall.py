@@ -786,6 +786,62 @@ class TestL2SemanticChannel:
         assert parser.parse_args(["recall", "openssl"]).lexical_only is False
 
 
+# -- P2: the CLI can bootstrap a brand new store ----------------------------
+class TestColdStart:
+    """A fresh HERMES_HOME could not be written to at all.
+
+    ``open_l2_table`` returned ``None`` whenever no 'memories' table existed, so
+    the very first ``remember`` on a new store failed with ``l2_table_missing``
+    — lancedb created the *directory* on connect but never the table. The CLI
+    could therefore not bootstrap its own store while the plugin could, which
+    makes every new deployment depend on something else running first.
+    """
+
+    def test_remember_bootstraps_a_fresh_store(self, store, monkeypatch):
+        _install_fake_embedding(monkeypatch)
+        out = cli.cmd_remember(
+            {}, "家用NAS 192.0.2.62 上重度使用 Docker 部署服务", "dsh")
+        assert out["ok"] is True, out
+        assert out.get("cold_start") is True
+
+    def test_the_bootstrapped_table_has_every_provenance_column(
+            self, store, monkeypatch):
+        # A table built by the CLI must be the table the plugin would have
+        # built, or the next backfill has nothing to add and the next write
+        # meets a column it does not have.
+        _install_fake_embedding(monkeypatch)
+        cli.cmd_remember(
+            {}, "家用NAS 192.0.2.62 上重度使用 Docker 部署服务", "dsh")
+        import lancedb
+
+        db = lancedb.connect(str(store.home / "memory" / "l2"))
+        cols = [f.name for f in db.open_table("memories").schema]
+        for col, _ in L2_PROVENANCE_COLUMNS:
+            assert col in cols, cols
+        assert "vector" in cols
+
+    def test_a_second_write_does_not_recreate_the_table(self, store, monkeypatch):
+        # Idempotent: the second call finds the table and must not report a
+        # cold start, nor rebuild it.
+        _install_fake_embedding(monkeypatch)
+        first = cli.cmd_remember(
+            {}, "家用NAS 192.0.2.62 上重度使用 Docker 部署服务", "dsh")
+        second = cli.cmd_remember(
+            {}, "SecretStore 使用 ROCKET_TLS 而不是 SSL_CERT_FILE", "dsh")
+        assert first["ok"] is True, first
+        assert second["ok"] is True, second
+        assert "cold_start" not in second
+
+    def test_a_read_does_not_conjure_a_table(self, store):
+        # open_l2_table stays read-only unless the caller passes a dimension:
+        # `agents` must not create a store just because it was asked to report.
+        cli.cmd_agents(store.cfg)
+        import lancedb
+
+        db = lancedb.connect(str(store.home / "memory" / "l2"))
+        assert "memories" not in [t.name for t in db.list_tables().tables]
+
+
 # -- P1: L2 provenance columns ---------------------------------------------
 class TestL2ProvenanceColumns:
     """``role`` existed in the schema and in cmd_remember but not in the CLI's
