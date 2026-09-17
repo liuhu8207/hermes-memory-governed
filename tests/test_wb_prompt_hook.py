@@ -273,6 +273,53 @@ class TestCleanPrompt:
         cleaned = hook.clean_prompt("memory_cli.py 的 snapshot 子命令是什么")
         assert "memory_cli" in cleaned or "memory" in cleaned
 
+    def test_a_wrapped_message_is_not_deleted(self):
+        """The bug the probe caught: stripping blocks removed the question too.
+
+        The host records a user turn as ~2300 characters of reminders ending in
+        ``<user_query>…</user_query>``. Cleaning the wrapped form used to yield
+        length 0 — a confident silence, which is the failure this store exists
+        to eliminate.
+        """
+        wrapped = ('<system-reminder data-role="user-context">\n'
+                   '<additional_data>\n<current_time>Thu</current_time>\n'
+                   '</additional_data>\n</system-reminder>\n'
+                   "<user_query>好，继续测试</user_query>")
+        assert hook.clean_prompt(wrapped) == "好，继续测试"
+
+    def test_wrapped_and_plain_produce_the_same_text(self):
+        """Both shapes must yield one answer, or the hash diagnostics disagree."""
+        plain = "现在workbuddy挂上能正常使用了吗？"
+        wrapped = (f"<system-reminder>x</system-reminder>\n"
+                   f"<user_query>{plain}</user_query>")
+        assert hook.clean_prompt(wrapped) == hook.clean_prompt(plain) == plain
+
+
+class TestPromptShape:
+    """Enough structure to identify the input, without recording it."""
+
+    def test_classes_are_counted(self):
+        shape = hook.prompt_shape("好，继续测试")
+        assert "cjk5" in shape and "other1" in shape
+        assert "ascii0" in shape and "space0" in shape
+
+    def test_cjk_is_not_counted_as_other(self):
+        """A CJK char is not in the Latin-1 range; the naive check miscounts it."""
+        assert "cjk2" in hook.prompt_shape("测试")
+
+    def test_markers_report_the_wrappers_present(self):
+        shape = hook.prompt_shape("<user_query>x</user_query>")
+        assert "user_query" in shape
+        assert "x" not in shape.split("markers=")[1].replace("user_query", "")
+
+    def test_markers_are_empty_when_absent(self):
+        assert "markers=[-]" in hook.prompt_shape("好")
+
+    def test_it_reveals_no_content(self):
+        shape = hook.prompt_shape("我的密码是 hunter2")
+        for leak in ("密码", "hunter2", "我的"):
+            assert leak not in shape
+
 
 class TestPayloadShape:
     """Field names and sizes — the only way to ask "which field is the prompt?"."""

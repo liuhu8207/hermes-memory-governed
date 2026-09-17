@@ -175,23 +175,39 @@ _OWN_JSON_RE = re.compile(r'^[ \t]*\{[ \t]*"continue".*$', re.M)
 _TAG_RE = re.compile(r"</?[a-zA-Z_][\w:.-]*[^>]*>")
 
 
+#: Where the user's own words live when the host wraps the message. Measured
+#: from the session transcript: the recorded user turn is a ~2300-character
+#: block of reminders ending in ``<user_query>好，继续测试</user_query>``.
+_USER_QUERY_RE = re.compile(r"<user_query>(.*?)</user_query>", re.S)
+
+
 def clean_prompt(prompt: str) -> str:
     """The part of ``prompt`` that the user actually typed.
 
     Returns ``""`` when nothing is left, which the caller treats as "no match"
     — the right answer for a turn that carried only host scaffolding.
 
-    Four passes, each answering something observed rather than imagined:
-    balanced host blocks (their *content* must go, not just their tags), this
-    hook's own injection, this hook's own stdout, and finally any tag left over
-    from a nested block. Skipping the last one cost a false positive on markup.
+    Order matters, and the first branch is the important one. Stripping host
+    blocks wholesale is right for scaffolding but catastrophic for a *wrapped
+    message*: the probe showed a wrapped payload cleaning down to length 0 —
+    the question itself deleted. That is a confident silence, the exact failure
+    this store exists to eliminate. So when the wrapper is present, keep what is
+    inside it and discard the rest, rather than the other way round.
+
+    The remaining passes answer observed problems: balanced host blocks (their
+    content must go, not just their tags), this hook's own injection, this
+    hook's own stdout, and finally any tag left over from a nested block.
     """
     text = str(prompt or "")
     if not text:
         return ""
-    text = _HOST_BLOCK_RE.sub(" ", text)
-    text = _OWN_BLOCK_RE.sub(" ", text)
-    text = _OWN_JSON_RE.sub(" ", text)
+    found = _USER_QUERY_RE.search(text)
+    if found:
+        text = found.group(1)
+    else:
+        text = _HOST_BLOCK_RE.sub(" ", text)
+        text = _OWN_BLOCK_RE.sub(" ", text)
+        text = _OWN_JSON_RE.sub(" ", text)
     text = _TAG_RE.sub(" ", text)
     return re.sub(r"\s+", " ", text).strip()
 
@@ -389,6 +405,47 @@ def payload_shape(payload: dict) -> str:
     return ",".join(parts) or "(empty)"
 
 
+#: Wrapper names the host is known to add around a user's message. Logging
+#: *which* of these appear is diagnostic and leaks nothing: the vocabulary is
+#: fixed and belongs to the protocol, not to the user.
+_HARNESS_MARKERS = (
+    "user_query", "system-reminder", "memory_and_skills_reminder",
+    "additional_data", "current_time", "task-notification", "identity_context",
+)
+
+
+def prompt_shape(text: str) -> str:
+    """Character classes and protocol markers present — never the text.
+
+    The hash was supposed to settle what ``prompt`` contains: log a short digest,
+    then hash candidates locally until one matches. It did not — a 6-character
+    message arrived as ``prompt`` of length 9, and no combination of that message
+    with whitespace (including U+3000 and zero-width characters) reproduced the
+    digest. Brute force cannot close that gap, so the log now reports enough
+    *structure* to identify the input by inspection.
+
+    Counts by class, plus which protocol wrappers are present. A Chinese
+    sentence and a Chinese sentence with three trailing newlines are
+    indistinguishable by length but not by class; a message the host re-wrapped
+    is identified by the marker list.
+    """
+    classes = {"cjk": 0, "ascii": 0, "digit": 0, "space": 0, "other": 0}
+    for ch in text:
+        if ch.isascii() and ch.isalpha():
+            classes["ascii"] += 1
+        elif ch.isdigit():
+            classes["digit"] += 1
+        elif ch.isspace():
+            classes["space"] += 1
+        elif "\u4e00" <= ch <= "\u9fff" or "\u3400" <= ch <= "\u4dbf":
+            classes["cjk"] += 1
+        else:
+            classes["other"] += 1
+    counts = ",".join(f"{k}{v}" for k, v in classes.items())
+    found = ",".join(m for m in _HARNESS_MARKERS if m in text) or "-"
+    return f"cls=[{counts}] markers=[{found}]"
+
+
 def main() -> int:
     payload = read_payload()
     raw_prompt = str(payload.get("prompt") or "")
@@ -412,6 +469,7 @@ def main() -> int:
             f"clean_sha={hashlib.sha1(prompt.encode('utf-8')).hexdigest()[:12]} "
             f"facts={len(facts)} matched={len(matches)} "
             f"injected={len(context)} problem={problem or '-'} "
+            f"{prompt_shape(raw_prompt)} "
             f"shape=[{payload_shape(payload)}]")
 
     out = {
