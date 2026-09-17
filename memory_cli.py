@@ -1089,7 +1089,16 @@ def _l2_schema(dim: int):
     ])
 
 
-def open_l2_table(cfg, create_dim: int = 0, created: list = None):
+#: Table creation is not atomic in LanceDB, so a second process can see the
+#: name before the dataset is readable. Five passes at 0.15s and growing is
+#: ~2.2s worst case — comfortably inside the winner's create time, and far below
+#: the point where waiting longer stops being better than failing.
+_L2_OPEN_RETRIES = 5
+_L2_OPEN_BACKOFF = 0.15
+
+
+def open_l2_table(cfg, create_dim: int = 0, created: list = None,
+                  errors: list = None):
     """Open the L2 table, backfilling the sharing columns on a legacy table.
 
     The column list is *not* written here. It comes from
@@ -1121,21 +1130,54 @@ def open_l2_table(cfg, create_dim: int = 0, created: list = None):
     import pyarrow as pa
 
     db = lancedb.connect(cfg.l2_db_path)
-    names = getattr(db, "list_tables", None)
-    listing = names() if callable(names) else db.table_names()
-    if not isinstance(listing, (list, tuple)):
-        listing = getattr(listing, "tables", []) or [listing]
-    table_names = [t.name if hasattr(t, "name") else str(t) for t in listing]
-    if "memories" not in table_names:
-        if create_dim <= 0:
-            return None
-        table = db.create_table("memories", schema=_l2_schema(create_dim))
-        if created is not None:
-            created.append(True)
-        # A freshly created table already carries every provenance column, so
-        # the backfill below is a no-op for it — it exists for legacy tables.
-    else:
-        table = db.open_table("memories")
+    table = None
+    last_error = None
+
+    # ``lancedb`` creates a table in more than one step: the directory shows up
+    # before ``_versions`` does. So a second process can list "memories", decide
+    # the table exists, and then fail to open it — measured 2026-09-17, four
+    # agents writing at once on a fresh HERMES_HOME, two of them dying with:
+    #
+    #     RuntimeError: Table 'memories' exists but could not be loaded
+    #     (it may be corrupt or incomplete): ... memories.lance was not found:
+    #     Not found: .../memories.lance/_versions
+    #
+    # They printed a traceback and no JSON at all, which breaks the contract
+    # that a caller gets a structured answer it can act on. Both halves are
+    # fixed here: wait out the other process instead of losing the race, and
+    # report exhaustion through ``errors`` rather than by raising.
+    for attempt in range(_L2_OPEN_RETRIES):
+        try:
+            table_names = _l2_table_names(db)
+            if "memories" in table_names:
+                table = db.open_table("memories")
+            elif create_dim > 0:
+                try:
+                    table = db.create_table("memories", schema=_l2_schema(create_dim))
+                    if created is not None:
+                        created.append(True)
+                except Exception as exc:      # noqa: BLE001 — retried below
+                    # Lost the create race. The winner needs a moment to finish;
+                    # the next pass will find a complete table and open it.
+                    last_error = exc
+                    time.sleep(_L2_OPEN_BACKOFF * (attempt + 1))
+                    continue
+            else:
+                return None                  # read-only call, no table yet: fine
+            break
+        except Exception as exc:             # noqa: BLE001 — retried below
+            last_error = exc
+            time.sleep(_L2_OPEN_BACKOFF * (attempt + 1))
+
+    if table is None:
+        # Say *why* rather than reporting the generic "missing": a table that
+        # exists but cannot be loaded is a different problem with a different
+        # fix, and conflating them sends the reader looking in the wrong place.
+        if errors is not None and last_error is not None:
+            errors.append(f"l2_open_failed after {_L2_OPEN_RETRIES} attempts: "
+                          f"{type(last_error).__name__}: {last_error}")
+        return None
+
     # lancedb takes a pa.Field here (new column, null-filled), NOT a
     # {name: pa.array} mapping — the array form raises TypeError, and when that
     # happens inside a best-effort block the migration fails invisibly.
@@ -1147,6 +1189,15 @@ def open_l2_table(cfg, create_dim: int = 0, created: list = None):
         if col not in existing:
             table.add_columns(pa.field(col, getattr(pa, typ)()))
     return table
+
+
+def _l2_table_names(db) -> list:
+    """Table names for a LanceDB connection, across client versions."""
+    lister = getattr(db, "list_tables", None)
+    listing = lister() if callable(lister) else db.table_names()
+    if not isinstance(listing, (list, tuple)):
+        listing = getattr(listing, "tables", []) or [listing]
+    return [t.name if hasattr(t, "name") else str(t) for t in listing]
 
 
 def _l2_existing_contents(table) -> set:
@@ -1236,10 +1287,22 @@ def cmd_remember(config: dict, text: str, agent: str,
     # vector we just produced, so a cold-started table matches the backend that
     # will be searched through it.
     cold_created: list = []
-    table = open_l2_table(cfg, create_dim=len(vector), created=cold_created)
+    open_errors: list = []
+    try:
+        table = open_l2_table(cfg, create_dim=len(vector), created=cold_created,
+                              errors=open_errors)
+    except Exception as exc:  # noqa: BLE001 — the caller gets JSON, not a traceback
+        table = None
+        open_errors.append(f"{type(exc).__name__}: {exc}")
     if table is None:
-        base.update(_refusal("l2_table_missing",
-                             detail="no 'memories' table in " + str(cfg.l2_db_path)))
+        # "could not be opened" and "there is no table" are different problems
+        # with different fixes. Collapsing them sends the reader after the wrong
+        # cause — and during a create race the table does exist, half-made.
+        if open_errors:
+            base.update(_refusal("l2_open_failed", detail=str(open_errors[0])[:300]))
+        else:
+            base.update(_refusal("l2_table_missing",
+                                 detail="no 'memories' table in " + str(cfg.l2_db_path)))
         return base
     if cold_created:
         # Said rather than implied: creating the store is an event, and a caller
