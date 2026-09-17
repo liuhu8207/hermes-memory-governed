@@ -23,11 +23,12 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import re
 import threading
 import time
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, Iterator, List, Optional, Tuple
 
 from ._config import GovernedMemoryConfig
 from ._embedding import EmbeddingService
@@ -396,6 +397,106 @@ class KBIndex:
         return out
 
 
+# -- vault 遍历（单一实现） ------------------------------------------------
+#
+# 这一段存在的全部理由：本模块曾经有**两份**各自手写的 ``rglob("*.md")``
+# （``scan_vault_paths`` 喂索引同步、``_iter_notes`` 喂检索打分），而 CLI 侧
+# ``memory_cli.iter_notes`` 是第三份。三份规则各不相同 —— 于是同一个仓库，
+# 插件和 CLI 对「库里有哪些笔记」给出不同答案；共享存储只能有一个答案。
+# 现在插件侧的两条路都走 :func:`iter_vault_notes`，规则与 CLI 侧对齐
+# （跳过所有点目录 + realpath 包含性检查）。
+def _is_link(path: Path) -> bool:
+    """True for a symlink **or** a Windows junction.
+
+    Junctions are the easy one to miss: ``os.path.islink`` reports ``False``
+    for them because they carry a different reparse tag, yet they redirect
+    just as effectively — and on this machine the production vault *is* a
+    junction, so a symlink-only check steps straight over the construct it
+    exists to catch. ``os.path.isjunction`` is Python 3.12+, hence the
+    ``getattr`` fallback.
+    """
+    try:
+        if path.is_symlink():
+            return True
+    except OSError:
+        return False
+    isjunction = getattr(os.path, "isjunction", None)
+    if callable(isjunction):
+        try:
+            return bool(isjunction(str(path)))
+        except OSError:
+            return False
+    return False
+
+
+def _is_within(child: Path, parent: Path) -> bool:
+    """True when ``child`` is ``parent`` or sits below it."""
+    try:
+        child.relative_to(parent)
+        return True
+    except ValueError:
+        return False
+
+
+def iter_vault_notes(vault: Path, *,
+                     errors: "Optional[List[str]]" = None) -> Iterator[Path]:
+    """Yield every note under ``vault``, refusing anything that leaves it.
+
+    This is the **only** vault walk in this module; both the index-sync side
+    (:meth:`KnowledgeBase.scan_vault_paths`) and the retrieval side
+    (:meth:`KnowledgeBase._iter_notes`) consume it, so they cannot drift
+    apart. Three rules, applied in this order:
+
+    1. **realpath containment** — ``rglob`` *follows* links, so a junction or
+       symlink under the vault walks out of it and a chain walks out further.
+       Every hit is re-judged on its ``realpath``; escapes are **refused and
+       named**, never silently dropped.
+    2. **all dot-directories are skipped** (not just ``.obsidian``) —
+       ``.git`` / ``.trash`` / ``.obsidian`` hold tooling, not notes, and the
+       CLI side already skips them.
+    3. ``index.md`` is navigation scaffolding (MOC), not a note.
+
+    Args:
+        vault: Vault root. May itself be a junction — both sides of every
+            comparison are resolved through the same rule, so that stays in.
+        errors: Optional sink. Every refusal is appended here *and* logged,
+            because "the vault is empty" and "the walk was refused" look
+            identical to a caller otherwise — and silently returning empty is
+            the failure family this project keeps hunting down.
+
+    Yields:
+        Note paths, sorted for deterministic ordering.
+    """
+    if not vault.exists():
+        return
+    vault_real = Path(os.path.realpath(str(vault)))
+    for p in sorted(vault.rglob("*.md")):
+        try:
+            if not p.is_file():
+                continue
+        except OSError:
+            continue
+        # rglob 已经跟着链接走出去了，所以这里必须用 realpath 复核「还在不在库里」。
+        real = Path(os.path.realpath(str(p)))
+        if not _is_within(real, vault_real):
+            msg = ("refused: '%s' resolves to '%s', outside the vault '%s'"
+                   % (p, real, vault_real))
+            logger.warning("[kb] vault walk %s", msg)
+            if errors is not None:
+                errors.append(msg)
+            continue
+        try:
+            rel = p.relative_to(vault)
+        except ValueError:
+            # 只可能经由「留在库内」的链接到达；此时真实身份才是可用的那个
+            rel = real.relative_to(vault_real)
+        if any(part.startswith(".") for part in rel.parts[:-1]):
+            continue
+        if p.name == "index.md":  # MOC 导航不参与检索
+            continue
+        yield p
+
+
 class KnowledgeBase:
     """知识库门面：vault 检索 + 写入 + 索引投影。"""
 
@@ -409,19 +510,37 @@ class KnowledgeBase:
         self._sync_lock = threading.Lock()
         # 最近一次探测结论，供 :meth:`last_index_status` 读取
         self._index_status: Dict[str, Any] = {}
+        # 最近一次 vault 遍历被拒绝的路径（越界链接等）。必须留痕：
+        # 「库里没这篇」和「这篇被拒了」对调用方长得一模一样。
+        self._vault_walk_refusals: List[str] = []
 
     # -- 索引新鲜度探测（廉价，只读元数据） ----------------------------
+
+    def _walk(self) -> List[Path]:
+        """单次 vault 遍历，供本类所有需要「库里有哪些笔记」的入口共用。
+
+        走 :func:`iter_vault_notes` —— 全模块唯一的遍历实现，所以索引同步侧与
+        检索侧不可能对「库里有什么」给出不同答案。被拒绝的路径（越界链接）
+        存进 :attr:`last_walk_refusals`，不静默丢弃。
+        """
+        refusals: List[str] = []
+        paths = list(iter_vault_notes(self._vault, errors=refusals))
+        self._vault_walk_refusals = refusals
+        return paths
+
+    @property
+    def last_walk_refusals(self) -> List[str]:
+        """最近一次遍历被拒绝的路径说明（越界链接等）。
+
+        空列表 = 没被拒。这是「库里没这篇」与「这篇被拒了」的唯一区分点 ——
+        没有它，一次被拒的遍历看起来跟空库一模一样。
+        """
+        return list(self._vault_walk_refusals)
 
     def scan_vault_paths(self) -> Dict[str, Path]:
         """正本侧 ``相对路径 -> Path`` 映射（单次目录遍历，不读文件内容）。"""
         out: Dict[str, Path] = {}
-        if not self._vault.exists():
-            return out
-        for path in self._vault.rglob("*.md"):
-            if ".obsidian" in path.parts:
-                continue
-            if path.name == "index.md":  # MOC 导航不参与检索
-                continue
+        for path in self._walk():
             out[self._rel(path)] = path
         return out
 
@@ -743,13 +862,7 @@ class KnowledgeBase:
 
     def _iter_notes(self) -> List[_Note]:
         notes: List[_Note] = []
-        if not self._vault.exists():
-            return notes
-        for path in sorted(self._vault.rglob("*.md")):
-            if ".obsidian" in path.parts:
-                continue
-            if path.name == "index.md":  # MOC 导航不参与检索
-                continue
+        for path in self._walk():  # 与索引同步侧共用同一份遍历规则
             try:
                 text = path.read_text(encoding="utf-8", errors="replace")
             except OSError:
