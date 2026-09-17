@@ -127,6 +127,44 @@ class TestTheShellPath:
         assert hook.decide(bash("wc -l ./memory/MEMORY.md"))[0] == "allow"
 
 
+class TestTheFilesystemSpelling:
+    """The guard must match the *file*, not the bytes.
+
+    Measured 2026-09-17, the literal-text match let two spellings of the same
+    file through: ``memory.md`` / ``Memory.MD`` (this filesystem is
+    case-insensitive) and ``MEMORY.md.`` (Windows strips a trailing dot). A rule
+    that can be sidestepped by holding Shift is not being enforced.
+    """
+
+    @pytest.mark.parametrize("path", [
+        r"C:\Users\example\AppData\Local\hermes\memory\memory.md",
+        "C:/Users/example/AppData/Local/hermes/memory/Memory.MD",
+        "C:/Users/example/AppData/Local/hermes/memory/mEmOrY.mD",
+    ])
+    def test_another_case_is_the_same_file(self, path):
+        decision, _, _, hit = hook.decide(edit(path))
+        assert decision == "deny" and hit == "MEMORY.md", path
+
+    @pytest.mark.parametrize("path", [
+        "C:/x/hermes/memory/MEMORY.md.",
+        r"C:\x\hermes\memory\USER.md...",
+        "C:/x/hermes/memory/persona.md.",
+    ])
+    def test_a_trailing_dot_is_the_same_file(self, path):
+        decision, _, _, hit = hook.decide(edit(path))
+        assert decision == "deny" and hit, path
+
+    def test_the_shell_path_is_normalised_too(self):
+        assert hook.decide(
+            bash("echo x >> C:/x/hermes/memory/memory.md"))[0] == "deny"
+
+    def test_a_near_miss_is_still_a_different_file(self):
+        """Normalising must not swallow names that are *not* the protected file."""
+        for path in (r"D:\proj\MEMORY.md.bak", r"D:\proj\not-MEMORY.md",
+                     "D:/proj/MEMORY.md.old", r"D:\proj\MY-MEMORY.md.txt"):
+            assert hook.decide(edit(path))[0] == "allow", path
+
+
 class TestBothToolNamingStyles:
     """The hook reference warns the received ``tool_name`` depends on the host.
 

@@ -21,7 +21,10 @@ So the rule is enforced where it can actually be enforced: at the tool call.
 
 What is blocked, and what is deliberately not
 ---------------------------------------------
-* ``Edit`` / ``Write`` targeting a protected file — denied outright.
+* ``Edit`` / ``Write`` targeting a protected file — denied outright, and the
+  path is matched the way the filesystem reads it, not the way it is typed:
+  ``memory.md`` and ``MEMORY.md.`` are the same file as ``MEMORY.md`` here, so
+  they are denied too (:func:`_resolve_key`).
 * ``Bash`` mentioning a protected file **and** a write indicator — denied. This
   one is a heuristic, and a narrow one: both conditions must hold, so ``cat``,
   ``grep``, ``ls`` and every other read still pass. A command that writes to
@@ -166,16 +169,47 @@ def _target_paths(tool_input: dict) -> list:
     return [s for s in every if "/" in s or "\\" in s]
 
 
+#: A trailing dot-run on a path segment. Windows strips those before opening the
+#: file, so ``MEMORY.md.`` and ``MEMORY.md`` are the same file on this box.
+_TRAILING_DOTS = re.compile(r"\.+(?=/|$)")
+
+
+def _resolve_key(text: str) -> str:
+    """Normalise a path the way the *filesystem* will before matching it.
+
+    Matching the literal text is not enough, because the guard cannot be
+    bypassed by *anything* an agent might plausibly type — including the same
+    file spelled differently. Measured 2026-09-17 on this machine, two Windows
+    behaviours each turned a denial into an allow::
+
+        .../hermes/memory/MEMORY.md    → deny     (correct)
+        .../hermes/memory/memory.md    → allow    ✗ case-insensitive FS
+        .../hermes/memory/Memory.MD    → allow    ✗ case-insensitive FS
+        .../hermes/memory/MEMORY.md.   → allow    ✗ trailing dot stripped
+        .../hermes/memory/USER.md      → deny     (correct)
+
+    ``normcase`` supplies case-insensitivity where the platform defines it and
+    is a no-op elsewhere; ``re.IGNORECASE`` in :func:`protected_hit` then keeps
+    the rule true on both platforms rather than only on Windows. Separators are
+    re-normalised *after* ``normcase`` because on Windows it rewrites them.
+    """
+    flat = os.path.normcase(text).replace("\\", "/").strip().strip("\"'")
+    return _TRAILING_DOTS.sub("", flat)
+
+
 def protected_hit(text: str) -> str:
     """The protected file name this text names as a *path*, or ``""``.
 
-    Both separators are accepted because Windows callers produce both.
+    Both separators are accepted because Windows callers produce both, and the
+    comparison is spelling-insensitive because the filesystem is — see
+    :func:`_resolve_key`.
     """
     if not text:
         return ""
-    flat = text.replace("\\", "/").strip().strip("\"'")
+    flat = _resolve_key(text)
     for name in PROTECTED_NAMES:
-        if re.search(r"(?:^|[/\s=])" + re.escape(name) + r"(?:$|[\"'\s,)])", flat):
+        if re.search(r"(?:^|[/\s=])" + re.escape(name) + r"(?:$|[\"'\s,)])",
+                     flat, re.IGNORECASE):
             return name
     return ""
 
