@@ -89,6 +89,13 @@ GENERIC_TERMS = {
     "一下", "帮我", "我们", "你们", "他们", "现在", "已经", "还是", "就是",
     "这些", "那些", "如果", "然后", "因为", "所以", "但是", "而且", "或者",
     "时候", "问题", "东西", "地方", "怎么", "如何", "多少", "哪个",
+    # Low-information nouns. They are real words, so the composition filter above
+    # cannot catch them — but every topic has them, so sharing one says nothing.
+    # Measured: 有没有更好的办法 matched a fact about a SecretStore reading
+    # workaround purely through 办法. Removing such a term only costs a match
+    # when it was the *only* overlap, which is exactly the case where the match
+    # was noise.
+    "办法", "方法", "方式", "事情", "情况", "内容", "状态", "结果", "样子",
 }
 
 #: Characters that carry grammar rather than topic. A bigram built **entirely**
@@ -97,18 +104,41 @@ GENERIC_TERMS = {
 #: 帮我把这个表格转成 CSV matched a fact about an SSH password prompt through
 #: the bigram 把这. Filtering whole phrases one by one does not scale; filtering
 #: by composition does.
+#:
+#: It only works if the list is complete, and the first version was not: 没 was
+#: missing, so 没有 survived as a "strong term" and the ordinary question
+#: 你再实测看有什么问题没有？ matched a fact reading "❌ AI 不能读密码 → 没有
+#: CLI/API 接口". One absent character defeated the whole scheme, which is why
+#: the negatives below are regression cases rather than illustrations.
 FUNCTION_CHARS = set(
     "的了和是在有就不也都还吗呢把被给与让使对于之其而或所以因从此那这"
     "什么怎么你我们他它们个上下中前后里外时候能不能可以是否一二三四五六"
     "七八九十多少你要想做会得着过到为很更最再又只才"
+    # Second pass, added after that miss: negations, modals and light verbs that
+    # only ever glue a real term to the sentence.
+    "没未别该需看试知道行好太挺常等等样"
 )
 
 
 def _is_function_bigram(term: str) -> bool:
-    """True for CJK bigrams made only of grammatical characters."""
+    """True for a CJK bigram that leads with a grammatical character.
+
+    The tokenizer slices fixed-width bigrams out of a run of CJK, so it cannot
+    see word boundaries: 有没有更好的办法 yields 的办, and 帮我把这个表格转成
+    CSV yields 把这. Both straddle a boundary and neither is a word.
+
+    Requiring **both** characters to be grammatical was the first attempt and it
+    missed 的办 — the trailing character there is 办, a real word. Leading with a
+    particle is the reliable signal: a bigram that starts with 的 / 把 / 在 / 有
+    is glued to whatever preceded it, whatever follows.
+
+    Cost, measured rather than assumed: bigrams like 有关 or 在于 are dropped
+    too. The positives in the calibration set (免密 / 门禁 / 阈值 / 密码 / 代理 /
+    同步 / 反向 …) start with content characters and are untouched.
+    """
     if term.isascii() or len(term) != 2:
         return False
-    return all(ch in FUNCTION_CHARS for ch in term)
+    return term[0] in FUNCTION_CHARS
 
 
 def snapshot_file() -> Path:
@@ -239,11 +269,58 @@ def build_context(matches: list) -> str:
     return text
 
 
+#: A run log exists because this hook is otherwise invisible. It runs before
+#: every prompt, its output is merged into the conversation, and when it
+#: misbehaves the symptom is "the agent said something odd" — far from the
+#: cause. Measured 2026-09-17: the host's rendered context contained the whole
+#: context block *and* a separate raw stdout line whose ``additionalContext``
+#: was empty, which is only explicable if the hook ran twice for one prompt.
+#: That is 2x the latency and no way to see it without a log.
+#:
+#: Only sizes are recorded — never the prompt itself. A diagnostic that quietly
+#: accumulates the user's questions would be a worse bug than the one it hunts.
+MAX_LOG_LINES = 200
+
+
+def log_path() -> Path:
+    """Beside the snapshot, inside HERMES_HOME."""
+    return snapshot_file().with_name("hook_log.txt")
+
+
+def log_run(event: str, session: str, note: str) -> None:
+    """Append one line. Never raises — logging must not be able to break a turn."""
+    if os.environ.get("HGM_HOOK_LOG") == "0":
+        return
+    try:
+        from datetime import datetime
+
+        path = log_path()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            lines = path.read_text(encoding="utf-8").splitlines()
+        except OSError:
+            lines = []
+        lines.append(f"{datetime.now().isoformat(timespec='seconds')}\t{event}\t"
+                     f"session={session or '?'}\t{note}")
+        if len(lines) > MAX_LOG_LINES:
+            lines = lines[-MAX_LOG_LINES:]
+        path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    except Exception:  # noqa: BLE001 — a log is not worth a broken turn
+        pass
+
+
 def main() -> int:
     payload = read_payload()
     prompt = str(payload.get("prompt") or "")
     facts, problem = load_snapshot(snapshot_file())
-    context = build_context(match(prompt, facts)) if facts else ""
+    matches = match(prompt, facts) if facts else []
+    context = build_context(matches)
+
+    # Recorded before printing: if the write itself fails the print still
+    # happens, and if the print fails the record of the attempt survives.
+    log_run("prompt", str(payload.get("session_id") or ""),
+            f"prompt_len={len(prompt)} facts={len(facts)} matched={len(matches)} "
+            f"injected={len(context)} problem={problem or '-'}")
 
     out = {
         "continue": True,

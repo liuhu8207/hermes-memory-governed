@@ -36,6 +36,17 @@ def _load():
 
 hook = _load()
 
+
+@pytest.fixture(autouse=True)
+def _never_touch_the_real_log(monkeypatch):
+    """The hook appends to a run log; a test run must not write into it.
+
+    Autouse because it is a side effect, not a subject: one forgotten
+    ``main()`` call would otherwise append to the user's real log file.
+    :class:`TestRunLog` turns it back on deliberately, with a patched path.
+    """
+    monkeypatch.setenv("HGM_HOOK_LOG", "0")
+
 FACTS = [
     {"content": "能不能做成免密", "agent": "dsh", "timestamp": 100},
     {"content": "SecretStore 使用 ROCKET_TLS 而不是 SSL_CERT_FILE",
@@ -44,6 +55,12 @@ FACTS = [
      "agent": "workbuddy", "timestamp": 300},
     {"content": "msf你现在ssh连接还是老弹密码窗，能不能把这个解决掉",
      "agent": "external", "timestamp": 400},
+    # Both added because the real store contains them and they produced
+    # production false positives — see TestTheCalibrationFoundThese.
+    {"content": "- ❌ AI 不能读密码 → 没有 CLI/API 接口",
+     "agent": "unattributed", "timestamp": 500},
+    {"content": "key太麻烦了，我希望有一个能让你读取，但又安全的办法",
+     "agent": "unattributed", "timestamp": 600},
 ]
 
 
@@ -82,13 +99,29 @@ class TestStrongTerms:
                     if t.isascii() and len(t) < hook.MIN_ASCII_TERM]
 
     def test_function_bigrams_are_dropped(self):
-        """The 把这 false positive: two grammar chars straddling a boundary."""
+        """Two grammar chars straddling a boundary — the 把这 false positive."""
         assert hook._is_function_bigram("把这")
         assert "把这" not in hook.strong_terms("帮我把这个表格转成 CSV")
 
-    def test_content_bigrams_survive_the_function_filter(self):
-        for term in ("免密", "门禁", "阈值", "密码", "代理"):
-            assert not hook._is_function_bigram(term)
+    @pytest.mark.parametrize("term", ["的办", "再把", "在有", "看有", "没什"])
+    def test_a_bigram_that_LEADS_with_grammar_is_dropped(self, term):
+        """Both chars being grammatical was the first rule, and it was too weak.
+
+        Measured in production on 2026-09-17: 有没有更好的办法 produced the
+        bigram 的办 (的 is grammar, 办 is a real word), which survived the
+        both-chars rule and matched a fact about a SecretStore workaround.
+        Leading with a particle is the reliable signal.
+        """
+        assert hook._is_function_bigram(term)
+
+    @pytest.mark.parametrize("term", ["免密", "门禁", "阈值", "密码", "代理", "同步", "反向", "实测"])
+    def test_content_bigrams_survive_the_function_filter(self, term):
+        assert not hook._is_function_bigram(term)
+
+    @pytest.mark.parametrize("term", ["办法", "方法", "方式", "状态", "结果"])
+    def test_low_information_nouns_are_dropped(self, term):
+        """Real words that every topic has, so sharing one says nothing."""
+        assert term in hook.GENERIC_TERMS
 
     def test_no_tokenizer_means_no_terms(self, monkeypatch):
         monkeypatch.setattr(hook.sys, "path", [])
@@ -130,18 +163,89 @@ class TestMatch:
 
 
 class TestTheCalibrationFoundThese:
-    """Measured false positives that the score-based gate let through."""
+    """Every entry here is a measured false positive, not a hypothetical."""
 
     @pytest.mark.parametrize("prompt", ["1+1 等于几", "帮我把这个表格转成 CSV"])
     def test_the_false_positives_that_killed_the_old_gate(self, prompt):
+        """The score-based gate let these through via '1' and 把这."""
         assert hook.match(prompt, FACTS) == [], (
             f"{prompt!r} 曾经靠 '1' / '把这' 命中；强词项判据必须挡住它")
 
+    def test_the_one_that_shipped_yesterday(self):
+        """Found in production, on a prompt with no topic at all.
+
+        ``你再实测看有什么问题没有？`` matched "- ❌ AI 不能读密码 → 没有
+        CLI/API 接口" through the bigram 没有, because 没 was missing from the
+        function-character list. One absent character defeated the scheme.
+        """
+        assert hook.match("你再实测看有什么问题没有？", FACTS) == []
+
+    @pytest.mark.parametrize("prompt", [
+        "有没有更好的办法", "这样做可以吗", "有什么问题没有", "这个对不对",
+        "你觉得呢", "帮我看看这段代码", "现在几点了", "谢谢", "继续",
+        "好的没问题", "还有别的吗", "今天天气怎么样", "1+1 等于几",
+        "帮我写一个 Python 冒泡排序", "这个 HTML 页面颜色改深一点",
+    ])
+    def test_ordinary_prompts_stay_silent(self, prompt):
+        assert hook.match(prompt, FACTS) == [], f"{prompt!r} 不该命中"
+
     @pytest.mark.parametrize("prompt", [
         "怎么免密登录", "SecretStore 跑在哪台机器上", "secretstore 两边同步要注意什么",
+        "AI 能不能读密码",
     ])
     def test_true_positives_still_survive(self, prompt):
         assert hook.match(prompt, FACTS), f"{prompt!r} 应当命中却没命中"
+
+    def test_one_known_false_positive_is_accepted_on_purpose(self):
+        """Shared content words are not shared meaning, and this is the proof.
+
+        解释一下什么是反向代理 shares 代理 with a fact about routing traffic
+        through a proxy. A lexical matcher cannot tell 走代理 from 反向代理, so
+        the choice is a short irrelevant line or an extra heuristic. Recorded in
+        the module docstring as the price of the design.
+        """
+        assert hook.match("解释一下什么是反向代理", FACTS) != []
+
+
+class TestRunLog:
+    """The hook is invisible by default; this is how a bad run is seen."""
+
+    def test_a_run_is_recorded(self, monkeypatch, tmp_path):
+        monkeypatch.setenv("HGM_HOOK_LOG", "1")
+        path = _snapshot(tmp_path)
+        monkeypatch.setattr(hook, "snapshot_file", lambda: path)
+        monkeypatch.setattr(hook.sys, "stdin",
+                            io.StringIO(json.dumps({"prompt": "怎么免密登录",
+                                                    "session_id": "s1"})))
+        monkeypatch.setattr(hook.sys, "stdout", io.StringIO())
+        hook.main()
+        text = hook.log_path().read_text(encoding="utf-8")
+        assert "session=s1" in text
+        assert "matched=1" in text
+        assert "免密" not in text, "日志不得记录提问内容本身"
+
+    def test_the_log_is_capped(self, monkeypatch, tmp_path):
+        monkeypatch.setenv("HGM_HOOK_LOG", "1")
+        path = _snapshot(tmp_path)
+        monkeypatch.setattr(hook, "snapshot_file", lambda: path)
+        monkeypatch.setattr(hook, "MAX_LOG_LINES", 5)
+        for i in range(12):
+            hook.log_run("prompt", f"s{i}", "note")
+        lines = hook.log_path().read_text(encoding="utf-8").splitlines()
+        assert len(lines) == 5
+
+    def test_logging_never_raises(self, monkeypatch):
+        monkeypatch.setenv("HGM_HOOK_LOG", "1")
+        monkeypatch.setattr(hook, "snapshot_file",
+                            lambda: (_ for _ in ()).throw(RuntimeError("boom")))
+        hook.log_run("prompt", "s", "note")          # must not raise
+
+    def test_it_can_be_switched_off(self, monkeypatch, tmp_path):
+        monkeypatch.setenv("HGM_HOOK_LOG", "0")
+        path = _snapshot(tmp_path)
+        monkeypatch.setattr(hook, "snapshot_file", lambda: path)
+        hook.log_run("prompt", "s", "note")
+        assert not hook.log_path().exists()
 
 
 # -- context ----------------------------------------------------------------
