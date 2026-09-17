@@ -213,6 +213,64 @@ class TestEconomy:
         assert elapsed < 2.8, f"常驻进程里单次调用仍要 {elapsed:.2f}s，没享受到常驻的好处"
 
 
+class TestObservability:
+    """The server must be able to say whether the host got as far as the tools.
+
+    Added after a real launch left *nothing* behind: the log showed a start and
+    no stop — terminated outside the read loop — and the server had recorded no
+    handshake at all, so "the host read the tool list" and "the host gave up
+    before saying anything" were indistinguishable. Same lesson as the WorkBuddy
+    hook: an invisible surface is an undebuggable one.
+    """
+
+    def test_the_handshake_is_recorded(self, tmp_path):
+        env = dict(os.environ)
+        env.pop("PYTHONPATH", None)
+        env["HGM_AGENT"] = "obs-test"
+        env["HERMES_HOME"] = str(tmp_path)      # log lands here, not in the real home
+        env.pop("HGM_MCP_LOG", None)
+        proc = subprocess.Popen([PY, str(SERVER)], cwd=str(REPO), env=env,
+                                stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                                stderr=subprocess.PIPE, text=True,
+                                encoding="utf-8", errors="replace", bufsize=1)
+        proc.stdin.write(json.dumps({
+            "jsonrpc": "2.0", "id": 1, "method": "initialize",
+            "params": {"protocolVersion": "2024-11-05", "capabilities": {},
+                       "clientInfo": {"name": "obs", "version": "1"}}}) + "\n")
+        proc.stdin.write(json.dumps({"jsonrpc": "2.0", "id": 2,
+                                     "method": "tools/list"}) + "\n")
+        proc.stdin.flush()
+        proc.stdout.readline()
+        proc.stdout.readline()
+        proc.stdin.close()
+        proc.wait(timeout=30)
+        text = (tmp_path / "memory" / "mcp_log.txt").read_text(encoding="utf-8")
+        assert "first_frame" in text
+        assert "initialize" in text and "client=obs/1" in text, text
+        assert "tools/list" in text and "count=5" in text, text
+
+    def test_the_first_frame_shape_is_recorded_without_its_content(self, tmp_path):
+        """Framing is the one mismatch that shows up only as the host giving up."""
+        env = dict(os.environ)
+        env.pop("PYTHONPATH", None)
+        env.pop("HGM_MCP_LOG", None)
+        env["HGM_AGENT"] = "obs-test"
+        env["HERMES_HOME"] = str(tmp_path)
+        proc = subprocess.Popen([PY, str(SERVER)], cwd=str(REPO), env=env,
+                                stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                                stderr=subprocess.PIPE, text=True,
+                                encoding="utf-8", errors="replace", bufsize=1)
+        proc.stdin.write(json.dumps({"jsonrpc": "2.0", "id": 1, "method": "ping",
+                                     "params": {"secret": "不该出现在日志里"}}) + "\n")
+        proc.stdin.flush()
+        proc.stdout.readline()
+        proc.stdin.close()
+        proc.wait(timeout=30)
+        text = (tmp_path / "memory" / "mcp_log.txt").read_text(encoding="utf-8")
+        assert "content_length_header=False" in text, text
+        assert "不该出现在日志里" not in text, "日志里出现了请求内容"
+
+
 class TestInterpreterBootstrap:
     """The server calls memory_cli in-process, so *this* interpreter needs LanceDB.
 

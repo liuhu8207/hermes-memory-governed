@@ -296,6 +296,15 @@ def handle(msg: dict) -> dict:
     msg_id = msg.get("id")
 
     if method == "initialize":
+        params = msg.get("params") or {}
+        client = params.get("clientInfo") or {}
+        # Logged because the previous host launch was *invisible*: the server
+        # started, was terminated without going through the read loop, and left
+        # nothing behind to say whether the handshake had completed. An MCP
+        # server that only logs tool calls cannot answer "did the host even get
+        # the tool list?" — the same blind spot the WorkBuddy hook had.
+        log("initialize", f"protocol={params.get('protocolVersion')} "
+                          f"client={client.get('name')}/{client.get('version')}")
         return _result(msg_id, {
             "protocolVersion": PROTOCOL_VERSION,
             "capabilities": {"tools": {"listChanged": False}},
@@ -306,6 +315,7 @@ def handle(msg: dict) -> dict:
     if method == "ping":
         return _result(msg_id, {})
     if method == "tools/list":
+        log("tools/list", f"count={len(TOOLS)}")
         return _result(msg_id, {"tools": TOOLS})
     if method == "tools/call":
         params = msg.get("params") or {}
@@ -401,10 +411,23 @@ def main() -> int:
     # across restarts.
     sys.stderr.write(f"[hgm-mcp] started agent={_agent()} protocol={PROTOCOL_VERSION}\n")
     sys.stderr.flush()
+    first_frame = True
     for line in sys.stdin:
         line = line.strip()
         if not line:
             continue
+        if first_frame:
+            first_frame = False
+            # Framing is the one mismatch that makes a host and a server talk
+            # past each other: MCP stdio is newline-delimited JSON, but some
+            # clients send LSP-style ``Content-Length`` headers instead. Both
+            # look like "a line arrived", and the disagreement surfaces only as
+            # the host quietly giving up. So the shape of the first frame — its
+            # length, whether it starts with ``{``, whether it carries a header
+            # — is recorded once. No content: at handshake time it is protocol.
+            log("first_frame", f"len={len(line)} json={line.startswith('{')} "
+                               f"content_length_header="
+                               f"{line.lower().startswith('content-length')}")
         try:
             msg = json.loads(line)
         except (ValueError, TypeError):
