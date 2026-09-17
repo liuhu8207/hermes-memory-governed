@@ -536,7 +536,8 @@ class TestCliL2Ranking:
         assert cli.search_l2("alpha beta gamma delta", 10, []) == []
         # ... and reported as filtered rather than as an empty vault: this count
         # is what made the regression visible in the first place.
-        ranking = cli.recall_l2("alpha beta gamma delta", 10, [])["ranking"]
+        ranking = cli.recall_l2("alpha beta gamma delta", 10, [],
+                                lexical_only=True)["ranking"]
         assert ranking["filtered_out"] == 1
 
     def test_relevant_query_survives_the_default_floor(self, store):
@@ -553,7 +554,8 @@ class TestCliL2Ranking:
             "recall": {"l2_min_score": 0.99},
         }), encoding="utf-8")
         _seed(store.home, [_ON_TOPIC])
-        result = cli.recall_l2("SecretStore ROCKET_TLS", 10, [])
+        result = cli.recall_l2("SecretStore ROCKET_TLS", 10, [],
+                               lexical_only=True)
         assert len(result["hits"]) == 1
         assert result["ranking"]["floor"] == cli.DEFAULT_L2_LEXICAL_FLOOR
         assert result["ranking"]["floor_source"] == "default"
@@ -564,7 +566,8 @@ class TestCliL2Ranking:
             "recall": {"l2_lexical_min_score": 0.9},
         }), encoding="utf-8")
         _seed(store.home, [_ON_TOPIC, _PARTIAL])
-        result = cli.recall_l2("SecretStore ROCKET_TLS", 10, [])
+        result = cli.recall_l2("SecretStore ROCKET_TLS", 10, [],
+                               lexical_only=True)
         assert result["ranking"]["floor"] == 0.9
         assert result["ranking"]["floor_source"] == "config-file"
         assert [h["content"] for h in result["hits"]] == [_ON_TOPIC]
@@ -572,7 +575,8 @@ class TestCliL2Ranking:
 
     def test_ranking_is_reported_honestly(self, store):
         _seed(store.home, [_ON_TOPIC])
-        ranking = cli.recall_l2("SecretStore", 10, [], l2_floor=0.5)["ranking"]
+        ranking = cli.recall_l2("SecretStore", 10, [], l2_floor=0.5,
+                                lexical_only=True)["ranking"]
         assert ranking["ranked"] is True
         assert ranking["basis"] == "lexical-dis-max"
         assert ranking["floor"] == 0.5
@@ -580,8 +584,158 @@ class TestCliL2Ranking:
 
     def test_truncation_is_reported(self, store):
         _seed(store.home, [_ON_TOPIC, _PARTIAL])
-        ranking = cli.recall_l2("SecretStore", 1, [], l2_floor=0.1)["ranking"]
+        ranking = cli.recall_l2("SecretStore", 1, [], l2_floor=0.1,
+                                lexical_only=True)["ranking"]
         assert ranking["truncated"] == 1
+
+
+# -- P1: the CLI's semantic L2 channel --------------------------------------
+#: A deterministic stand-in for the embedding backend. ``car`` / ``车子`` /
+#: ``automobile`` share one axis, so the fake model treats them as one meaning
+#: with no shared wording — which is precisely the case no lexical matcher can
+#: solve, and therefore the case that proves the vector channel is doing
+#: something the keyword channel cannot.
+_FAKE_DIM = 4
+_FAKE_AXES = {"car": 0, "automobile": 0, "车子": 0, "alpha": 1, "beta": 2}
+_CAR_DOC = "I drive an automobile to work"
+
+
+def _fake_vec(text: str) -> list:
+    v = [0.0] * _FAKE_DIM
+    low = str(text or "").lower()
+    for tok, axis in _FAKE_AXES.items():
+        if tok in low:
+            v[axis] = 1.0
+    if not any(v):
+        v[_FAKE_DIM - 1] = 1.0
+    return v
+
+
+def _seed_vectors(home, texts) -> None:
+    import lancedb
+
+    l2 = home / "memory" / "l2"
+    l2.mkdir(parents=True, exist_ok=True)
+    db = lancedb.connect(str(l2))
+    if "memories" in db.table_names():
+        db.drop_table("memories")
+    db.create_table("memories", data=[{
+        "content": t, "category": "other", "source": "test",
+        "timestamp": "2026-09-16T00:00:00", "vector": _fake_vec(t),
+        "source_rowid": None, "role": "agent", "agent": "tester",
+        "project": None,
+    } for t in texts])
+
+
+def _install_fake_embedding(monkeypatch, available: bool = True,
+                            last_error: str = "") -> None:
+    """Point ``plugin_module("_embedding")`` at a fake, so tests never call out."""
+    real = cli.plugin_module
+
+    class _Service:
+        def __init__(self):
+            self.available = available
+            self.last_error = last_error
+            self.backend_name = "fake:test"
+
+        def embed_one(self, text):
+            return _fake_vec(text) if available else None
+
+    def dispatch(name):
+        if name == "_embedding":
+            return types.SimpleNamespace(
+                EmbeddingService=types.SimpleNamespace(
+                    get=lambda cfg: _Service()))
+        return real(name)
+
+    monkeypatch.setattr(cli, "plugin_module", dispatch)
+
+
+class TestL2SemanticChannel:
+    """The CLI had no vector channel at all: every hit was keyword-scored.
+
+    So a query that shared no wording with a fact could not find it, no matter
+    how close the meaning — measured on the real store, ``openssl`` returned 0
+    hits while the fact "SecretStore uses ROCKET_TLS, not SSL_CERT_FILE" sat
+    right there. Multi-agent sharing is worth little if a rephrasing loses the
+    memory.
+    """
+
+    def test_meaning_finds_a_fact_that_shares_no_wording(self, store, monkeypatch):
+        # The whole point of the channel, and impossible lexically.
+        _install_fake_embedding(monkeypatch)
+        _seed_vectors(store.home, [_CAR_DOC])
+        # Lexical, i.e. what the CLI could do before: no shared token, no hit.
+        assert cli.recall_l2("car", 5, [], lexical_only=True)["hits"] == []
+        # Semantic: "car" and "automobile" are one axis in the fake model.
+        hits = cli.recall_l2("car", 5, [])["hits"]
+        assert len(hits) == 1
+        assert hits[0]["score"] == pytest.approx(1.0)
+        assert hits[0]["score_basis"] == "semantic-cosine"
+
+    def test_the_semantic_channel_replaces_not_merges(self, store, monkeypatch):
+        # Ranking a cosine score and a coverage fraction in one list is the same
+        # dimension error as thresholding one with the other's floor.
+        _install_fake_embedding(monkeypatch)
+        _seed_vectors(store.home, [_CAR_DOC, "alpha one", "beta two"])
+        result = cli.recall_l2("car", 10, [])
+        assert result["ranking"]["basis"] == "semantic-cosine"
+        assert result["hits"]
+        assert all(h["score_basis"] == "semantic-cosine" for h in result["hits"])
+
+    def test_the_semantic_floor_uses_its_own_key(self, store, monkeypatch):
+        # The red line: recall.l2_min_score is the in-plugin channel's cosine
+        # threshold and must NOT govern this one, nor may the lexical floor.
+        (store.home / "governed_memory.json").write_text(json.dumps({
+            "wiki_dir": str(store.vault),
+            "recall": {"l2_min_score": 0.99, "l2_lexical_min_score": 0.99,
+                       "l2_semantic_min_score": 0.5},
+        }), encoding="utf-8")
+        _install_fake_embedding(monkeypatch)
+        _seed_vectors(store.home, [_CAR_DOC])
+        result = cli.recall_l2("car", 5, [])
+        assert result["ranking"]["floor"] == 0.5
+        assert result["ranking"]["floor_source"] == "config-file"
+        assert result["hits"]
+
+    def test_the_default_semantic_floor_sits_in_the_calibrated_window(
+            self, store, monkeypatch):
+        # Calibrated on the real store (21 facts, bge-m3): relevant top1 in
+        # [0.7843, 0.9640], irrelevant top1 in [0.6693, 0.7586].
+        floor = cli.DEFAULT_L2_SEMANTIC_FLOOR
+        assert 0.7586 < floor <= 0.7843
+
+    def test_an_unavailable_backend_degrades_to_lexical_and_says_why(
+            self, store, monkeypatch):
+        # Must not raise, must not silently return an empty L2.
+        _install_fake_embedding(monkeypatch, available=False,
+                                last_error="simulated: no api key")
+        _seed_vectors(store.home, ["alpha one"])
+        errors: list = []
+        result = cli.recall_l2("alpha", 5, errors)
+        assert result["ranking"]["basis"] == "lexical-dis-max"
+        assert result["ranking"]["semantic"]["available"] is False
+        assert "simulated: no api key" in result["ranking"]["semantic"]["reason"]
+        assert any("l2 semantic" in e for e in errors), errors
+        # ... and the lexical channel still answers.
+        assert [h["content"] for h in result["hits"]] == ["alpha one"]
+
+    def test_lexical_only_skips_a_live_backend(self, store, monkeypatch):
+        _install_fake_embedding(monkeypatch)
+        _seed_vectors(store.home, [_CAR_DOC, "alpha one"])
+        result = cli.recall_l2("car", 5, [], lexical_only=True)
+        assert result["ranking"]["basis"] == "lexical-dis-max"
+        assert result["hits"] == []
+        # "Not attempted" and "attempted and unavailable" are different facts and
+        # are reported differently: no 'semantic' block at all here, versus one
+        # carrying available=False and a reason in the degradation test above.
+        assert "semantic" not in result["ranking"]
+
+    def test_the_cli_exposes_lexical_only(self):
+        parser = cli.build_parser()
+        args = parser.parse_args(["recall", "openssl", "--lexical-only"])
+        assert args.lexical_only is True
+        assert parser.parse_args(["recall", "openssl"]).lexical_only is False
 
 
 # -- P1: L2 provenance columns ---------------------------------------------

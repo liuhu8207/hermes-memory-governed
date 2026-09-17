@@ -506,20 +506,58 @@ _L2_TERM_SATURATION = 3
 #: 0.333 and 0.667 and the exact choice inside the window is not knife-edge.
 DEFAULT_L2_LEXICAL_FLOOR = 0.4
 
-#: Stated on every CLI L2 answer. The keyword channel and the in-plugin vector
-#: channel both land on [0, 1], but they measure different things — one
-#: measures meaning, this one measures wording — and they are cut by different
-#: floors. Leaving that unsaid would let a caller treat a lexical hit as a
-#: semantic one, which is the same class of error as the hardcoded 0.9 it
-#: replaces.
+#: Floor for the CLI's **semantic** L2 channel, on the cosine scale.
+#:
+#: A DIFFERENT quantity from :data:`DEFAULT_L2_LEXICAL_FLOOR` and a different
+#: key (``recall.l2_semantic_min_score``). It must never be read from
+#: ``recall.l2_min_score``: that value belongs to the in-plugin channel, and
+#: borrowing a threshold calibrated for one quantity to cut another is exactly
+#: the defect that already emptied the lexical channel once.
+#:
+#: Calibrated 2026-09-17 against the real store (21 facts; siliconflow
+#: ``BAAI/bge-m3``, 1024-d, cosine) with 10 relevant + 8 irrelevant queries:
+#:
+#:     relevant   top1 in [0.7843, 0.9640]   10/10 kept
+#:     irrelevant top1 in [0.6693, 0.7586]    0/8 leaked
+#:
+#: The usable window is (0.7586, 0.7843]; 0.77 sits inside it with margin on
+#: both sides — 0.011 below the relevant minimum, 0.014 above the irrelevant
+#: maximum. The plugin's own cosine floor happens to be 0.76, also inside the
+#: window: the two measure the same thing, but they are deliberately separate
+#: keys so retuning one cannot silently move the other.
+DEFAULT_L2_SEMANTIC_FLOOR = 0.77
+
+#: Candidates fetched per requested hit when a project scope cannot be pushed
+#: into LanceDB as a prefilter. Without it another project's rows can fill the
+#: whole shortlist and the scoped rows never surface at all.
+_L2_SEMANTIC_OVERFETCH = 5
+
+#: Stated on every CLI L2 answer. The two channels both land on [0, 1] but
+#: measure different things — one measures meaning, the other measures wording —
+#: and each is cut by its own floor. Leaving that unsaid would let a caller
+#: treat a lexical 0.8 as a semantic 0.8, which is the same class of error as
+#: the hardcoded 0.9 this replaced.
 _L2_RANKING_NOTE = (
-    "L2 reached through the CLI is keyword-scored (no embedding model is "
-    "loaded here). score = matched query terms over min(terms, 3), taking the "
+    "L2 reached through the CLI is keyword-scored (no embedding model is used "
+    "on this path). score = matched query terms over min(terms, 3), taking the "
     "better of a phrase match and a word match, on [0,1]. That is a lexical "
-    "measure, not the in-plugin cosine score, and it is cut by its own floor "
-    "(recall.l2_lexical_min_score) rather than recall.l2_min_score — the two "
+    "measure, not a cosine score, and it is cut by its own floor "
+    "(recall.l2_lexical_min_score) rather than recall.l2_min_score — the "
     "channels are not interchangeable. score_basis and floor_source say which "
     "one produced these hits.")
+
+#: The counterpart note for the vector channel. Kept as a separate string
+#: rather than merged into one paragraph: a caller that reads the note has to be
+#: able to tell which channel actually produced the hits it is looking at.
+_L2_SEMANTIC_NOTE = (
+    "L2 reached through the CLI is vector-scored: the query is embedded by the "
+    "same backend the plugin uses and matched by LanceDB cosine distance, "
+    "mapped to [0,1] as 1 - d/2. That is a semantic measure, not the lexical "
+    "coverage fraction, and it is cut by its own floor "
+    "(recall.l2_semantic_min_score) — never by recall.l2_min_score, and never "
+    "by the lexical floor. The 'semantic' block in the ranking says whether "
+    "this channel was available; a lexical answer is a degradation, not a "
+    "choice.")
 
 #: Terms that carry no retrieval signal in either language. Deliberately short
 #: and generic: a longer list tuned against the queries it is measured on would
@@ -627,18 +665,17 @@ def l2_lexical_score(query: str, content: str) -> float:
     return max(term_score, phrase_score)
 
 
-def _resolve_l2_floor(explicit=None) -> tuple:
-    """Resolve the CLI's lexical L2 floor as ``(floor, source)``.
+def _resolve_named_floor(key: str, explicit=None, default: float = 0.0) -> tuple:
+    """Resolve one ``recall.<key>`` threshold as ``(floor, source)``.
+
+    Shared by the lexical and the semantic channel so they can never drift
+    apart in *how* a threshold is resolved — only in which key each reads.
 
     ``source`` names where the number came from, so the answer can distinguish
     "the operator tuned this" from "the built-in calibration" instead of
     implying a gate that was configured when it was not. Order: explicit
-    argument, plugin ``recall.l2_lexical_min_score``, the same key in
-    ``governed_memory.json``, then :data:`DEFAULT_L2_LEXICAL_FLOOR`.
-
-    Deliberately never falls back to ``recall.l2_min_score``: that value is
-    calibrated on cosine similarity, and reusing it here is precisely the
-    defect this function exists to prevent.
+    argument, plugin ``recall.<key>``, the same key in ``governed_memory.json``,
+    then ``default``.
     """
     def _coerce(value):
         try:
@@ -651,23 +688,53 @@ def _resolve_l2_floor(explicit=None) -> tuple:
         if value is not None:
             return value, "explicit"
     try:
-        value = _coerce(getattr(plugin_config().recall, "l2_lexical_min_score", None))
+        value = _coerce(getattr(plugin_config().recall, key, None))
         if value is not None:
             return value, "config"
     except Exception:  # noqa: BLE001 — a missing config must not blind recall
         pass
     try:
-        value = _coerce((load_config().get("recall") or {}).get("l2_lexical_min_score"))
+        value = _coerce((load_config().get("recall") or {}).get(key))
         if value is not None:
             return value, "config-file"
     except Exception:  # noqa: BLE001
         pass
-    return DEFAULT_L2_LEXICAL_FLOOR, "default"
+    return default, "default"
+
+
+def _resolve_l2_floor(explicit=None) -> tuple:
+    """Resolve the CLI's **lexical** L2 floor as ``(floor, source)``.
+
+    Deliberately never falls back to ``recall.l2_min_score``: that value is
+    calibrated on cosine similarity, and reusing it here is precisely the
+    defect this function exists to prevent. See
+    :data:`DEFAULT_L2_LEXICAL_FLOOR`.
+    """
+    return _resolve_named_floor("l2_lexical_min_score", explicit,
+                                DEFAULT_L2_LEXICAL_FLOOR)
+
+
+def _resolve_l2_semantic_floor(explicit=None) -> tuple:
+    """Resolve the CLI's **semantic** L2 floor as ``(floor, source)``.
+
+    Its own key, ``recall.l2_semantic_min_score`` — never ``l2_min_score``.
+    That one is the *in-plugin* channel's threshold; sharing it would couple
+    two channels that are meant to be tunable independently and would hide
+    which of them an operator just changed.
+
+    The default happens to sit near the plugin's because both measure bge-m3
+    cosine similarity (see :data:`DEFAULT_L2_SEMANTIC_FLOOR`) — the same
+    quantity, so similar numbers are expected — but they are read from separate
+    keys on purpose, and neither is ever compared against a lexical score.
+    """
+    return _resolve_named_floor("l2_semantic_min_score", explicit,
+                                DEFAULT_L2_SEMANTIC_FLOOR)
 
 
 def _l2_ranking(ranked: bool, floor: float, source: str,
                 filtered: int = 0, truncated: int = 0,
-                note: str = None) -> dict:
+                note: str = None, basis: str = "lexical-dis-max",
+                semantic: dict = None) -> dict:
     """Metadata describing *how* the L2 hits were produced.
 
     Reported separately from the hits because a score without its basis is
@@ -676,30 +743,168 @@ def _l2_ranking(ranked: bool, floor: float, source: str,
     ``filtered_out`` count is load-bearing — it is what made this defect
     visible in QA (`filtered_out: 3` next to `hits: []`), so it is never
     dropped, even when it is zero.
+
+    ``basis`` names the channel that produced these hits. ``semantic`` describes
+    the vector channel whenever it was attempted: whether it was available, why
+    not when it was not, and the floor it would have used. It is emitted even
+    on a lexical answer, because a lexical answer is then a *degradation* and
+    the caller is entitled to know that — otherwise "I searched semantically and
+    found nothing" and "I could not embed at all" look identical.
     """
-    return {
+    out = {
         "ranked": ranked,
-        "basis": "lexical-dis-max",
+        "basis": basis,
         "floor": floor,
         "floor_source": source,
         "filtered_out": filtered,
         "truncated": truncated,
-        "note": _L2_RANKING_NOTE if note is None else note,
+        "note": ((_L2_RANKING_NOTE if basis == "lexical-dis-max"
+                  else _L2_SEMANTIC_NOTE) if note is None else note),
     }
+    if semantic is not None:
+        out["semantic"] = semantic
+    return out
+
+
+def _l2_semantic_hits(query: str, top_k: int, project: str = "",
+                      errors: list = None) -> dict:
+    """Vector L2 hits for ``query``: embed it, then search by cosine distance.
+
+    Reuses the plugin rather than reimplementing any part of it. The embedding
+    backend (:class:`EmbeddingService`), the distance→score mapping
+    (:func:`_recall.distance_to_score`) and the project predicate
+    (:func:`_recall.l2_project_where` / ``l2_project_allows``) are the very
+    objects the in-plugin channel uses. A second copy of any of them is exactly
+    how two entry points end up giving two answers to one question.
+
+    Returns a verdict dict and never raises:
+    ``{"available", "hits", "floor", "floor_source", "filtered_out",
+    "truncated", "reason", "backend"}``.
+
+    ``available`` is False when the query could not be embedded or the store
+    could not be searched; ``reason`` then says why. The caller is expected to
+    fall back to the lexical channel **and say so** — silently returning an
+    empty L2 would read to an agent as "nothing has been remembered", which is
+    the worst answer this module can give.
+    """
+    floor, floor_source = _resolve_l2_semantic_floor(None)
+    out = {"available": False, "hits": [], "floor": floor,
+           "floor_source": floor_source, "filtered_out": 0, "truncated": 0,
+           "reason": "", "backend": ""}
+
+    def _unavailable(reason: str) -> dict:
+        out["reason"] = reason
+        if errors is not None:
+            errors.append(f"l2 semantic: {reason}")
+        return out
+
+    try:
+        cfg = plugin_config()
+        embedding = plugin_module("_embedding").EmbeddingService.get(cfg)
+    except Exception as e:  # noqa: BLE001 — a bare interpreter must still answer
+        return _unavailable("semantic unavailable: cannot load the embedding "
+                            f"backend ({type(e).__name__}: {e})")
+    if not embedding.available:
+        return _unavailable(
+            "semantic unavailable: no embedding backend able to embed this "
+            f"query ({embedding.last_error or 'backend reported unavailable'})")
+    try:
+        vector = embedding.embed_one(query)
+    except Exception as e:  # noqa: BLE001
+        return _unavailable("semantic unavailable: embedding failed "
+                            f"({type(e).__name__}: {e})")
+    if vector is None:
+        return _unavailable(
+            "semantic unavailable: the embedding backend returned no vector "
+            f"({embedding.last_error or 'no detail given'})")
+
+    try:
+        import lancedb
+
+        recall_mod = plugin_module("_recall")
+        # Checked before connecting: lancedb.connect() would otherwise *create*
+        # the directory, and a read must not have that side effect.
+        if not Path(str(cfg.l2_db_path)).exists():
+            return _unavailable("semantic unavailable: l2 directory missing")
+        db = lancedb.connect(str(cfg.l2_db_path))
+        names = [t.name if hasattr(t, "name") else str(t)
+                 for t in db.list_tables().tables]
+        if "memories" not in names:
+            return _unavailable("semantic unavailable: no 'memories' table")
+        table = db.open_table("memories")
+        if not any(f.name == "vector" for f in table.schema):
+            return _unavailable("semantic unavailable: 'memories' has no "
+                                "vector column, so no row can be matched by "
+                                "meaning")
+        limit = max(int(top_k or 0), 1)
+        search = table.search(vector).metric("cosine")
+        prefiltered = False
+        if project:
+            try:
+                search = search.where(recall_mod.l2_project_where(project),
+                                      prefilter=True)
+                prefiltered = True
+            except Exception:  # noqa: BLE001 — older LanceDB has no prefilter
+                limit = limit * _L2_SEMANTIC_OVERFETCH
+        hits, filtered = [], 0
+        for r in search.limit(limit).to_list():
+            if project and not prefiltered \
+                    and not recall_mod.l2_project_allows(project, r.get("project")):
+                continue
+            score = recall_mod.distance_to_score(r.get("_distance"))
+            if score < floor:
+                filtered += 1
+                continue
+            hit = {"layer": "l2", "content": str(r.get("content", ""))[:600],
+                   "score": round(score, 4),
+                   "score_basis": "semantic-cosine"}
+            if r.get("agent"):
+                hit["agent"] = r.get("agent")
+            if r.get("project"):
+                hit["project"] = str(r.get("project"))
+            hits.append(hit)
+        hits.sort(key=lambda h: h["score"], reverse=True)
+        kept = hits[:max(int(top_k or 0), 0)]
+        out.update({"available": True, "hits": kept, "filtered_out": filtered,
+                    "truncated": len(hits) - len(kept),
+                    "backend": getattr(embedding, "backend_name", "") or ""})
+        return out
+    except Exception as e:  # noqa: BLE001
+        return _unavailable("semantic unavailable: vector search failed "
+                            f"({type(e).__name__}: {e})")
 
 
 def search_l2(query: str, top_k: int, errors: list = None,
               project: str = "", l2_floor: float = None) -> list:
-    """Keyword-scan L2 without an embedding model. See :func:`recall_l2`."""
-    return recall_l2(query, top_k, errors, project, l2_floor)["hits"]
+    """Keyword-scan L2 without an embedding model. See :func:`recall_l2`.
+
+    Lexical **by construction**. "Without an embedding model" is the contract of
+    this wrapper, so it passes ``lexical_only=True`` rather than relying on the
+    backend happening to be unavailable — which also keeps every lexical test
+    deterministic and offline instead of silently depending on a network call.
+    """
+    return recall_l2(query, top_k, errors, project, l2_floor,
+                     lexical_only=True)["hits"]
 
 
 def recall_l2(query: str, top_k: int, errors: list = None,
-              project: str = "", l2_floor: float = None) -> dict:
-    """Keyword-scan L2 without an embedding model, ranked and thresholded.
+              project: str = "", l2_floor: float = None,
+              lexical_only: bool = False) -> dict:
+    """L2 recall through the CLI, ranked and thresholded.
 
-    Returns ``{"hits": [...], "ranking": {...}}``. Hits are ordered by
-    relevance and every one of them is at or above the floor.
+    Two channels, one answer. The **semantic** channel embeds the query with the
+    backend the plugin uses and searches by cosine; it is tried first, and when
+    it works it *replaces* the lexical one rather than being merged into it —
+    the two scores are different quantities, and ranking them in one list would
+    be the same dimension error as thresholding one with the other's floor. The
+    **lexical** channel is the fallback, used when ``lexical_only`` is set or
+    when no embedding backend can serve the query.
+
+    Returns ``{"hits": [...], "ranking": {...}}``. ``ranking["basis"]`` says
+    which channel produced the hits and ``ranking["semantic"]`` says whether the
+    vector channel was available and, if not, why — so a lexical answer is never
+    mistaken for a semantic one, and a degradation never looks like a choice.
+
 
     Two things the previous version got wrong, both of which made the shared
     entry point the weakest implementation of the same query:
@@ -725,10 +930,30 @@ def recall_l2(query: str, top_k: int, errors: list = None,
     ``project`` narrows the result to one project *plus* the global facts that
     belong to no project in particular.
 
-    ``l2_floor`` overrides the configured threshold; ``None`` resolves it
-    through :func:`_resolve_l2_floor`.
+    ``l2_floor`` overrides the configured *lexical* threshold; ``None`` resolves
+    it through :func:`_resolve_l2_floor`. It has no effect on the semantic
+    channel, which resolves its own floor through
+    :func:`_resolve_l2_semantic_floor`.
+
+    ``lexical_only`` skips the vector channel entirely — for A/B comparison, for
+    offline use, and for callers that want the wording-level answer.
     """
     floor, floor_source = _resolve_l2_floor(l2_floor)
+
+    # Tried first, and when it works it is the answer. Not merged: see the
+    # docstring. When it cannot run, `semantic` keeps the reason and is attached
+    # to the lexical ranking below, so the fallback is visible rather than
+    # looking like a deliberate keyword search.
+    semantic = None
+    if not lexical_only:
+        semantic = _l2_semantic_hits(query, top_k, project, errors)
+        if semantic["available"]:
+            return {"hits": semantic["hits"],
+                    "ranking": _l2_ranking(
+                        True, semantic["floor"], semantic["floor_source"],
+                        filtered=semantic["filtered_out"],
+                        truncated=semantic["truncated"],
+                        basis="semantic-cosine", semantic=semantic)}
 
     def _fail(msg: str) -> dict:
         if errors is not None:
@@ -740,7 +965,8 @@ def recall_l2(query: str, top_k: int, errors: list = None,
                 "ranking": _l2_ranking(False, floor, floor_source,
                                        note="L2 could not be read, so no hits "
                                             "were ranked or filtered; see the "
-                                            "'degraded' entry for the reason.")}
+                                            "'degraded' entry for the reason.",
+                                       semantic=semantic)}
 
     try:
         import lancedb
@@ -770,7 +996,8 @@ def recall_l2(query: str, top_k: int, errors: list = None,
                     else [None] * len(contents))
         if not (l2_query_terms(query) or l2_phrase_terms(query)):
             return {"hits": [],
-                    "ranking": _l2_ranking(True, floor, floor_source)}
+                    "ranking": _l2_ranking(True, floor, floor_source,
+                                           semantic=semantic)}
         hits, filtered = [], 0
         for c, ag, pj in zip(contents, agents, projects):
             c = str(c or "")
@@ -802,7 +1029,8 @@ def recall_l2(query: str, top_k: int, errors: list = None,
         kept = hits[:max(int(top_k or 0), 0)]
         return {"hits": kept,
                 "ranking": _l2_ranking(True, floor, floor_source, filtered,
-                                       len(hits) - len(kept))}
+                                       len(hits) - len(kept),
+                                       semantic=semantic)}
     except Exception as e:  # noqa: BLE001
         return _fail(str(e)[:200])
 
@@ -1536,6 +1764,10 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--project", default="",
                    help="Narrow L2 to this project plus global facts "
                         "(default: no narrowing — search every project)")
+    p.add_argument("--lexical-only", action="store_true",
+                   help="Skip the vector channel and answer from keywords "
+                        "alone (A/B comparison, offline use). The ranking "
+                        "says which channel was used either way.")
 
     ks = sub.add_parser("kb-search", parents=[common],
                         help="Search the Obsidian knowledge base")
@@ -1608,7 +1840,8 @@ def main():
     if args.cmd == "recall":
         degraded: list = []
         scoped = normalize_project(getattr(args, "project", "") or "")
-        l2 = recall_l2(args.query, args.top_k, degraded, project=scoped)
+        l2 = recall_l2(args.query, args.top_k, degraded, project=scoped,
+                       lexical_only=getattr(args, "lexical_only", False))
         kb_refused: list = []
         out = {
             "query": args.query,
