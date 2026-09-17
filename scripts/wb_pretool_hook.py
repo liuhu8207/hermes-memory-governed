@@ -60,7 +60,24 @@ for _stream in (sys.stdout, sys.stderr):
 PROTECTED_NAMES = ("MEMORY.md", "USER.md", "persona.md", "persona_meta.json")
 
 #: Tools whose whole purpose is writing a file — matched on the path alone.
-FILE_WRITE_TOOLS = ("Edit", "Write", "MultiEdit", "NotebookEdit")
+#:
+#: Two naming styles, both accepted on purpose. The hook reference states that
+#: the ``matcher`` accepts either style, but that the ``tool_name`` the *script*
+#: receives depends on the run environment: the CLI uses ``Write`` / ``Edit`` /
+#: ``Bash`` while the IDE uses ``write_to_file`` / ``replace_in_file`` /
+#: ``execute_command``. Measured 2026-09-17 in this environment, the names are
+#: CLI-style (Bash 1307, Edit 370, Write 108 across one evening's sessions) — so
+#: the guard did work. It would have failed *silently* under the other style,
+#: which is the failure this project keeps meeting: not a crash, just a rule that
+#: quietly stops being enforced. Accepting both costs one tuple.
+FILE_WRITE_TOOLS = (
+    "Edit", "Write", "MultiEdit", "NotebookEdit",                 # CLI style
+    "replace_in_file", "write_to_file", "multi_replace_in_file",  # IDE style
+    "insert_content", "apply_diff", "create_file",
+)
+
+#: The shell tool, likewise under both names.
+SHELL_TOOLS = ("Bash", "execute_command")
 
 #: Tokens that make a shell command a write rather than a read. Narrow on
 #: purpose: a false positive here blocks real work.
@@ -187,7 +204,7 @@ def decide(payload: dict) -> tuple:
                 return "deny", REASON.format(name=hit), tool, hit
         return "allow", "", tool, ""
 
-    if tool == "Bash":
+    if tool in SHELL_TOOLS:
         strings = []
         _strings(tool_input, strings)
         # Both conditions are required: naming the file is not enough (the agent

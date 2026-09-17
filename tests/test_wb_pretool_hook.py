@@ -127,6 +127,41 @@ class TestTheShellPath:
         assert hook.decide(bash("wc -l ./memory/MEMORY.md"))[0] == "allow"
 
 
+class TestBothToolNamingStyles:
+    """The hook reference warns the received ``tool_name`` depends on the host.
+
+    The CLI uses ``Edit`` / ``Write`` / ``Bash``; the IDE uses
+    ``replace_in_file`` / ``write_to_file`` / ``execute_command``. Measured
+    2026-09-17 this environment sends CLI-style names, so the guard worked — but
+    under the other style it would have answered "allow" to everything, with no
+    error anywhere. A rule that silently stops being enforced is this project's
+    recurring failure, so both spellings are accepted.
+    """
+
+    @pytest.mark.parametrize("tool", ["replace_in_file", "write_to_file",
+                                      "multi_replace_in_file", "insert_content"])
+    def test_ide_style_file_writers_are_recognised(self, tool):
+        payload = {"tool_name": tool,
+                   "tool_input": {"filePath": "C:/x/hermes/memory/MEMORY.md",
+                                  "content": "x"}}
+        decision, reason, _, hit = hook.decide(payload)
+        assert decision == "deny" and hit == "MEMORY.md", (
+            f"{tool} 是 IDE 风格名，没被识别 —— 守卫会静默失效")
+
+    def test_ide_style_shell_is_recognised(self):
+        payload = {"tool_name": "execute_command",
+                   "tool_input": {"command": "echo x >> C:/x/hermes/memory/USER.md"}}
+        assert hook.decide(payload)[0] == "deny"
+
+    def test_the_camel_case_path_key_is_read(self):
+        """The IDE example in the reference uses ``filePath``, not ``file_path``."""
+        assert "filePath" in hook.PATH_KEYS
+
+    def test_cli_style_still_works(self):
+        assert hook.decide(edit("C:/x/hermes/memory/MEMORY.md"))[0] == "deny"
+        assert hook.decide(bash("echo x >> C:/x/hermes/memory/MEMORY.md"))[0] == "deny"
+
+
 class TestTheContract:
     def _run(self, raw, capsys):
         import sys
