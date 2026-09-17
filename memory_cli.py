@@ -473,74 +473,215 @@ def search_l3(query: str, top_k: int, errors: list = None) -> list:
 
 
 # -- L2: LanceDB keyword scan (no embeddings) -------------------------------
+#: How many matched query terms count as "fully matched".
+#:
+#: The defect was a *ceiling*, not only a threshold. The previous score was
+#: ``matched / len(terms)``, which cannot exceed ``1/len(terms)``: every
+#: two-term query topped out at 0.5, so no threshold above 0.5 could ever admit
+#: one. Measured on the real store, applying ``recall.l2_min_score`` (0.76 — a
+#: *cosine* calibration) emptied the layer for 15 of 15 natural-language
+#: queries. Saturating the denominator encodes "three matched terms is as much
+#: evidence as a keyword channel has", which makes the score independent of how
+#: long the question happens to be.
+_L2_TERM_SATURATION = 3
+
+#: Floor for the CLI's lexical L2 channel, on that coverage scale.
+#:
+#: NOT ``recall.l2_min_score``. That one is calibrated on cosine similarity
+#: (relevant 8/8 at 0.8458~0.9095, irrelevant 8/8 at 0.6755~0.7515); a coverage
+#: fraction lives on an entirely different distribution, and reusing the value
+#: was the defect. Operators can override this via
+#: ``recall.l2_lexical_min_score`` in ``governed_memory.json``.
+#:
+#: Calibrated 2026-09-17 against the project's real store (21 facts) with the
+#: same 8-relevant / 8-irrelevant protocol as ``tmp/calibrate_l2.py``:
+#:
+#:     relevant   top1 in [0.667, 1.000]   8/8 kept
+#:     irrelevant top1 in [0.000, 0.333]   0/8 leaked
+#:
+#: The usable window is therefore (1/3, 1/2]: one matched term must keep a
+#: two-term query (0.5) but must not keep a three-term one (0.333), and 0.4 is
+#: a round value inside it with margin on both sides. For queries of three
+#: terms or more the score is quantised at 1/3, so nothing can land between
+#: 0.333 and 0.667 and the exact choice inside the window is not knife-edge.
+DEFAULT_L2_LEXICAL_FLOOR = 0.4
+
 #: Stated on every CLI L2 answer. The keyword channel and the in-plugin vector
-#: channel both land on [0, 1] and both are cut by ``recall.l2_min_score``, but
-#: they measure different things — one measures meaning, this one measures
-#: wording. Leaving that unsaid would let a caller treat a lexical hit as a
+#: channel both land on [0, 1], but they measure different things — one
+#: measures meaning, this one measures wording — and they are cut by different
+#: floors. Leaving that unsaid would let a caller treat a lexical hit as a
 #: semantic one, which is the same class of error as the hardcoded 0.9 it
 #: replaces.
 _L2_RANKING_NOTE = (
     "L2 reached through the CLI is keyword-scored (no embedding model is "
-    "loaded here): score = share of the query's distinct terms present in the "
-    "fact, on [0,1]. The range matches the in-plugin cosine score so "
-    "recall.l2_min_score means the same thing, but the measures are not "
-    "interchangeable — this channel is ranked and thresholded, not "
-    "vector-ranked.")
+    "loaded here). score = matched query terms over min(terms, 3), taking the "
+    "better of a phrase match and a word match, on [0,1]. That is a lexical "
+    "measure, not the in-plugin cosine score, and it is cut by its own floor "
+    "(recall.l2_lexical_min_score) rather than recall.l2_min_score — the two "
+    "channels are not interchangeable. score_basis and floor_source say which "
+    "one produced these hits.")
+
+#: Terms that carry no retrieval signal in either language. Deliberately short
+#: and generic: a longer list tuned against the queries it is measured on would
+#: be fitting the calibration set rather than the language.
+_L2_STOP_TERMS = frozenset("""
+的 了 是 在 我 你 他 她 它 们 有 和 与 就 不 都 也 很 到 说 要 去 会 着 好 这 那 哪 吗 呢 吧 啊 呀 么 之 其
+什么 怎么 怎样 如何 为什么 哪个 哪些 可以 能 能够 需要 应该 想 让 帮 请 一下 一个 一些 这个 那个
+我们 你们 他们 现在 已经 还是 或者 并且 如果 就是 还有 以及 等等 把 被 给 对 从 向 为 为了 于 以 及 或 但 而 则
+所 得 地 过 来 时 时候 里 外 中 后 前 多 少 大 小 太 真 好像 可能 大概 一直 才 只 更 最 非常 比较 有点 有些
+哪里 为啥 多少 能不能 还要 同时 别的 地方 出来 起来 下去 知道 觉得 感觉 帮忙 麻烦
+the a an of to in for on is are was were be been with and or not it its this that at by from as
+""".split())
+
+#: ASCII word or a run of CJK. Keeping the two apart matters: the legacy
+#: pattern ``[\w\u4e00-\u9fff]+`` glued ``本地IP通过`` into one unusable term.
+_L2_TOKEN_RE = re.compile(r"[A-Za-z0-9_]+|[\u4e00-\u9fff]+")
+_L2_ASCII_RE = re.compile(r"[A-Za-z0-9_]+")
+#: The legacy tokenizer, kept only to give phrase matching its units.
+_L2_PHRASE_RE = re.compile(r"[\w\u4e00-\u9fff]+")
 
 
-def l2_lexical_score(tokens, content: str) -> float:
-    """Share of the query's distinct terms that ``content`` contains, on [0, 1].
+def l2_query_terms(query: str) -> list:
+    """Distinct informative terms of a query: ASCII words + CJK bigrams.
 
-    Why a real score instead of the hardcoded ``0.9`` this replaced: the score
-    is the *only* input the ``recall.l2_min_score`` floor has, so a constant
-    turns the floor into a no-op — 0.9 clears every threshold anyone would
-    configure, and the CLI would keep presenting unranked, unfiltered keyword
-    hits as if they had passed the same gate the plugin applies.
-
-    Why [0, 1]: that is where the in-plugin L2 score lives
-    (``_recall.distance_to_score`` maps a cosine distance onto it), so one
-    configured floor means "relevant enough" on both channels.
+    Bigrams rather than single characters, because one CJK character is far too
+    common to be evidence — measured, unigram matching scored
+    ``Excel 怎么做数据透视表`` as high as the genuinely relevant
+    ``SecretStore 跑在哪台机器上``. And bigrams rather than whole runs, because
+    a run only ever matches in one word order: ``数据同步`` could never find
+    ``同步数据``, which is half of why the channel went empty.
     """
-    if not tokens:
+    out = []
+    for token in _L2_TOKEN_RE.findall(str(query or "")):
+        if _L2_ASCII_RE.fullmatch(token):
+            candidates = [token.lower()]
+        elif len(token) > 1:
+            candidates = [token[i:i + 2] for i in range(len(token) - 1)]
+        else:
+            candidates = [token]
+        for cand in candidates:
+            if cand not in _L2_STOP_TERMS and cand not in out:
+                out.append(cand)
+    return out
+
+
+def l2_doc_terms(content: str) -> set:
+    """The term set of a stored fact — the same tokenizer as the query side."""
+    return set(l2_query_terms(content))
+
+
+def l2_phrase_terms(query: str) -> list:
+    """Contiguous query phrases, MATCHED BY SUBSTRING.
+
+    The second matcher of the dis_max in :func:`l2_lexical_score`. An exact CJK
+    phrase is the highest-precision evidence available without a dictionary,
+    but as the *only* matcher it is brittle in word order — and that, combined
+    with a floor it could never reach, is what emptied the layer.
+    """
+    out = []
+    for token in _L2_PHRASE_RE.findall(str(query or "")):
+        token = token.lower()
+        if token not in _L2_STOP_TERMS and token not in out:
+            out.append(token)
+    return out
+
+
+def _saturated_rate(matched: int, total: int) -> float:
+    """``matched`` over a denominator that stops growing at the saturation point."""
+    if total <= 0:
         return 0.0
+    return min(1.0, matched / max(1, min(total, _L2_TERM_SATURATION)))
+
+
+def l2_lexical_score(query: str, content: str) -> float:
+    """Relevance of ``content`` to ``query`` on [0, 1], from lexical evidence.
+
+    ``dis_max`` over two matchers — exact phrase, and term overlap — because
+    neither alone is sufficient:
+
+    * phrase-only cannot match ``数据同步`` to ``同步数据``;
+    * term-only scores an unrelated query as high as a relevant one whenever a
+      *common* word happens to be rare inside a small store (measured:
+      ``Excel 怎么做数据透视表`` tied with ``SecretStore 跑在哪台机器上``,
+      because ``数据`` occurs in only 1 of the 21 facts).
+
+    Taking the better of the two keeps the phrase matcher's precision and the
+    term matcher's recall. The result is a *lexical* relevance: the same [0,1]
+    spirit as the in-plugin cosine score, but not the same quantity, and it is
+    thresholded as such.
+    """
     low = str(content or "").lower()
-    covered = sum(1 for t in tokens if t in low)
-    return covered / len(tokens)
+    if not low:
+        return 0.0
+    term_score = 0.0
+    terms = l2_query_terms(query)
+    if terms:
+        doc_terms = l2_doc_terms(str(content))
+        term_score = _saturated_rate(sum(1 for t in terms if t in doc_terms),
+                                     len(terms))
+    phrase_score = 0.0
+    phrases = l2_phrase_terms(query)
+    if phrases:
+        phrase_score = _saturated_rate(sum(1 for p in phrases if p in low),
+                                       len(phrases))
+    return max(term_score, phrase_score)
 
 
 def _resolve_l2_floor(explicit=None) -> tuple:
-    """Resolve the L2 score floor as ``(floor, resolved)``.
+    """Resolve the CLI's lexical L2 floor as ``(floor, source)``.
 
-    ``resolved`` is ``False`` when the plugin's threshold could not be read, so
-    the answer can say "unfiltered" instead of implying a gate that never ran.
+    ``source`` names where the number came from, so the answer can distinguish
+    "the operator tuned this" from "the built-in calibration" instead of
+    implying a gate that was configured when it was not. Order: explicit
+    argument, plugin ``recall.l2_lexical_min_score``, the same key in
+    ``governed_memory.json``, then :data:`DEFAULT_L2_LEXICAL_FLOOR`.
+
+    Deliberately never falls back to ``recall.l2_min_score``: that value is
+    calibrated on cosine similarity, and reusing it here is precisely the
+    defect this function exists to prevent.
     """
-    if explicit is not None:
+    def _coerce(value):
         try:
-            return float(explicit), True
+            return float(value)
         except (TypeError, ValueError):
-            return 0.0, False
+            return None
+
+    if explicit is not None:
+        value = _coerce(explicit)
+        if value is not None:
+            return value, "explicit"
     try:
-        recall = plugin_module("_recall")
-        return (recall.layer_score_floor("l2", getattr(plugin_config(), "recall", None)),
-                True)
-    except Exception:  # noqa: BLE001 — a missing threshold must not blind recall
-        return 0.0, False
+        value = _coerce(getattr(plugin_config().recall, "l2_lexical_min_score", None))
+        if value is not None:
+            return value, "config"
+    except Exception:  # noqa: BLE001 — a missing config must not blind recall
+        pass
+    try:
+        value = _coerce((load_config().get("recall") or {}).get("l2_lexical_min_score"))
+        if value is not None:
+            return value, "config-file"
+    except Exception:  # noqa: BLE001
+        pass
+    return DEFAULT_L2_LEXICAL_FLOOR, "default"
 
 
-def _l2_ranking(ranked: bool, floor: float, resolved: bool,
+def _l2_ranking(ranked: bool, floor: float, source: str,
                 filtered: int = 0, truncated: int = 0,
                 note: str = None) -> dict:
     """Metadata describing *how* the L2 hits were produced.
 
     Reported separately from the hits because a score without its basis is
     unfalsifiable: a caller cannot tell a filtered list from an unfiltered one,
-    nor a lexical 0.8 from a semantic 0.8, unless the answer says so.
+    nor a lexical 0.8 from a semantic 0.8, unless the answer says so. The
+    ``filtered_out`` count is load-bearing — it is what made this defect
+    visible in QA (`filtered_out: 3` next to `hits: []`), so it is never
+    dropped, even when it is zero.
     """
     return {
         "ranked": ranked,
-        "basis": "keyword-coverage",
+        "basis": "lexical-dis-max",
         "floor": floor,
-        "floor_resolved": resolved,
+        "floor_source": source,
         "filtered_out": filtered,
         "truncated": truncated,
         "note": _L2_RANKING_NOTE if note is None else note,
@@ -558,17 +699,23 @@ def recall_l2(query: str, top_k: int, errors: list = None,
     """Keyword-scan L2 without an embedding model, ranked and thresholded.
 
     Returns ``{"hits": [...], "ranking": {...}}``. Hits are ordered by
-    relevance and every one of them is at or above the L2 floor.
+    relevance and every one of them is at or above the floor.
 
     Two things the previous version got wrong, both of which made the shared
     entry point the weakest implementation of the same query:
 
-    * it emitted a hardcoded ``score`` of 0.9, so the calibrated L2 threshold
-      (0.76 — measured: relevant 8/8 at 0.8458~0.9095, irrelevant 8/8 at
-      0.6755~0.7515) could never reject anything coming through the CLI;
+    * it emitted a hardcoded ``score`` of 0.9, so no threshold could ever
+      reject anything coming through the CLI;
     * it stopped at the first ``top_k`` rows in *write order*, so the cut was
       arbitrary — the facts that happened to be written first won, and a
       caller had no way to know anything had been dropped.
+
+    And a third, introduced while fixing those two and caught by QA: the score
+    was a bare coverage fraction cut by ``recall.l2_min_score``, a threshold
+    calibrated on *cosine similarity*. Two independent errors — the wrong
+    dimension, and a ceiling of ``1/len(terms)`` that no multi-word query could
+    clear — left the layer empty for 15 of 15 natural-language queries. See
+    :data:`DEFAULT_L2_LEXICAL_FLOOR` and :func:`l2_lexical_score`.
 
     ``errors`` is an optional sink. L2 used to fail silently — an ImportError
     from a bare interpreter produced the same ``[]`` as a genuine no-match, and
@@ -578,11 +725,10 @@ def recall_l2(query: str, top_k: int, errors: list = None,
     ``project`` narrows the result to one project *plus* the global facts that
     belong to no project in particular.
 
-    ``l2_floor`` overrides the configured threshold; ``None`` reads
-    ``recall.l2_min_score`` through :func:`_recall.layer_score_floor`, the same
-    function the in-plugin path uses.
+    ``l2_floor`` overrides the configured threshold; ``None`` resolves it
+    through :func:`_resolve_l2_floor`.
     """
-    floor, resolved = _resolve_l2_floor(l2_floor)
+    floor, floor_source = _resolve_l2_floor(l2_floor)
 
     def _fail(msg: str) -> dict:
         if errors is not None:
@@ -591,7 +737,7 @@ def recall_l2(query: str, top_k: int, errors: list = None,
         # nothing could be read. Saying otherwise would let a caller read an
         # empty L2 as "searched and found nothing relevant".
         return {"hits": [],
-                "ranking": _l2_ranking(False, floor, resolved,
+                "ranking": _l2_ranking(False, floor, floor_source,
                                        note="L2 could not be read, so no hits "
                                             "were ranked or filtered; see the "
                                             "'degraded' entry for the reason.")}
@@ -622,12 +768,9 @@ def recall_l2(query: str, top_k: int, errors: list = None,
                   else [None] * len(contents))
         projects = (arr["project"].to_pylist() if "project" in arr.column_names
                     else [None] * len(contents))
-        # Distinct, lowercased: repeating a term in the query must not inflate
-        # the coverage denominator, and "the THE The" is one term, not three.
-        tokens = list(dict.fromkeys(
-            t.lower() for t in re.findall(r"[\w\u4e00-\u9fff]+", query or "")))
-        if not tokens:
-            return {"hits": [], "ranking": _l2_ranking(True, floor, resolved)}
+        if not (l2_query_terms(query) or l2_phrase_terms(query)):
+            return {"hits": [],
+                    "ranking": _l2_ranking(True, floor, floor_source)}
         hits, filtered = [], 0
         for c, ag, pj in zip(contents, agents, projects):
             c = str(c or "")
@@ -639,7 +782,7 @@ def recall_l2(query: str, top_k: int, errors: list = None,
             # it must not see is *another* project's facts.
             if project and pj and pj != project:
                 continue
-            score = l2_lexical_score(tokens, c)
+            score = l2_lexical_score(query, c)
             if score <= 0:
                 continue
             if score < floor:
@@ -647,7 +790,7 @@ def recall_l2(query: str, top_k: int, errors: list = None,
                 continue
             hit = {"layer": "l2", "content": c[:600],
                    "score": round(score, 4),
-                   "score_basis": "keyword-coverage"}
+                   "score_basis": "lexical-dis-max"}
             if ag:
                 hit["agent"] = ag
             if pj:
@@ -658,7 +801,7 @@ def recall_l2(query: str, top_k: int, errors: list = None,
         hits.sort(key=lambda h: h["score"], reverse=True)
         kept = hits[:max(int(top_k or 0), 0)]
         return {"hits": kept,
-                "ranking": _l2_ranking(True, floor, resolved, filtered,
+                "ranking": _l2_ranking(True, floor, floor_source, filtered,
                                        len(hits) - len(kept))}
     except Exception as e:  # noqa: BLE001
         return _fail(str(e)[:200])
@@ -978,6 +1121,56 @@ def safe_vault_path(vault, *parts: str) -> Path:
     return candidate
 
 
+#: Win32 device names. ``CON.md`` is rejected by the filesystem even though it
+#: looks like an ordinary filename, so it has to be rejected here first —
+#: otherwise the caller gets an OSError traceback instead of a verdict, and on
+#: the read side ``path.exists()`` can resolve to the console device itself.
+_WIN32_RESERVED_STEMS = frozenset(
+    {"con", "prn", "aux", "nul", "clock$"}
+    | {f"com{i}" for i in range(1, 10)}
+    | {f"lpt{i}" for i in range(1, 10)})
+
+
+def split_vault_section(section: str) -> list:
+    """Split a ``--section`` value into validated path components.
+
+    Containment (:func:`safe_vault_path`) stops a section *leaving* the vault;
+    this stops it being a name the filesystem cannot accept. That is a different
+    failure with a different symptom, and it was the one still escaping: on NTFS
+    ``notes:evil`` addresses an alternate data stream of ``notes`` — inside the
+    vault lexically, so containment passes it — and ``mkdir`` then raised an
+    uncaught ``NotADirectoryError``. No JSON, a bare traceback, and a caller
+    that cannot tell "refused" from "the tool is broken".
+
+    Raises:
+        VaultPathEscape: on a ``:`` (ADS) or any other Win32-forbidden
+            character, a ``..`` component, a trailing space/dot, a reserved
+            device name, or a section that is empty once split.
+    """
+    raw = str(section or "").replace("\\", "/")
+    parts = [p for p in raw.split("/") if p not in ("", ".")]
+    if not parts:
+        raise VaultPathEscape(
+            "refused: section must name a directory inside the vault")
+    for part in parts:
+        if part == "..":
+            raise VaultPathEscape(
+                f"refused: '..' is not allowed in a section ('{section}')")
+        bad = _ILLEGAL_FS.search(part)
+        if bad:
+            raise VaultPathEscape(
+                f"refused: {bad.group(0)!r} is not allowed in a section "
+                f"('{section}')")
+        if part.rstrip(" .") != part:
+            raise VaultPathEscape(
+                f"refused: a section name may not end with a space or a dot "
+                f"('{part}')")
+        if part.split(".")[0].lower() in _WIN32_RESERVED_STEMS:
+            raise VaultPathEscape(
+                f"refused: '{part}' is a reserved device name")
+    return parts
+
+
 # -- KB vault ---------------------------------------------------------------
 def iter_notes(config: dict, subdirs: list = None, errors: list = None) -> list:
     """Every note in the vault, or every note under the named sections.
@@ -992,10 +1185,13 @@ def iter_notes(config: dict, subdirs: list = None, errors: list = None) -> list:
     Hidden directories are skipped: ``.obsidian`` / ``.trash`` hold tooling, not
     notes. Root-level scaffold files (``index.md``) are not notes either.
 
+    Every note is re-checked for containment on its **real** path, because the
+    walk follows links and can leave the vault (see the loop below).
+
     ``errors`` is an optional sink: a ``--section`` that points outside the
     vault is skipped and named there, because returning "no such notes" for a
     query that was refused reads as an empty vault rather than a rejected
-    request.
+    request. Paths that leave the vault mid-walk are named there too.
     """
     vault = wiki_dir(config)
     roots = [vault] if subdirs is None else []
@@ -1006,17 +1202,43 @@ def iter_notes(config: dict, subdirs: list = None, errors: list = None) -> list:
             if errors is not None:
                 errors.append(str(e))
     out = []
+    # Judged against the *real* vault, computed once: the vault itself is a
+    # junction in production, and both sides of every comparison must resolve
+    # through the same rule for that to stay "inside".
+    vault_real = Path(os.path.realpath(str(vault)))
     for root in roots:
         if not root.exists():
             continue
         for p in sorted(root.rglob("*.md")):
-            if not p.is_file():
+            try:
+                if not p.is_file():
+                    continue
+            except OSError:
+                continue
+            # rglob FOLLOWS links, so the walk cannot be trusted to have stayed
+            # inside the vault: a junction or symlink under it — and the
+            # production ``wiki`` is itself a junction, so this is the normal
+            # case, not an exotic one — steps out, and a chain steps out
+            # further. Every hit is re-judged on its real path.
+            #
+            # The old code did the opposite: `except ValueError: out.append(p)`
+            # *kept* the out-of-vault files, so kb-search and recall returned
+            # the contents of whatever the link pointed at. Refusals are
+            # recorded rather than dropped silently — an empty result and a
+            # rejected walk look identical to a caller otherwise.
+            real = Path(os.path.realpath(str(p)))
+            if not _is_within(real, vault_real):
+                if errors is not None:
+                    errors.append(
+                        f"refused: '{p}' resolves to '{real}', outside the "
+                        f"vault '{vault_real}'")
                 continue
             try:
                 rel = p.relative_to(vault)
             except ValueError:
-                out.append(p)
-                continue
+                # Reachable only via a link that stays inside the vault; the
+                # visible identity is then the real one.
+                rel = real.relative_to(vault_real)
             if any(part.startswith(".") for part in rel.parts[:-1]):
                 continue
             if len(rel.parts) == 1 and rel.stem.lower() in _VAULT_SCAFFOLD:
@@ -1134,14 +1356,36 @@ def cmd_kb_add(config: dict, title: str, body: str, section: str,
     # escaping path would happily build the target outside the vault, and the
     # note would then "succeed" into a place nothing reads.
     try:
-        subdir = safe_vault_path(vault, section)
-        path = safe_vault_path(subdir, slugify(title) + ".md")
+        subdir = safe_vault_path(vault, *split_vault_section(section))
+        filename = slugify(title) + ".md"
+        path = safe_vault_path(subdir, filename)
     except VaultPathEscape as e:
         return {"ok": False, "error": str(e),
                 "hint": ("--section must name a directory inside the vault; "
                          "use kb-add with a plain section name such as 'notes'")}
 
-    subdir.mkdir(parents=True, exist_ok=True)
+    if filename.split(".")[0].lower() in _WIN32_RESERVED_STEMS:
+        # Refused rather than renamed: silently writing "_CON.md" would make
+        # the note unfindable by the title the caller asked for.
+        return {"ok": False,
+                "error": f"refused: '{filename}' is a reserved device name",
+                "hint": "choose a different title"}
+    if subdir.exists() and not subdir.is_dir():
+        # e.g. --section "notes/seed.md", where a note already owns that name.
+        return {"ok": False,
+                "error": f"refused: '{subdir}' exists and is not a directory",
+                "hint": "pick a different section name"}
+
+    try:
+        subdir.mkdir(parents=True, exist_ok=True)
+    except OSError as e:
+        # Last line of defence for anything the checks above did not anticipate
+        # (a read-only vault, a name only the driver objects to). A refusal the
+        # caller can read beats a traceback it cannot act on.
+        return {"ok": False,
+                "error": (f"refused: cannot create section '{section}': "
+                          f"{type(e).__name__}: {e}")[:300],
+                "hint": "pick a different section name"}
 
     now = time.strftime("%Y-%m-%dT%H:%M:%S", time.localtime())
     existed = path.exists()
@@ -1176,12 +1420,27 @@ def cmd_kb_add(config: dict, title: str, body: str, section: str,
             "created": created, "updated": now}
     text = dump_frontmatter(meta) + "\n\n" + body.rstrip() + "\n"
 
-    # Atomic write: one agent must never observe a half-written note.
-    fd, tmp = tempfile.mkstemp(dir=str(subdir), suffix=".tmp")
+    # Atomic write: one agent must never observe a half-written note. Failures
+    # come back as a verdict rather than a traceback — the caller is an agent,
+    # and "the tool crashed" is not something it can act on.
+    try:
+        fd, tmp = tempfile.mkstemp(dir=str(subdir), suffix=".tmp")
+    except OSError as e:
+        return {"ok": False,
+                "error": (f"refused: cannot write into '{subdir}': "
+                          f"{type(e).__name__}: {e}")[:300]}
     try:
         with os.fdopen(fd, "w", encoding="utf-8") as f:
             f.write(text)
         os.replace(tmp, path)
+    except OSError as e:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        return {"ok": False,
+                "error": (f"refused: cannot write '{path}': "
+                          f"{type(e).__name__}: {e}")[:300]}
     except BaseException:
         try:
             os.unlink(tmp)

@@ -1,19 +1,22 @@
 # -*- coding: utf-8 -*-
-"""Vault containment (P0) and CLI L2 ranking / schema (P1) regression tests.
+"""Vault containment (P0), CLI L2 recall calibration (P0), and structured
+refusals (P1) — regression tests.
 
-Two unrelated-looking failures share a cause, which is why they share a file:
-in both cases the *shared* entry point quietly implemented a weaker version of
-a contract the plugin already honoured.
+Three failures with one shared cause: the *shared* entry point quietly
+implemented a weaker contract than the plugin behind it.
 
-* ``kb-add --section`` joined attacker-controlled text straight onto the vault
-  path, so ``--section ../memory`` wrote MEMORY.md — the human-authored L1
-  rulebook the CLI documents as not writable by any agent.
-* The CLI's L2 channel scored every keyword hit ``0.9``, so the calibrated L2
-  threshold could never reject anything, and it returned hits in write order
-  without saying it had truncated them.
+* ``kb-add --section`` was joined straight onto the vault path, so
+  ``--section ../memory`` wrote MEMORY.md — the human-authored L1 rulebook the
+  CLI documents as unwritable by any agent.
+* The CLI's L2 channel scored every keyword hit ``0.9``, so no threshold could
+  reject anything; the fix then applied a *cosine*-calibrated threshold to a
+  coverage fraction, whose ceiling is ``1/len(query terms)``. Measured on the
+  real store that emptied L2 for 15 of 15 natural-language queries.
+* ``--section 'memory:evil'`` is lexically inside the vault, so containment
+  passed it and ``mkdir`` raised an uncaught ``NotADirectoryError``: no JSON, a
+  bare traceback, and a caller that cannot tell "refused" from "broken".
 
-Both were invisible to the suite because the tests that existed exercised the
-paths that already worked.
+Every scenario below failed before its fix.
 """
 
 from __future__ import annotations
@@ -21,6 +24,7 @@ from __future__ import annotations
 import json
 import os
 import subprocess
+import sys
 import types
 from pathlib import Path
 
@@ -54,18 +58,18 @@ def store(tmp_path, monkeypatch):
 def _make_link(link: Path, target: Path) -> bool:
     """Point ``link`` at ``target`` as a symlink, or a junction as a fallback.
 
-    Junctions matter and are the realistic case on this machine (both
-    ``hermes-home`` and ``wiki`` are junctions): creating a symlink on Windows
-    needs Developer Mode or elevation, while a junction needs neither, so a
-    symlink-only helper would silently stop testing the interesting case.
+    Junctions matter and are the realistic case on this machine (the production
+    ``wiki`` and ``hermes-home`` are both junctions): creating a symlink on
+    Windows needs Developer Mode or elevation, while a junction needs neither,
+    so a symlink-only helper would silently stop testing the interesting case.
     """
     try:
         link.symlink_to(target, target_is_directory=True)
         if cli._is_link(link):
             return True
         # Seen on this machine: symlink_to returns without error and creates
-        # nothing (no Developer Mode), which would make the test below pass for
-        # the wrong reason — it would be checking a path that is not a link.
+        # nothing, which would make a test below pass for the wrong reason — it
+        # would be checking a path that is not a link at all.
         if link.exists():
             link.rmdir()
     except (OSError, NotImplementedError, ValueError):
@@ -81,15 +85,15 @@ def _make_link(link: Path, target: Path) -> bool:
 class TestKbAddSectionContainment:
     """``--section`` is caller-controlled text and was joined unchecked.
 
-    The refusal has to be loud. The pre-fix behaviour returned ``ok: true``
-    with a path outside the vault, so an agent could rewrite L1 while its own
-    health check kept reporting success.
+    The refusal has to be loud: the pre-fix behaviour returned ``ok: true`` with
+    a path outside the vault, so an agent could rewrite L1 while its own health
+    check kept reporting success.
     """
 
     @staticmethod
     def _sections():
         out = ["../memory", "../../memory", "notes/../../memory"]
-        if os.altsep == "\\":  # Windows: the backslash really is a separator
+        if os.name == "nt":
             out.append("..\\memory")
         return out
 
@@ -98,10 +102,17 @@ class TestKbAddSectionContainment:
         out = cli.cmd_kb_add(store.cfg, "MEMORY", "pwned", section,
                              [], [], None, agent="dsh")
         assert out["ok"] is False
-        assert "outside the vault" in out["error"]
+        assert out["error"].startswith("refused:")
         # The write must not land anywhere: a silently relocated note is worse
         # than a refused one, because nothing signals the loss.
         assert not list(store.home.parent.rglob("MEMORY.md"))
+
+    def test_safe_vault_path_itself_refuses_parent_traversal(self, store):
+        # Kept as a unit-level guard: the section validator rejects '..' before
+        # this is reached, so without this test the containment check itself
+        # could rot unnoticed.
+        with pytest.raises(cli.VaultPathEscape):
+            cli.safe_vault_path(store.vault, "../memory", "MEMORY.md")
 
     def test_absolute_section_is_refused(self, store, tmp_path):
         outside = tmp_path / "outside"
@@ -132,9 +143,9 @@ class TestKbAddSectionContainment:
         assert not (outside / "MEMORY.md").exists()
 
     def test_the_naive_join_would_have_escaped(self, store):
-        # Pins the mechanism rather than one exploit: if the containment check
-        # is ever swapped back for `vault / section`, this fails even though
-        # every other assertion here still passes.
+        # Pins the mechanism rather than one exploit: if containment is ever
+        # swapped back for `vault / section`, this fails even though every other
+        # assertion here still passes.
         naive = Path(os.path.normpath(str(store.vault / "../memory" / "MEMORY.md")))
         assert not cli._is_within(naive, Path(os.path.abspath(str(store.vault))))
 
@@ -173,10 +184,130 @@ class TestKbSearchSectionContainment:
         assert refused == []
 
 
-# -- P1: CLI L2 ranking -----------------------------------------------------
+# -- P1: the read path follows links too ------------------------------------
+class TestVaultWalkContainment:
+    """``rglob`` follows links, so the walk cannot be trusted to stay inside.
+
+    The old code did the opposite of checking: ``except ValueError:
+    out.append(p)`` kept whatever the walk found outside, so ``kb-search`` and
+    ``recall`` returned the contents of whatever a link pointed at — including
+    files the vault has no business exposing.
+    """
+
+    def test_an_out_of_vault_path_from_the_walk_is_refused_and_named(
+            self, store, monkeypatch):
+        outside = store.home.parent / "outside"
+        outside.mkdir(parents=True, exist_ok=True)
+        stray = outside / "stray.md"
+        stray.write_text("---\ntitle: stray\n---\nZIGZAG_TOKEN_91827364\n",
+                         encoding="utf-8")
+
+        real_rglob = Path.rglob
+
+        def fake_rglob(self, pattern, **kwargs):
+            # Emulates a junction under the vault: the walk hands back a path
+            # whose real location is outside. Deterministic on every platform,
+            # unlike depending on whether rglob follows links here.
+            yield from real_rglob(self, pattern, **kwargs)
+            yield stray
+
+        monkeypatch.setattr(Path, "rglob", fake_rglob)
+        errors: list = []
+        notes = cli.iter_notes(store.cfg, None, errors)
+        assert stray not in notes
+        assert any("outside the vault" in e for e in errors), errors
+        # And nothing from outside reaches the search results.
+        hits = cli.cmd_kb_search(store.cfg, "ZIGZAG_TOKEN_91827364", 5, "")
+        assert hits == []
+
+    def test_a_junction_under_the_vault_is_not_read_through(self, store,
+                                                            tmp_path):
+        outside = tmp_path / "outside"
+        outside.mkdir()
+        (outside / "secret.md").write_text(
+            "---\ntitle: secret\n---\nZIGZAG_TOKEN_91827364\n", encoding="utf-8")
+        link = store.vault / "notes" / "leak"
+        if not _make_link(link, outside):
+            pytest.skip("cannot create a symlink or junction in this environment")
+
+        hits = cli.cmd_kb_search(store.cfg, "ZIGZAG_TOKEN_91827364", 5, "")
+        assert hits == []
+        vault_real = Path(os.path.realpath(str(store.vault)))
+        for note in cli.iter_notes(store.cfg, None, []):
+            assert cli._is_within(Path(os.path.realpath(str(note))), vault_real)
+
+    def test_a_link_chain_is_resolved_not_just_one_hop(self, store, tmp_path):
+        # Two hops: vault/notes/hop -> vault/notes/hop2 -> outside.
+        outside = tmp_path / "outside"
+        outside.mkdir()
+        (outside / "secret.md").write_text(
+            "---\ntitle: secret\n---\nZIGZAG_TOKEN_91827364\n", encoding="utf-8")
+        hop2 = store.vault / "notes" / "hop2"
+        if not _make_link(hop2, outside):
+            pytest.skip("cannot create a symlink or junction in this environment")
+        hop = store.vault / "notes" / "hop"
+        if not _make_link(hop, hop2):
+            pytest.skip("cannot create a chain in this environment")
+        hits = cli.cmd_kb_search(store.cfg, "ZIGZAG_TOKEN_91827364", 5, "")
+        assert hits == []
+
+
+# -- P1: refusals must be verdicts, not tracebacks --------------------------
+class TestSectionRefusalIsStructuredJson:
+    """A caller that is an agent cannot act on a traceback."""
+
+    @pytest.mark.parametrize("section", [
+        "memory:evil",          # NTFS alternate data stream
+        "notes:evil",
+        "notes*", "no?tes", "no|tes", 'no"tes', "no\x01tes",
+        ".", "./",
+    ])
+    def test_bad_section_names_are_refused_with_a_verdict(self, store, section):
+        out = cli.cmd_kb_add(store.cfg, "T", "body", section, [], [], None)
+        assert isinstance(out, dict)
+        assert out["ok"] is False
+        assert out["error"].startswith("refused:")
+
+    def test_an_omitted_section_still_defaults_to_notes(self, store):
+        # Pre-existing behaviour, pinned so the validation above cannot be
+        # tightened into breaking the default.
+        out = cli.cmd_kb_add(store.cfg, "T", "body", "", [], [], None)
+        assert out["ok"] is True, out
+        assert out["section"] == "notes"
+
+    def test_section_naming_an_existing_file_is_refused(self, store):
+        (store.vault / "notes" / "seed.md").write_text("x", encoding="utf-8")
+        out = cli.cmd_kb_add(store.cfg, "T", "body", "notes/seed.md",
+                             [], [], None)
+        assert out["ok"] is False
+        assert out["error"].startswith("refused:")
+        assert "not a directory" in out["error"]
+
+    def test_reserved_device_name_is_refused(self, store):
+        # "CON.md" is rejected by the filesystem, so it must be refused by us —
+        # otherwise the caller gets an OSError instead of a verdict, and on the
+        # read side path.exists() can resolve to the console device.
+        out = cli.cmd_kb_add(store.cfg, "CON", "body", "notes", [], [], None)
+        assert out["ok"] is False
+        assert "reserved" in out["error"]
+
+    def test_cli_emits_json_and_exit_code_1_not_a_traceback(self, store,
+                                                            monkeypatch, capsys):
+        monkeypatch.setattr(sys, "argv", [
+            "memory_cli.py", "kb-add", "T", "body", "--section", "memory:evil"])
+        rc = cli.main()
+        captured = capsys.readouterr()
+        assert rc == 1
+        payload = json.loads(captured.out)  # would raise on a traceback
+        assert payload["ok"] is False
+        assert payload["error"].startswith("refused:")
+
+
+# -- P0: CLI L2 recall calibration ------------------------------------------
 _ON_TOPIC = "SecretStore 使用 ROCKET_TLS 而不是 SSL_CERT_FILE"
 _PARTIAL = "SecretStore 部署在 NAS 上"
 _OFF_TOPIC = "今天的天气不错"
+_OFF_TOPIC_QUERY = "推荐一本讲罗马历史的书"
 
 
 def _seed(home, texts) -> None:
@@ -195,15 +326,60 @@ def _seed(home, texts) -> None:
     } for t in texts])
 
 
-class TestCliL2Ranking:
-    """The CLI must not be the weaker of the two L2 implementations.
+class TestL2ScoreShape:
+    """The score must not be capped by how long the question is.
 
-    The threshold is calibrated at 0.76 (relevant 8/8 measured 0.8458~0.9095,
-    irrelevant 8/8 measured 0.6755~0.7515). A hardcoded 0.9 cleared it
-    unconditionally, so an external agent got an unfiltered, unordered list
-    that looked like it had passed the same gate the plugin applies.
+    The shipped version divided by ``len(query terms)``, so the ceiling was
+    ``1/len(terms)``: a five-term question could not exceed 0.2 no matter how
+    well it matched, and no multi-word query could reach any sane floor.
     """
 
+    def test_a_multi_term_query_clears_the_floor(self):
+        score = cli.l2_lexical_score(
+            "SecretStore ROCKET_TLS 端口 密码 重启", _ON_TOPIC)
+        # 2 of 5 terms present; the old formula gave 2/5 = 0.4 and the old
+        # threshold was 0.76, so this could never have survived.
+        assert score == pytest.approx(2 / 3)
+        assert score > cli.DEFAULT_L2_LEXICAL_FLOOR
+
+    def test_score_rises_with_evidence(self):
+        assert cli.l2_lexical_score("SecretStore", _ON_TOPIC) == pytest.approx(1.0)
+        assert cli.l2_lexical_score("SecretStore 端口", _ON_TOPIC) == pytest.approx(0.5)
+        assert cli.l2_lexical_score("端口 密码", _ON_TOPIC) == pytest.approx(0.0)
+
+    def test_word_order_does_not_decide_the_match(self):
+        # The phrase matcher cannot see this; the bigram matcher must.
+        # 数据同步 vs 同步数据 is the recall hole QA hit.
+        doc = "两边同步数据要注意"
+        assert cli.l2_lexical_score("数据同步", doc) >= cli.DEFAULT_L2_LEXICAL_FLOOR
+
+    def test_ascii_and_cjk_are_not_glued_into_one_term(self):
+        # `[\w\u4e00-\u9fff]+` made "本地IP通过https访问secretstore" a single
+        # term, which can then never match anything except itself.
+        terms = cli.l2_query_terms("我想用本地IP通过https访问secretstore")
+        assert "secretstore" in terms
+        assert "https" in terms
+        assert "通过" in terms
+
+    def test_stopwords_carry_no_signal(self):
+        assert cli.l2_lexical_score("的 了 是", _ON_TOPIC) == 0.0
+
+    def test_default_floor_sits_in_the_calibrated_window(self):
+        # Calibrated on the project's real store (21 facts, 8 relevant +
+        # 8 irrelevant queries): relevant top1 in [0.667, 1.0], irrelevant
+        # top1 in [0.0, 0.333]. The window is therefore (1/3, 1/2] — one
+        # matched term must keep a two-term query but not a three-term one.
+        floor = cli.DEFAULT_L2_LEXICAL_FLOOR
+        assert 1 / 3 < floor <= 1 / 2
+
+    def test_one_of_two_terms_survives_but_one_of_three_does_not(self):
+        assert (cli.l2_lexical_score("SecretStore 端口", _ON_TOPIC)
+                >= cli.DEFAULT_L2_LEXICAL_FLOOR)
+        assert (cli.l2_lexical_score("SecretStore 端口 密码", _ON_TOPIC)
+                < cli.DEFAULT_L2_LEXICAL_FLOOR)
+
+
+class TestCliL2Ranking:
     def test_hits_are_ordered_by_relevance_not_write_order(self, store):
         # Write order is the worst possible ranking: it hands back whichever
         # facts happened to be stored first.
@@ -211,63 +387,71 @@ class TestCliL2Ranking:
         hits = cli.search_l2("SecretStore ROCKET_TLS", 10, [])
         assert [h["content"] for h in hits] == [_ON_TOPIC, _PARTIAL]
 
-    def test_score_is_coverage_not_a_constant(self, store):
+    def test_score_is_evidence_not_a_constant(self, store):
         _seed(store.home, [_PARTIAL, _OFF_TOPIC, _ON_TOPIC])
         hits = cli.search_l2("SecretStore ROCKET_TLS", 10, [])
         scores = [h["score"] for h in hits]
         assert scores == [1.0, 0.5]
         # The bug, pinned: every hit used to carry 0.9 regardless of overlap.
         assert 0.9 not in scores
-        assert all(h["score_basis"] == "keyword-coverage" for h in hits)
+        assert all(h["score_basis"] == "lexical-dis-max" for h in hits)
 
-    def test_irrelevant_query_is_filtered_by_the_floor(self, store):
+    def test_a_natural_language_question_still_finds_the_fact(self, store):
+        # QA's exact reproduction through the CLI: floor on -> 0 hits with
+        # filtered_out 3. The question shares exactly one entity with the fact,
+        # which is what a lexical channel has to work with.
+        _seed(store.home, [_ON_TOPIC, _PARTIAL, _OFF_TOPIC])
+        hits = cli.search_l2("SecretStore 跑在哪台机器上", 10, [])
+        assert hits, "the QA reproduction still returns nothing through the CLI"
+        assert _ON_TOPIC in [h["content"] for h in hits]
+
+    def test_irrelevant_query_is_filtered_by_the_default_floor(self, store):
         _seed(store.home, ["只有 alpha 这一个词是重合的"])
-        # 1 of 4 query terms -> 0.25 coverage, far below the calibrated 0.76.
-        assert cli.search_l2("alpha beta gamma delta", 10, [], l2_floor=0.76) == []
-        # ... and reported as filtered rather than as an empty vault.
-        ranking = cli.recall_l2("alpha beta gamma delta", 10, [],
-                                l2_floor=0.76)["ranking"]
+        assert cli.search_l2(_OFF_TOPIC_QUERY, 10, []) == []
+        assert cli.search_l2("alpha beta gamma delta", 10, []) == []
+        # ... and reported as filtered rather than as an empty vault: this count
+        # is what made the regression visible in the first place.
+        ranking = cli.recall_l2("alpha beta gamma delta", 10, [])["ranking"]
         assert ranking["filtered_out"] == 1
-        # Without a floor the same hit is returned, but never as a high score.
-        unfiltered = cli.search_l2("alpha beta gamma delta", 10, [], l2_floor=0.0)
-        assert [h["score"] for h in unfiltered] == [0.25]
 
-    def test_relevant_query_survives_the_calibrated_floor(self, store):
+    def test_relevant_query_survives_the_default_floor(self, store):
         _seed(store.home, [_ON_TOPIC, _PARTIAL])
-        hits = cli.search_l2("SecretStore ROCKET_TLS", 10, [], l2_floor=0.76)
-        # Full coverage clears 0.76; the half-match does not. That is the
-        # behaviour the constant 0.9 made impossible.
-        assert [h["content"] for h in hits] == [_ON_TOPIC]
+        hits = cli.search_l2("SecretStore ROCKET_TLS", 10, [])
+        assert [h["content"] for h in hits] == [_ON_TOPIC, _PARTIAL]
 
-    def test_floor_is_read_through_the_plugin_function(self, store, monkeypatch):
-        monkeypatch.setattr(
-            cli, "plugin_config",
-            lambda: types.SimpleNamespace(
-                recall=types.SimpleNamespace(l2_min_score=0.76)))
-        _seed(store.home, [_PARTIAL])
-        ranking = cli.recall_l2("SecretStore ROCKET_TLS", 10, [])["ranking"]
-        assert ranking["floor"] == 0.76
-        assert ranking["floor_resolved"] is True
-        assert cli.recall_l2("SecretStore ROCKET_TLS", 10, [])["hits"] == []
+    def test_the_cosine_floor_is_not_applied_to_this_channel(self, store):
+        # The regression, end to end: recall.l2_min_score is calibrated on
+        # cosine similarity and lives in the deployed config at 0.76. Applying
+        # it to a lexical score is the defect.
+        (store.home / "governed_memory.json").write_text(json.dumps({
+            "wiki_dir": str(store.vault),
+            "recall": {"l2_min_score": 0.99},
+        }), encoding="utf-8")
+        _seed(store.home, [_ON_TOPIC])
+        result = cli.recall_l2("SecretStore ROCKET_TLS", 10, [])
+        assert len(result["hits"]) == 1
+        assert result["ranking"]["floor"] == cli.DEFAULT_L2_LEXICAL_FLOOR
+        assert result["ranking"]["floor_source"] == "default"
+
+    def test_floor_is_overridable_from_the_config_file(self, store):
+        (store.home / "governed_memory.json").write_text(json.dumps({
+            "wiki_dir": str(store.vault),
+            "recall": {"l2_lexical_min_score": 0.9},
+        }), encoding="utf-8")
+        _seed(store.home, [_ON_TOPIC, _PARTIAL])
+        result = cli.recall_l2("SecretStore ROCKET_TLS", 10, [])
+        assert result["ranking"]["floor"] == 0.9
+        assert result["ranking"]["floor_source"] == "config-file"
+        assert [h["content"] for h in result["hits"]] == [_ON_TOPIC]
+        assert result["ranking"]["filtered_out"] == 1
 
     def test_ranking_is_reported_honestly(self, store):
         _seed(store.home, [_ON_TOPIC])
         ranking = cli.recall_l2("SecretStore", 10, [], l2_floor=0.5)["ranking"]
         assert ranking["ranked"] is True
-        assert ranking["basis"] == "keyword-coverage"
+        assert ranking["basis"] == "lexical-dis-max"
         assert ranking["floor"] == 0.5
-
-    def test_an_unresolvable_floor_is_admitted_not_implied(self, store,
-                                                           monkeypatch):
-        # If the threshold cannot be read, saying so beats returning unfiltered
-        # hits that look like they cleared a gate.
-        def _boom(_name):
-            raise RuntimeError("plugin unavailable")
-
-        monkeypatch.setattr(cli, "plugin_module", _boom)
-        ranking = cli.recall_l2("SecretStore", 10, [])["ranking"]
-        assert ranking["floor_resolved"] is False
-        assert ranking["floor"] == 0.0
+        assert ranking["floor_source"] == "explicit"
 
     def test_truncation_is_reported(self, store):
         _seed(store.home, [_ON_TOPIC, _PARTIAL])
@@ -277,13 +461,13 @@ class TestCliL2Ranking:
 
 # -- P1: L2 provenance columns ---------------------------------------------
 class TestL2ProvenanceColumns:
-    """``role`` existed in the schema and in cmd_remember but not in the
-    CLI's backfill, so ``table.add()`` raised "field 'role' does not exist" on
-    any legacy table and every external agent's ``remember`` failed at once.
+    """``role`` existed in the schema and in cmd_remember but not in the CLI's
+    backfill, so ``table.add()`` raised "field 'role' does not exist" on any
+    legacy table and every external agent's ``remember`` failed at once.
 
     Guards the *shape* of the bug, not just this instance: three places must
-    agree (create-table schema, plugin backfill, CLI backfill) and the tests
-    all run against tables that already have the columns.
+    agree (create-table schema, plugin backfill, CLI backfill) and every test
+    runs against a table that already has the columns.
     """
 
     def test_definition_covers_all_provenance_columns(self):
