@@ -170,10 +170,14 @@ class TestKbSearchSectionContainment:
     """The same escape on the read side: ``--section`` fed a ``rglob`` root."""
 
     def test_escaping_section_is_refused_and_named(self, store):
+        # Was caught by containment ("outside the vault"); it is now refused
+        # first by the shared section validator, so read and write agree on the
+        # same input instead of the reader accepting what the writer rejected.
         refused: list = []
         hits = cli.cmd_kb_search(store.cfg, "anything", 5, "../memory", refused)
         assert hits == []
-        assert refused and "outside the vault" in refused[0]
+        assert refused and refused[0].startswith("refused:")
+        assert "../memory" in refused[0]
 
     def test_legitimate_section_still_searches(self, store):
         cli.cmd_kb_add(store.cfg, "运维笔记", "示例主路由 8022", "notes",
@@ -301,6 +305,127 @@ class TestSectionRefusalIsStructuredJson:
         payload = json.loads(captured.out)  # would raise on a traceback
         assert payload["ok"] is False
         assert payload["error"].startswith("refused:")
+
+
+# -- P2: read and write must validate a --section the same way ---------------
+class TestKbSearchUsesTheSectionValidator:
+    """``iter_notes`` called ``safe_vault_path`` but not the section validator.
+
+    So every malformed ``--section`` that ``kb-add`` refuses with a verdict was
+    accepted by ``kb-search`` and returned as an empty result: rc=0, no
+    ``refused`` field, indistinguishable from "no notes matched".
+    """
+
+    MALFORMED = [
+        "memory:evil",   # NTFS alternate data stream
+        "CON",           # reserved device name
+        "NUL",
+        "no\x01tes",     # a control character
+        "a" * 300,       # longer than any filesystem component
+        "   ",           # whitespace only
+    ]
+
+    @pytest.mark.parametrize("section", MALFORMED)
+    def test_read_path_refuses_what_the_write_path_refuses(self, store, section):
+        refused: list = []
+        hits = cli.cmd_kb_search(store.cfg, "anything", 5, section, refused)
+        assert hits == []
+        assert refused, "the read path swallowed a malformed section"
+        assert refused[0].startswith("refused:")
+
+
+class TestReadWriteSectionValidationIsSymmetric:
+    """Both paths must run the SAME validator: same input, same verdict.
+
+    Guards the *shape* of the bug, not one payload: if the read path ever stops
+    calling ``split_vault_section``, these fail even while every other assertion
+    still passes.
+    """
+
+    @pytest.mark.parametrize("section", [
+        "../memory", "memory:evil", "CON", "NUL", "no\x01tes", "a" * 300,
+        "   ", ".git", ".obsidian",
+    ])
+    def test_the_same_section_is_refused_identically_by_both_paths(
+            self, store, section):
+        add = cli.cmd_kb_add(store.cfg, "T", "body", section, [], [], None)
+        refused: list = []
+        cli.cmd_kb_search(store.cfg, "T", 5, section, refused)
+        assert add["ok"] is False
+        assert add["error"].startswith("refused:")
+        assert refused and refused[0].startswith("refused:")
+        # Byte-for-byte the same verdict: one validator, not two.
+        assert add["error"] == refused[0]
+
+
+class TestKbSearchRefusalIsALoudFailure:
+    """A refused read must not exit 0 — a script keying on rc would read it as
+    an empty vault."""
+
+    REFUSED = ["memory:evil", "CON", "NUL", "no\x01tes", "a" * 300, "   ",
+               "../memory"]
+
+    @pytest.mark.parametrize("section", REFUSED)
+    def test_cli_exits_1_with_json_and_a_refused_field(
+            self, store, monkeypatch, capsys, section):
+        monkeypatch.setattr(sys, "argv", [
+            "memory_cli.py", "kb-search", "x", "--section", section])
+        rc = cli.main()
+        payload = json.loads(capsys.readouterr().out)  # raises on a traceback
+        assert rc == 1
+        assert payload["refused"], payload
+        assert all(r.startswith("refused:") for r in payload["refused"])
+
+    def test_a_legitimate_section_still_exits_0(self, store, monkeypatch,
+                                                capsys):
+        cli.cmd_kb_add(store.cfg, "运维笔记", "示例主路由 8022", "notes",
+                       [], [], None, agent="dsh")
+        monkeypatch.setattr(sys, "argv", [
+            "memory_cli.py", "kb-search", "运维", "--section", "notes"])
+        rc = cli.main()
+        payload = json.loads(capsys.readouterr().out)
+        assert rc == 0
+        assert [h["title"] for h in payload["results"]] == ["运维笔记"]
+        assert "refused" not in payload
+
+
+# -- P2: a dot-directory is not writable ------------------------------------
+class TestDotDirectoryIsNotWritable:
+    """``kb-add --section .git`` was accepted and wrote into ``.git``, but
+    ``iter_notes`` skips dot-directories — a write that can never be read back,
+    and the failure is silent. The write rule is now the read rule."""
+
+    def test_a_dot_section_is_refused_and_writes_nothing(self, store):
+        out = cli.cmd_kb_add(store.cfg, "EVIL", "body", ".git", [], [], None)
+        assert out["ok"] is False
+        assert out["error"].startswith("refused:")
+        assert "hidden directory" in out["error"]
+        # Nothing was created, anywhere: a refused write must not leave a trace.
+        assert not (store.vault / ".git").exists()
+        assert not list(store.vault.rglob("EVIL.md"))
+
+    def test_a_note_already_buried_in_a_dot_dir_is_unreadable(self, store):
+        # Pins *why* the write is refused: the vault walk never returns it, so
+        # accepting the write would have produced an invisible note.
+        hidden = store.vault / ".obsidian"
+        hidden.mkdir()
+        (hidden / "buried.md").write_text(
+            "---\ntitle: buried\n---\nZIGZAG_TOKEN_91827364\n",
+            encoding="utf-8")
+        assert cli.cmd_kb_search(store.cfg, "ZIGZAG_TOKEN_91827364", 5, "") == []
+        out = cli.cmd_kb_add(store.cfg, "buried2", "body", ".obsidian",
+                             [], [], None)
+        assert out["ok"] is False
+        assert out["error"].startswith("refused:")
+
+    def test_a_legitimate_section_is_still_readable_after_write(self, store):
+        # The pre-existing invariant, pinned so tightening the rule cannot have
+        # broken it: write it, read it straight back.
+        out = cli.cmd_kb_add(store.cfg, "运维笔记", "示例主路由 8022", "notes",
+                             [], [], None, agent="dsh")
+        assert out["ok"] is True, out
+        hits = cli.cmd_kb_search(store.cfg, "运维", 5, "notes", [])
+        assert [h["title"] for h in hits] == ["运维笔记"]
 
 
 # -- P0: CLI L2 recall calibration ------------------------------------------

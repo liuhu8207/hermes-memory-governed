@@ -1130,22 +1130,40 @@ _WIN32_RESERVED_STEMS = frozenset(
     | {f"com{i}" for i in range(1, 10)}
     | {f"lpt{i}" for i in range(1, 10)})
 
+#: NTFS caps a single path component at 255 UTF-16 code units. Rejected here so
+#: both the read and the write path refuse an over-long section with a verdict:
+#: unhandled, the write path died with an ``OSError`` and the read path returned
+#: an empty result — the same input producing two different symptoms, one of
+#: them silent.
+_MAX_SECTION_PART = 255
+
 
 def split_vault_section(section: str) -> list:
     """Split a ``--section`` value into validated path components.
 
+    The **single** validator for a section name, called by both paths —
+    ``kb-add`` (write) and ``iter_notes`` (read). Keeping one function is not
+    tidiness: when the read path validated less than the write path, every
+    malformed section the writer refused with a verdict was accepted by the
+    reader and returned as an empty result, so "your section was rejected" and
+    "no notes matched" looked identical to the caller.
+
     Containment (:func:`safe_vault_path`) stops a section *leaving* the vault;
-    this stops it being a name the filesystem cannot accept. That is a different
-    failure with a different symptom, and it was the one still escaping: on NTFS
-    ``notes:evil`` addresses an alternate data stream of ``notes`` — inside the
-    vault lexically, so containment passes it — and ``mkdir`` then raised an
-    uncaught ``NotADirectoryError``. No JSON, a bare traceback, and a caller
-    that cannot tell "refused" from "the tool is broken".
+    this stops it being a name the filesystem cannot accept, or one the vault
+    walk will not read back. That is a different failure with a different
+    symptom, and it was the one still escaping: on NTFS ``notes:evil``
+    addresses an alternate data stream of ``notes`` — inside the vault
+    lexically, so containment passes it — and ``mkdir`` then raised an uncaught
+    ``NotADirectoryError``. No JSON, a bare traceback, and a caller that cannot
+    tell "refused" from "the tool is broken".
 
     Raises:
         VaultPathEscape: on a ``:`` (ADS) or any other Win32-forbidden
-            character, a ``..`` component, a trailing space/dot, a reserved
-            device name, or a section that is empty once split.
+            character, a ``..`` component, a whitespace-only component, a
+            hidden (dot) directory — which ``iter_notes`` would skip, making the
+            write unreadable — a component longer than the filesystem allows, a
+            trailing space/dot, a reserved device name, or a section that is
+            empty once split.
     """
     raw = str(section or "").replace("\\", "/")
     parts = [p for p in raw.split("/") if p not in ("", ".")]
@@ -1156,6 +1174,22 @@ def split_vault_section(section: str) -> list:
         if part == "..":
             raise VaultPathEscape(
                 f"refused: '..' is not allowed in a section ('{section}')")
+        if not part.strip():
+            raise VaultPathEscape(
+                f"refused: section must name a directory inside the vault "
+                f"('{section}')")
+        if part.startswith("."):
+            # Aligned with iter_notes(), which skips dot-directories. A write
+            # into one used to be accepted and then never read back: the note
+            # "succeeded" into a place the vault itself walks past.
+            raise VaultPathEscape(
+                f"refused: '{part}' is a hidden directory; the vault walk "
+                f"skips dot-directories, so a note filed here could never be "
+                f"read back")
+        if len(part) > _MAX_SECTION_PART:
+            raise VaultPathEscape(
+                f"refused: section component is longer than "
+                f"{_MAX_SECTION_PART} characters ('{part[:32]}...')")
         bad = _ILLEGAL_FS.search(part)
         if bad:
             raise VaultPathEscape(
@@ -1188,16 +1222,22 @@ def iter_notes(config: dict, subdirs: list = None, errors: list = None) -> list:
     Every note is re-checked for containment on its **real** path, because the
     walk follows links and can leave the vault (see the loop below).
 
-    ``errors`` is an optional sink: a ``--section`` that points outside the
-    vault is skipped and named there, because returning "no such notes" for a
-    query that was refused reads as an empty vault rather than a rejected
-    request. Paths that leave the vault mid-walk are named there too.
+    ``errors`` is an optional sink: a ``--section`` that is malformed or points
+    outside the vault is skipped and named there, because returning "no such
+    notes" for a query that was refused reads as an empty vault rather than a
+    rejected request. Sections are judged by :func:`split_vault_section` — the
+    same validator the write path uses — so the read and write paths can never
+    disagree about what is a valid section. Paths that leave the vault mid-walk
+    are named there too.
     """
     vault = wiki_dir(config)
     roots = [vault] if subdirs is None else []
     for s in (subdirs or []):
         try:
-            roots.append(safe_vault_path(vault, s))
+            # The SAME validator the write path uses, deliberately: a section
+            # kb-add refuses with a verdict must not be quietly accepted here
+            # and returned as "no notes matched".
+            roots.append(safe_vault_path(vault, *split_vault_section(s)))
         except VaultPathEscape as e:
             if errors is not None:
                 errors.append(str(e))
@@ -1618,6 +1658,10 @@ def main():
     print(json.dumps(out, ensure_ascii=False, indent=2))
     # A refused write is a failure the caller must act on, not a soft result.
     if isinstance(out, dict) and out.get("ok") is False:
+        return 1
+    # A refused *read* is the same kind of failure. Without this, a rejected
+    # --section exited 0 and a script keying on rc read it as "empty vault".
+    if args.cmd == "kb-search" and isinstance(out, dict) and out.get("refused"):
         return 1
     return 0
 
