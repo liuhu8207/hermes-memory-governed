@@ -23,6 +23,11 @@ persona.md
 persona_meta.json
 governed_memory.json
 
+# --- 构建过程报告：会引用真实主机/地址/路径，只保留本地副本 ---
+# 公开仓库面向"想装这套系统的人"，不含任何私人环境细节。
+# 本地副本在 .workbuddy/private-reports/（本文件已忽略 .workbuddy/）。
+reports/
+
 # --- Python 虚拟环境（务必忽略：本仓 .venv 有 513MB / 7494 个文件）---
 .venv/
 venv/

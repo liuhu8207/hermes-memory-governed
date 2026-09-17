@@ -227,7 +227,7 @@ class TestExternalWriteGate:
         problem, the missing corroboration was."""
         # "我家里" alone is a place, not a fact; with the hardware named it is one.
         assert not external_write_verdict("我家里")[0]
-        assert external_write_verdict("我家里用的是软路由+策略服务A，打算换回硬件路由器")[0]
+        assert external_write_verdict("我家里用的是软路由+策略服务A，打算换回CoreRouter")[0]
 
     def test_the_negation_token_is_not_in_the_strong_pool(self):
         """Pin the fix at the source, not only at the verdict.
@@ -361,7 +361,7 @@ class TestRolePriorDoesNotGate:
         """The cost side, pinned: single-signal facts must NOT be lost."""
         assert dialogue_fact_admits("我们决定用 PostgreSQL 因为它更稳定", "user")
         assert dialogue_fact_admits(
-            "我家里用的是虚拟机软路由，我打算换回硬件路由器", "user")
+            "我家里用的是虚拟机 FlexRouter，我打算换回 CoreRouter", "user")
 
     def test_a_modal_commitment_is_admitted_alone(self):
         for text in ("我需要每天都备份", "不能明文存密码",
@@ -742,7 +742,7 @@ class TestProjectLabelling:
     """Folding a working directory into a project label."""
 
     def test_normalize_keeps_cjk(self):
-        # Checkouts on this machine live under D:\repos\Drive\项目\... . Agent
+        # Checkouts on this machine live under D:/repos\项目\... . Agent
         # names drop non-ASCII, but doing that here would collapse several
         # distinct projects onto one empty label.
         assert cli.normalize_project("我的项目-v2") == "我的项目-v2"
@@ -943,7 +943,7 @@ class TestWikiDirIsolation:
 
         src = inspect.getsource(cli.wiki_dir)
         assert "hermes_home()" in src, "default must be derived from HERMES_HOME"
-        # The old fallback was D:\repos\Drive\项目\github\wiki. Neither a drive
+        # The old fallback was D:/repos\wiki. Neither a drive
         # letter nor the repo's parent directory may appear as a literal.
         assert "Drive" not in src and "github" not in src
 

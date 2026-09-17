@@ -460,7 +460,7 @@ class TestKbGetMissIsNotSilent:
                        [], [], None, agent="dsh")
         out = cli.cmd_kb_get(store.cfg, "运维笔记")
         assert out["ok"] is True
-        assert "ROS" in out["body"]
+        assert "示例主路由" in out["body"]
 
     def test_a_miss_exits_1_and_stays_json(self, store, monkeypatch, capsys):
         monkeypatch.setattr(sys, "argv",

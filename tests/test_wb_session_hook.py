@@ -40,7 +40,18 @@ def _load_hook():
 
 hook = _load_hook()
 
-MSYS_REPO = "/d/repos/Drive/项目/github/hermes-memory-governed"
+#: This checkout, in the two shapes the hook deals in. **Derived, never
+#: hardcoded** — the repo is public, so the suite must not carry the operator's
+#: path, and a derived value also happens to be correct on any other machine.
+REPO_WIN = str(REPO).replace("\\", "/")
+REPO_MSYS = ("/" + REPO_WIN[0].lower() + REPO_WIN[2:]
+             if REPO_WIN[1:2] == ":" else REPO_WIN)
+
+#: A neutral pair for the pure string-rewriting tests. Those only check the
+#: separators and the drive letter, so the path need not exist — and must not
+#: name a real machine. Tests that need the project walk to *resolve* use
+#: ``REPO_WIN`` instead.
+MSYS_REPO = "/d/repos/hermes-memory-governed"
 WIN_REPO = "D:/repos/hermes-memory-governed"
 
 
@@ -172,7 +183,7 @@ class TestPersonaDumpIsNotInjected:
 
 class TestBuildContext:
     def test_project_block_appears_for_a_known_project(self):
-        ctx = hook.build_context(L1, WIN_REPO)
+        ctx = hook.build_context(L1, REPO_WIN)
         assert "### 当前项目" in ctx
         assert "hermes-memory-governed" in ctx
 
@@ -238,7 +249,7 @@ class TestBuildContext:
         assert "没有 MCP 工具时" in section, "CLI 没有被写成后备路径"
 
     def test_the_project_block_also_leads_with_the_tools(self):
-        hint = hook.build_context(L1, WIN_REPO).split("### 当前项目", 1)[1]
+        hint = hook.build_context(L1, REPO_WIN).split("### 当前项目", 1)[1]
         assert hint.index("hgm_recall") < hint.index("memory_cli.py")
 
 
@@ -292,7 +303,7 @@ class TestTheRegression:
         Betting on that one field meant the project block vanished silently
         whenever the payload matched the CLI shape. It must now survive.
         """
-        monkeypatch.setenv("CODEBUDDY_PROJECT_DIR", MSYS_REPO)
+        monkeypatch.setenv("CODEBUDDY_PROJECT_DIR", REPO_MSYS)
         monkeypatch.setattr(hook, "fetch_l1", lambda: dict(L1))
         cli_shaped = json.dumps({
             "session_id": "cli-shaped",
@@ -306,7 +317,8 @@ class TestTheRegression:
         ctx = json.loads(capsys.readouterr().out)["hookSpecificOutput"]["additionalContext"]
         assert "### 当前项目" in ctx, "项目块在 CLI 形态的 payload 下消失了"
         assert "hermes-memory-governed" in ctx
-        assert "/d/repos" not in ctx, "MSYS 路径没有转成 Windows 形态"
+        if REPO_MSYS != REPO_WIN:      # Windows only: git-bash form must convert
+            assert REPO_MSYS not in ctx, "MSYS 路径没有转成 Windows 形态"
 
 
 @pytest.mark.skipif(shutil.which("sh") is None, reason="needs Git Bash")
@@ -316,7 +328,7 @@ class TestEndToEnd:
     def test_the_wrapper_emits_json_and_ignores_a_hostile_path(self):
         proc = subprocess.run(
             ["sh", str(REPO / "scripts" / "wb_session_hook.sh")],
-            input=json.dumps({"session_id": "e2e", "cwd": WIN_REPO}),
+            input=json.dumps({"session_id": "e2e", "cwd": REPO_WIN}),
             capture_output=True, text=True, encoding="utf-8", errors="replace",
             cwd=str(REPO), timeout=180,
             env={**__import__("os").environ, "PATH": "/usr/bin:/bin"},

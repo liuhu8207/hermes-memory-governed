@@ -75,7 +75,7 @@ import tempfile
 import time
 from pathlib import Path
 
-DEFAULT_HERMES_HOME = r"D:\repos\Drive\项目\github\hermes-home"
+DEFAULT_HERMES_HOME = r"D:/repos\hermes-home"
 VAULT_SUBDIRS = ["inbox", "notes", "projects", "areas", "resources", "archive"]
 
 #: Root-level vault files that are navigation scaffolds, not notes. Only
@@ -128,7 +128,7 @@ _AGENT_NAME_MAX = 32
 
 #: Project identifiers are *labels*, not security boundaries, so unlike agent
 #: names they keep CJK — this machine's checkouts live under
-#: ``D:\repos\Drive\项目\...`` and stripping the ideographs would collapse
+#: ``D:/repos\项目\...`` and stripping the ideographs would collapse
 #: several distinct projects onto the same empty string. Only path separators,
 #: whitespace and shell-hostile characters are removed.
 _PROJECT_NAME_RE = re.compile(r"[^0-9A-Za-z_.\-\u4e00-\u9fff]")
