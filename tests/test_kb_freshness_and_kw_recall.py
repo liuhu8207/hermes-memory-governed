@@ -89,6 +89,22 @@ def _install(kb: KnowledgeBase, idx: _SemanticIndex) -> _SemanticIndex:
     return idx
 
 
+def _make_upsert_fail(idx: _SemanticIndex) -> None:
+    """让这个索引的 ``upsert`` 从此只记账、**不落库**。
+
+    模拟「同步跑了却仍然对不上」：文件在同步期间持续被改、upsert 写入失败、
+    或后端拒绝写入。这条路径要验的是「重探之后仍然不新鲜时必须**如实报**，
+    不能因为发生过自愈就强行折成 ``fresh=True``」—— 那才是真信号。
+
+    必须**就地**改同一个索引对象：换一个新的替身会把已入索引的笔记一起清空，
+    测出来的是「全没了」而不是「补不上」（本机实测过这个假失败）。
+    """
+    def upsert(path, text, mtime=0.0):
+        idx.upserts.append(path)   # 只记账，rows 保持不变
+
+    idx.upsert = upsert
+
+
 # ---------------------------------------------------------------------------
 # P0-1
 # ---------------------------------------------------------------------------
@@ -136,7 +152,17 @@ class TestSearchSelfHealsStaleIndex:
         )
 
     def test_index_status_is_exposed_in_search_output(self, tmp_path):
-        """陈旧状态必须出现在检索结果里，不能只在 health 里算着玩。"""
+        """陈旧状态必须出现在检索结果里，不能只在 health 里算着玩。
+
+        契约（2026-09-17 修正）：自愈**成功之后重新探测**，
+        ``fresh`` / ``missing`` / ``stale`` / ``orphaned`` 报的是**当前真值**；
+        同步**前**的差异计数显式留在 ``pre_sync_*``。
+
+        旧实现只挂同步前那一份快照，于是一个字典里同时是 ``synced=True`` 和
+        ``fresh=False, missing=1`` —— 而 ``search()`` 正是在自愈**之后**才构建
+        结果的，那句「结果可能不全」是误报（实测：自愈 missing 1→0、indexed
+        26→27 都成功）。「陈旧必须可见」这条原意改由 ``pre_sync_missing`` 守住。
+        """
         kb = _make_kb(tmp_path, {"notes/a.md": NOTE_A})
         idx = _install(kb, _SemanticIndex())
         kb.sync_index()  # 先对齐
@@ -147,9 +173,113 @@ class TestSearchSelfHealsStaleIndex:
 
         (tmp_path / "wiki" / "notes" / "b.md").write_text(NOTE_B, encoding="utf-8")
         healed = kb.search("alpha", top_k=10)[0]["index_status"]
-        assert healed["fresh"] is False, "这一条发生时『结果可能不全』必须可见"
-        assert healed["missing"] == 1
         assert healed["synced"] is True, "必须标明已经自愈过"
+        # 同步前的差异 —— 「这一条发生时『结果可能不全』」仍然必须可见
+        assert healed["pre_sync_missing"] == 1, (
+            "自愈前漏了 1 篇这件事必须还查得到 —— 不能因为改报『已新鲜』就抹掉"
+            "（这正是本次修正不能丢掉的东西）")
+        assert healed["pre_sync_stale"] == 0
+        assert healed["pre_sync_orphaned"] == 0
+        # 同步后的当前真值 —— 已经补上了，就不该再报「结果可能不全」
+        assert healed["fresh"] is True, (
+            "自愈成功后 fresh 仍是 False —— search() 的结果其实是完整的，"
+            "这是误报（修复前：synced=True 却 fresh=False、missing=1）")
+        assert healed["missing"] == 0, "重探之后 missing 必须是当前真值 0"
+        assert "notes/b.md" in idx.rows, "笔记必须真的进了索引投影"
+
+    def test_second_search_reports_fresh_current_truth(self, tmp_path):
+        """连续两次 ``search()``：第二次的快照必须报 ``fresh: true``。
+
+        修复前最刺眼的地方就是这里：自愈明明成功了（missing 1→0），检索结果其实
+        完整，快照却报 ``fresh=false, missing=1``。用户被告知「结果可能不全」，
+        而结果一点都不少。
+        """
+        kb = _make_kb(tmp_path, {"notes/a.md": NOTE_A})
+        idx = _install(kb, _SemanticIndex())
+        kb.sync_index()
+        (tmp_path / "wiki" / "notes" / "b.md").write_text(NOTE_B, encoding="utf-8")
+
+        first = kb.search("alpha", top_k=10)[0]["index_status"]
+        assert first["synced"] is True, "第一次必须检测到陈旧并自愈"
+        assert first["pre_sync_missing"] == 1, "自愈前的差异必须留痕"
+        assert first["fresh"] is True, "自愈成功那一次就该报当前真值"
+
+        upserts_after_first = len(idx.upserts)
+        second = kb.search("alpha", top_k=10)[0]["index_status"]
+        assert second["fresh"] is True, "第二次检索必须报新鲜"
+        assert second["missing"] == 0 and second["stale"] == 0
+        assert second["synced"] is False, "第二次没有再同步，不该标 synced"
+        assert len(idx.upserts) == upserts_after_first, (
+            "第二次检索又重嵌了 %d 篇 —— 新鲜时重探不得变成重建"
+            % (len(idx.upserts) - upserts_after_first))
+
+    def test_still_stale_after_sync_is_reported_honestly(self, tmp_path):
+        """重探后仍然不新鲜时必须如实报，不能因为「自愈过」就折成 True。
+
+        构造：先用正常索引对齐（a.md 在库里），再换成 upsert 不落库的替身，
+        然后外部写入 b.md —— 同步**跑了**但补不上。这正是「文件持续变动 /
+        upsert 失败」的形状。
+        """
+        kb = _make_kb(tmp_path, {"notes/a.md": NOTE_A})
+        idx = _install(kb, _SemanticIndex())
+        kb.sync_index()          # a.md 正常入索引
+        _make_upsert_fail(idx)   # 此后 upsert 补不上
+        (tmp_path / "wiki" / "notes" / "b.md").write_text(NOTE_B, encoding="utf-8")
+
+        status = kb.search("alpha", top_k=10)[0]["index_status"]
+        assert status["synced"] is True, "确实尝试同步过"
+        assert status["fresh"] is False, (
+            "同步了却仍然对不上时必须继续报不新鲜 —— 这是真信号，"
+            "谎报新鲜等于把『结果可能不全』重新变回静默失败")
+        assert status["missing"] == 1, "当前真值：确实还差 b.md 这一篇"
+        assert status["pre_sync_missing"] == 1, "同步前的计数同样要留"
+
+    def test_reprobe_happens_only_when_a_sync_actually_ran(self, tmp_path):
+        """重探只允许发生在**本次真的同步过**之后。
+
+        性能硬约束的另一半：新鲜时每次检索只该探测一次，不能为「取当前真值」
+        白花第二次 stat + ``path_mtimes``。同步过之后才允许重探一次。
+        """
+        kb = _make_kb(tmp_path, {"notes/a.md": NOTE_A})
+        idx = _install(kb, _SemanticIndex())
+        kb.sync_index()
+
+        calls = {"n": 0}
+        base = idx.path_mtimes
+
+        def counted():
+            calls["n"] += 1
+            return base()
+
+        idx.path_mtimes = counted
+
+        calls["n"] = 0
+        kb.search("alpha", top_k=10)
+        assert calls["n"] == 1, (
+            "新鲜时探测了 %d 次 —— 重探不得变成每次检索的固定开销" % calls["n"])
+
+        (tmp_path / "wiki" / "notes" / "b.md").write_text(NOTE_B, encoding="utf-8")
+        calls["n"] = 0
+        kb.search("alpha", top_k=10)
+        assert calls["n"] == 2, (
+            "同步过之后应当重探一次（1 次判陈旧 + 1 次取当前真值），实际 %d 次"
+            % calls["n"])
+
+    def test_index_status_stays_a_pure_current_truth_diagnostic(self, tmp_path):
+        """``index_status()`` 是纯诊断（当前真值），不带 ``synced`` / ``pre_sync_*``。
+
+        这两套语义必须分开：一个是「此刻索引什么状态」，一个是「刚才那次自愈
+        做了什么」。混在一起就是本次缺陷的形状。
+        """
+        kb = _make_kb(tmp_path, {"notes/a.md": NOTE_A})
+        _install(kb, _SemanticIndex())
+        kb.sync_index()
+        (tmp_path / "wiki" / "notes" / "b.md").write_text(NOTE_B, encoding="utf-8")
+
+        diag = kb.index_status()
+        assert diag["fresh"] is False and diag["missing"] == 1, "当前真值：还没同步"
+        assert "synced" not in diag, "纯诊断不该带『本次是否自愈过』"
+        assert "pre_sync_missing" not in diag, "纯诊断不该带同步前快照"
 
     def test_second_search_does_not_reembed_everything(self, tmp_path):
         """性能硬约束：新鲜时多次检索不能反复重建索引。"""

@@ -681,6 +681,15 @@ class KnowledgeBase:
         可用性本身也会自愈（P2）：``idx.available`` 在判定为不可用时按 TTL
         懒重探，因此一次瞬时故障过后，这里会先恢复 ``available``、再照常做
         增量同步 —— 无需重启进程。恢复次数随 ``reprobe_count`` 一起透出。
+
+        返回值的语义（2026-09-17 修正）：增量同步**成功之后重新探测一次**
+        （实测 ≈9ms，相对一次检索 273ms 可以接受），所以 ``fresh`` /
+        ``missing`` / ``stale`` / ``orphaned`` 一律是**同步后的当前真值**；
+        同步前的差异计数不丢，显式留在 ``pre_sync_*`` 里。旧实现直接把同步前
+        的快照当结果返回，于是同一个字典里同时出现 ``synced=True`` 和
+        ``fresh=False, missing=1`` —— 自愈其实成功了（missing 1→0）却报
+        「结果可能不全」。而 ``search()`` 正是在自愈**之后**才构建结果的，
+        那个「不全」是误报。同一个字段名两种语义，正是本项目一直在清的坑。
         """
         idx = self._index_get()
         available = idx.available  # 可能触发一次懒重探；必须先读它再读计数
@@ -702,7 +711,24 @@ class KnowledgeBase:
                 # 增量同步，并把已经算好的两侧映射传进去，避免重复 stat / 扫描
                 self.sync_index(_vault_mtimes=vault, _note_paths=paths,
                                 _index_mtimes=indexed)
-                self._index_status = dict(state, synced=True)
+                # 同步后重探：fresh / missing / stale / orphaned 必须是**当前真值**。
+                # 直接返回同步前的快照会自相矛盾（synced=True 却 fresh=False、
+                # missing=1），而 search() 正是在同步之后才构建结果的 —— 那句
+                # 「结果可能不全」是误报。同步前的差异计数显式留在 pre_sync_*，
+                # 它是「这次自愈补了什么」的唯一记录。
+                #
+                # 重探只在**本次真的同步过**之后发生：新鲜时多一次 9ms 的 stat
+                # 扫描纯属浪费，性能硬约束（新鲜时 5 次检索不得重嵌）不容破坏。
+                # 若重探后仍 fresh=False（例如文件持续在变），如实报 —— 那是有
+                # 价值的真信号，不能强行折成 True。
+                after = self._probe_state(idx)
+                self._index_status = dict(
+                    after,
+                    synced=True,
+                    pre_sync_missing=state["missing"],
+                    pre_sync_stale=state["stale"],
+                    pre_sync_orphaned=state["orphaned"],
+                )
             return self._index_status
 
     # -- 骨架 / 索引 -------------------------------------------------
@@ -977,8 +1003,13 @@ class KnowledgeBase:
 
         门前先做一次 :meth:`_ensure_fresh_index`（廉价 mtime 探测 + 必要时的
         增量同步）：会话中新写入 / 外部写入 vault 的笔记不必等到进程重启才
-        能被搜到。同步前后的索引状态都挂在返回项的 ``index_status`` 上，所以
-        「结果可能不全」这件事对用户是可见的，而不是静默变少。
+        能被搜到。索引状态挂在返回项的 ``index_status`` 上，所以「结果可能
+        不全」这件事对用户是可见的，而不是静默变少。
+
+        其中 ``fresh`` / ``missing`` / ``stale`` / ``orphaned`` 是**同步后的
+        当前真值**（自愈成功就报新鲜），同步前的差异计数在 ``pre_sync_*`` ——
+        两者分开是 2026-09-17 的修正：旧实现只挂同步前那一份，于是自愈成功
+        了却报「结果可能不全」，是误报。
         """
         if not query.strip():
             return []
@@ -1034,6 +1065,12 @@ class KnowledgeBase:
             "stale": status.get("stale", 0),
             "orphaned": status.get("orphaned", 0),
             "synced": bool(status.get("synced", False)),
+            # 同步前的差异计数 = 「这次自愈补了什么」。与上面的 fresh/missing
+            # （同步后的当前真值）语义不同，所以分开设字段 —— 一个字段两种
+            # 含义正是本项目一直在清的坑。
+            "pre_sync_missing": status.get("pre_sync_missing", 0),
+            "pre_sync_stale": status.get("pre_sync_stale", 0),
+            "pre_sync_orphaned": status.get("pre_sync_orphaned", 0),
         }
 
         scored: Dict[str, Dict[str, Any]] = {}
