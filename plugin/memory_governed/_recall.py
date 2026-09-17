@@ -16,7 +16,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from concurrent.futures import TimeoutError as FuturesTimeoutError
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 from ._config import GovernedMemoryConfig
 from ._embedding import EmbeddingService
@@ -52,6 +52,16 @@ MIN_SCORE: float = 0.1
 #: 且会以 score=1.0 挤进注入上下文 —— 它们是工具过程输出，不是可复用的
 #: 会话记忆，必须挡在召回之外。提为模块级常量便于以后调整白名单。
 L3_RECALL_ROLES: tuple = ("user", "assistant")
+
+#: KB 提示通道向 :meth:`KnowledgeBase.search` 申请的候选池大小。
+#:
+#: 必须显著大于 ``recall_max_notes``：候选先按融合分（0.4*kw + 0.6*sem）排序，
+#: 而纯关键词命中的融合分被 0.4 的权重压到 <= 0.4，在普遍 0.5~0.9 的候选里排
+#: 不进前 3 —— 不放开候选池，关键词通道就算放行了也取不到（实测那篇漏掉的
+#: 笔记排在全库第 27 位）。放大候选池**不增加 embedding 调用**（每条查询仍然
+#: 只嵌一次），代价只是 LanceDB 多返回几行。
+_RECALL_KB_POOL_FACTOR: int = 10
+_RECALL_KB_POOL_MIN: int = 30
 
 
 def layer_score_floor(layer: str, recall_cfg=None, *,
@@ -782,8 +792,17 @@ class RecallEngine:
         用宽松阈值换高覆盖率，把"要不要深读"的决定权交给 agent
         （``governed_kb_get`` / ``governed_kb_search``）。
 
-        未注入 KB（``kb=None``）或 ``kb.recall_min_score <= 0`` 时静默返回空，
-        保持旧行为不变。
+        未注入 KB（``kb=None``）时静默返回空，保持旧行为不变。
+        门槛需满足：``recall_min_score > 0`` 或 ``recall_min_kw_score > 0``
+        （两者都 =0 表示通道关闭，与旧版一致）。
+
+        **关键词通道为什么此前是死的**（P0，2026-09-17）：融合分是
+        ``0.4*kw + 0.6*sem``（见 ``_kb._KB_KW_WEIGHT`` / ``_KB_SEM_WEIGHT``），
+        而部署的 ``recall_min_score = 0.45`` 直接套在这个融合分上。于是**纯
+        关键词命中的理论上限就是 0.4**（``kw_norm`` 满格也只有 ``0.4*1.0``），
+        永远够不到 0.45 —— 关键词这一路被结构性地关死，只剩语义通道。
+        现在改成**逐通道判定**：``kw >= recall_min_kw_score`` OR
+        ``融合分 >= recall_min_score``。
         """
         kb = getattr(self, "_kb", None)
         if kb is None:
@@ -792,34 +811,64 @@ class RecallEngine:
         if kb_cfg is None or not bool(getattr(kb_cfg, "recall_hint_enabled", True)):
             return []
         min_score = float(getattr(kb_cfg, "recall_min_score", 0.0) or 0.0)
-        if min_score <= 0.0:
+        min_kw = float(getattr(kb_cfg, "recall_min_kw_score", 0.0) or 0.0)
+        if min_score <= 0.0 and min_kw <= 0.0:
             return []
         limit = max(1, int(getattr(kb_cfg, "recall_max_notes", 3) or 3))
+
+        # 候选池必须大于 limit：融合分普遍 0.5~0.9，而纯关键词命中被 0.4 权
+        # 重压到 <=0.4，先按融合分截到 limit 条就等于把它提前淘汰了（实测漏
+        # 掉的那篇排在全库第 27 位）。多取候选不增加 embedding 调用 —— 每条
+        # 查询仍然只嵌一次，代价只是 LanceDB 多返回几行。
+        pool = max(limit * _RECALL_KB_POOL_FACTOR, _RECALL_KB_POOL_MIN)
         try:
-            hits = kb.search(query, top_k=limit)
+            hits = kb.search(query, top_k=pool)
         except Exception as e:  # noqa: BLE001 — 提示通道失败绝不能影响主召回
             logger.debug("KB recall failed: %s", e)
             return []
 
-        out: List[RecallResult] = []
+        admitted: List[Tuple[float, str, Dict[str, Any]]] = []
         for h in hits:
-            score = float(h.get("score", 0.0) or 0.0)
-            if score < min_score:
+            fused = float(h.get("score", 0.0) or 0.0)
+            kw = float(h.get("keyword_score", 0.0) or 0.0)
+            # 走哪一进门是诊断依据：出错时能直接看出是语义给高了还是关键词
+            # 给高了，而不是只能看到一个融合分。
+            via = ""
+            if fused >= min_score > 0.0:
+                via = "fused"
+            elif kw >= min_kw > 0.0:
+                via = "keyword"
+            if not via:
                 continue
             title = str(h.get("title") or "").strip()
             path = str(h.get("path") or "").strip()
             if not title and not path:
                 continue
+            admitted.append((max(fused, kw), via, {
+                "title": title, "path": path, "hit": h, "fused": fused, "kw": kw,
+            }))
+
+        # 放行后按**放行依据**重排再截断：不重排的话，被关键词放行的笔记虽然
+        # 进了候选、还是会因为融合分低而排在末尾被 trim 掉 —— 修复等于没生效。
+        # 用的是 max(fused, kw)：两路都命中时取更强的那一路作为强度指标。
+        admitted.sort(key=lambda row: row[0], reverse=True)
+
+        out: List[RecallResult] = []
+        for score, via, row in admitted[:limit]:
+            h = row["hit"]
             out.append(RecallResult(
                 layer="kb",
-                content=title or Path(path).stem,
+                content=row["title"] or Path(row["path"]).stem,
                 score=score,
-                source=path,
+                source=row["path"],
                 metadata={
                     "kind": h.get("kind", ""),
                     "section": h.get("section", ""),
-                    "keyword_score": h.get("keyword_score", 0.0),
+                    "keyword_score": row["kw"],
                     "semantic_score": h.get("semantic_score", 0.0),
+                    "fused_score": row["fused"],
+                    "admit_via": via,
+                    "index_status": h.get("index_status", {}),
                 },
             ))
         return out

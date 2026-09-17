@@ -141,6 +141,19 @@ class KnowledgeConfig:
     #: 漏过 1/5 —— 提示行误报成本仅 ~40 token，因此取偏宽松一侧换覆盖率。
     #: 想要更干净可提到 0.50（相关 4/5、无关 0/5）。
     recall_min_score: float = 0.0
+    #: 走廊同上：KB 提示通道的**关键词**准入门槛。
+    #: 召回判定是两条走廊的**或**：``keyword >= recall_min_kw_score`` OR
+    #: ``融合分 >= recall_min_score``。两者同为 0.0 时通道关闭。
+    #:
+    #: 为什么必须有它（P0，2026-09-17）：融合分是 ``0.4*kw + 0.6*sem``，
+    #: 纯关键词命中的理论上限就是 0.4 —— 无论关键词多准，融合分都够不到
+    #: 部署值 0.45，关键词这一条路被结构性地关死。两个走廊必须分开设门槛。
+    #:
+    #: **默认 0.0 = 关闭**：与 ``recall_min_score`` 同一约定 —— 代码默认不改
+    #: 行为，部署侧显式开启。建议部署值 **1.0**（= ``kw_norm`` 满格，语义是
+    #: 「查询串完整出现在标题/tags/concepts 里」这一最强粒度）：在此粒度下
+    #: 实测相关命中 10/10、无关噪音与开启前完全一致（详见 reports）。
+    recall_min_kw_score: float = 0.0
     #: 一次提示最多列出几篇笔记。
     recall_max_notes: int = 3
 
@@ -325,7 +338,8 @@ _NUMERIC_FIELDS = {
     "mermaid_compress": ["canvas_max_tokens"],
     "vector": ["dim"],
     "embedding": ["dimensions"],
-    "kb": ["top_k", "min_score", "recall_min_score", "recall_max_notes"],
+    "kb": ["top_k", "min_score", "recall_min_score", "recall_min_kw_score",
+           "recall_max_notes"],
 }
 
 

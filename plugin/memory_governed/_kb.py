@@ -57,6 +57,12 @@ _KEYWORD_SCORE_DENOM = 5.0
 _KB_KW_WEIGHT = 0.4
 _KB_SEM_WEIGHT = 0.6
 
+#: mtime 比对容差（秒）：差值不超过它就认为「索引与正本一致」。
+#:
+#: 不能取 0：文件系统/同步盘的时间戳精度不一致（FAT/exFAT 1s、某些网盘 2s），
+#: 严格相等会造成同一批笔记反复被判定为「陈旧」，每次检索都白白重嵌一遍。
+_INDEX_MTIME_TOLERANCE = 0.5
+
 
 def _as_list(value: Any) -> List[str]:
     """归一化 frontmatter 的 tags/concepts 到 List[str]。"""
@@ -300,6 +306,167 @@ class KnowledgeBase:
         # 独立向量库目录（与 L2 记忆的 l2/ 分开）
         self._index_db = Path(config.l2_db_path).parent / "kb_index"
         self._index: Optional[KBIndex] = None
+        # 检索前的自愈同步互斥：并发检索（recall 线程池）不触发两遍增量同步
+        self._sync_lock = threading.Lock()
+        # 最近一次探测结论，供 :meth:`last_index_status` 读取
+        self._index_status: Dict[str, Any] = {}
+
+    # -- 索引新鲜度探测（廉价，只读元数据） ----------------------------
+
+    def scan_vault_paths(self) -> Dict[str, Path]:
+        """正本侧 ``相对路径 -> Path`` 映射（单次目录遍历，不读文件内容）。"""
+        out: Dict[str, Path] = {}
+        if not self._vault.exists():
+            return out
+        for path in self._vault.rglob("*.md"):
+            if ".obsidian" in path.parts:
+                continue
+            if path.name == "index.md":  # MOC 导航不参与检索
+                continue
+            out[self._rel(path)] = path
+        return out
+
+    def scan_vault_mtimes(self) -> Dict[str, float]:
+        """正本侧 ``相对路径 -> mtime`` 映射，**只读 stat、不读文件内容**。
+
+        这是本修复的性能关键：旧代码为了知道「有没有新笔记」必须用
+        ``_iter_notes()`` 把每篇笔记 read + 解析 frontmatter（vault 越大越贵），
+        而判别陈旧只需要 mtime —— stat 比 read 便宜一到两个数量级（实测
+        27 篇：stat 扫描 1.45ms vs 一次真实向量检索 273ms ≈ 1/190）。
+        """
+        out: Dict[str, float] = {}
+        for rel, path in self.scan_vault_paths().items():
+            out[rel] = _file_mtime(path)
+        return out
+
+    @staticmethod
+    def _diff_index_state(
+        vault_mtimes: Dict[str, float],
+        indexed: Dict[str, float],
+        available: bool,
+        reason: str = "",
+        probe: str = "ok",
+    ) -> Dict[str, Any]:
+        """正本 vs 投影的差异分类（纯计算，无 I/O）。
+
+        返回字段：
+            ``available`` / ``reason`` —— **向量后端**是否可用。只由索引
+                自身决定，绝不能被「探针能不能跑」污染（见下）。
+            ``probe`` —— ``"ok"`` / ``"unavailable"`` / ``"unsupported"``。
+                区分「后端没了」和「这个索引实现没有 mtime 表，没法判断」。
+            ``vault_notes`` / ``indexed`` —— 两侧记录数
+            ``missing`` / ``missing_paths`` —— 正本有、索引没有（新增/外部写入）
+            ``stale`` / ``stale_paths`` —— mtime 不一致（修改过）
+            ``orphaned`` —— 索引有、正本没有（已删除）
+            ``fresh`` —— 三者皆为 0；``probe != "ok"`` 时为 ``None``（**未知**，
+                不是「不可用」）。把「未知」说成「不可用」会让检索路径误砍掉
+                整条语义通道 —— 读路径宁可放行，不可砍光。
+        """
+        missing: List[str] = []
+        stale: List[str] = []
+        for rel, mt in vault_mtimes.items():
+            cur = indexed.get(rel)
+            if cur is None:
+                missing.append(rel)
+            elif abs(cur - mt) > _INDEX_MTIME_TOLERANCE:
+                stale.append(rel)
+        orphaned = [rel for rel in indexed if rel not in vault_mtimes]
+        fresh: Optional[bool]
+        fresh = None if probe != "ok" else not (missing or stale or orphaned)
+        state = {
+            "available": bool(available),
+            "reason": reason,
+            "probe": probe,
+            "vault_notes": len(vault_mtimes),
+            "indexed": len(indexed),
+            "missing": len(missing),
+            "missing_paths": sorted(missing),
+            "stale": len(stale),
+            "stale_paths": sorted(stale),
+            "orphaned": len(orphaned),
+            "orphaned_paths": sorted(orphaned),
+            "fresh": fresh,
+        }
+        return state
+
+    def _probe_state(self, idx: KBIndex) -> Dict[str, Any]:
+        """探测当前新鲜度；探针跑不动时如实标 ``probe``，不谎报 ``available``。
+
+        ``path_mtimes`` 是本次修复引入的索引能力，替身 / 第三方 / 旧版索引可能
+        没有。那种情况下我们**无法判断**新鲜度（``fresh=None``），但这跟「向量
+        后端不可用」是两件完全不同的事：语义通道该照常工作。历史教训之一就是
+        把这两件事混成一个布尔值，于是补一个诊断功能顺手把召回砍掉一半。
+        """
+        if not idx.available:
+            return self._diff_index_state(
+                {}, {}, False, idx.last_error or "index unavailable",
+                probe="unavailable",
+            )
+        probe_mtimes = getattr(idx, "path_mtimes", None)
+        if not callable(probe_mtimes):
+            # available 仍然是 True：后端在，只是探针不可用。
+            return self._diff_index_state(
+                {}, {}, True, "index has no path_mtimes()", probe="unsupported",
+            )
+        return self._diff_index_state(
+            self.scan_vault_mtimes(), probe_mtimes(), True, probe="ok",
+        )
+
+    def index_status(self) -> Dict[str, Any]:
+        """索引新鲜度诊断（纯元数据，不读文件内容）。
+
+        与 :meth:`sync_index` 共用同一份「陈旧」定义（``_INDEX_MTIME_TOLERANCE``
+        容差），所以这里报 ``missing=1`` 就一定意味着下一次同步会补上 1 篇。
+        探针不可用时 ``probe="unsupported"`` / ``fresh=None``（未知 ≠ 不可用）。
+        """
+        return self._probe_state(self._index_get())
+
+    @property
+    def last_index_status(self) -> Dict[str, Any]:
+        """上一次新鲜度探测的结论（首次检索前为空 dict）。
+
+        供上层把「检索结果可能不全」这件事显式告知用户 —— 数值再准，
+        用户看不到就等于没有。
+        """
+        return dict(self._index_status)
+
+    def _ensure_fresh_index(self) -> Dict[str, Any]:
+        """检索门前的廉价自愈：发现陈旧才增量同步，新鲜就立刻返回。
+
+        为什么放在这里而不是只在进程启动时跑一次：``ensure(sync=True)`` 的后台
+        同步只覆盖「插件刚起来」那一刻，会话中新写入的笔记（`kb-add` 之外的
+        外部直写 vault、同步盘、Obsidian 手工编辑）要到下一次重启才进索引，
+        期间 ``kb-search`` 搜不到却什么都不说 —— 静默失败比报错更糟。
+
+        成本控制（实测 27 篇真实 vault）：
+        - 一次探针 = stat 扫描 1.45ms + 索引侧 ``path_mtimes`` 7.98ms ≈ 9.4ms
+        - 一次真实向量检索（含 embedding API）≈ 273.6ms
+        探针比一次检索便宜约 29 倍，因此**每次检索都探测**的开销完全可以
+        接受，换来的是「写完立刻能搜到」的确定性；真正贵的内嵌落库只在
+        ``fresh=False`` 时发生，且只针对差异部分（:meth:`sync_index` 增量）。
+
+        探针跑不动（索引没有 ``path_mtimes``）时不报「后端不可用」，只把
+        ``fresh`` 标成未知然后照常返回 —— 自愈是增强，不能反过来把检索砍掉。
+        """
+        idx = self._index_get()
+        probe_mtimes = getattr(idx, "path_mtimes", None) if idx.available else None
+        if not idx.available or not callable(probe_mtimes):
+            # 后端真的不可用，或探针不可用：都没有可同步的依据，直接如实返回。
+            self._index_status = self._probe_state(idx)
+            return self._index_status
+
+        with self._sync_lock:
+            paths = self.scan_vault_paths()
+            vault = {rel: _file_mtime(p) for rel, p in paths.items()}
+            indexed = probe_mtimes()
+            state = self._diff_index_state(vault, indexed, True)
+            self._index_status = state
+            if state["fresh"] is False:
+                # 增量同步，并把已经算好的两侧映射传进去，避免重复 stat / 扫描
+                self.sync_index(_vault_mtimes=vault, _note_paths=paths,
+                                _index_mtimes=indexed)
+                self._index_status = dict(state, synced=True)
+            return self._index_status
 
     # -- 骨架 / 索引 -------------------------------------------------
 
@@ -342,8 +509,11 @@ class KnowledgeBase:
             n += 1
         return {"ok": True, "indexed": n}
 
-    def sync_index(self, *, background: bool = False,
-                   force: bool = False) -> Dict[str, Any]:
+    def sync_index(self, *, background: bool = False, force: bool = False,
+                   _vault_mtimes: "Optional[Dict[str, float]]" = None,
+                   _note_paths: "Optional[Dict[str, Path]]" = None,
+                   _index_mtimes: "Optional[Dict[str, float]]" = None
+                   ) -> Dict[str, Any]:
         """增量同步：正本（vault）变更 → 索引投影更新。
 
         与 :meth:`reindex` 的区别：``reindex`` 无条件全量重建（26 篇 = 26 次
@@ -363,6 +533,13 @@ class KnowledgeBase:
 
         Returns:
             统计 dict：``{ok, added, updated, removed, unchanged, errors}``。
+
+        私有参数 ``_vault_mtimes`` / ``_note_paths`` / ``_index_mtimes`` 供
+        :meth:`_ensure_fresh_index` 复用已经算好的「正本 mtime 表 / 路径表 /
+        索引 mtime 表」，避免一次检索里重复遍历目录、重复扫 LanceDB 两次。
+
+        命名必须带后缀：模块顶层已经 ``from . import _vault``，名字叫 ``_vault``
+        的参数会把模块遮住，``_vault.parse_frontmatter`` 直接 AttributeError。
         """
         if background:
             t = threading.Thread(
@@ -376,31 +553,42 @@ class KnowledgeBase:
         if not idx.available:
             return {"ok": False, "reason": idx.last_error or "index unavailable"}
 
-        notes = self._iter_notes()
-        vault: Dict[str, tuple] = {}
-        for note in notes:
-            rel = self._rel(note.path)
-            try:
-                mt = note.path.stat().st_mtime
-            except OSError:
-                mt = 0.0
-            vault[rel] = (note, mt)
+        paths = _note_paths if _note_paths is not None else self.scan_vault_paths()
+        vault: Dict[str, float] = (
+            _vault_mtimes if _vault_mtimes is not None
+            else {rel: _file_mtime(p) for rel, p in paths.items()}
+        )
 
-        indexed = {} if force else idx.path_mtimes()
+        indexed = {} if force else (
+            _index_mtimes if _index_mtimes is not None else idx.path_mtimes()
+        )
 
         added: List[str] = []
         updated: List[str] = []
-        for rel, (note, mt) in vault.items():
+        for rel, mt in vault.items():
             cur = indexed.get(rel)
             if cur is None:
                 added.append(rel)
-            elif abs(cur - mt) > 0.5:  # 容差：避开文件系统时间精度差异
+            elif abs(cur - mt) > _INDEX_MTIME_TOLERANCE:  # 避开文件系统时间精度差异
                 updated.append(rel)
         removed = [rel for rel in indexed if rel not in vault]
 
         errors = 0
+        # 只读差异部分的内容：批量重建（reindex）才需要读全库，
+        # 一次自愈通常只有 1~2 篇是新的，没必要把 27 篇全 parse 一遍。
         for rel in added + updated:
-            note, mt = vault[rel]
+            path = paths.get(rel)
+            if path is None:
+                errors += 1
+                continue
+            try:
+                text = path.read_text(encoding="utf-8", errors="replace")
+            except OSError as e:
+                logger.debug("kb sync read failed for %s: %s", rel, e)
+                errors += 1
+                continue
+            meta, body = _vault.parse_frontmatter(text)
+            note = _Note(path, _vault.note_title(path), meta, body)
             try:
                 idx.upsert(rel, note.full_text, mtime=mt)
             except Exception as e:  # noqa: BLE001
@@ -426,19 +614,12 @@ class KnowledgeBase:
         return result
 
     def index_stats(self) -> Dict[str, Any]:
-        """索引新鲜度诊断：正本 vs 投影的差异计数（供 governed_health 用）。"""
-        idx = self._index_get()
-        vault = len(self._iter_notes())
-        if not idx.available:
-            return {"available": False, "reason": idx.last_error,
-                    "vault_notes": vault, "indexed": 0, "stale": vault}
-        indexed = idx.path_mtimes()
-        return {
-            "available": True,
-            "vault_notes": vault,
-            "indexed": len(indexed),
-            "missing": max(0, vault - len(indexed)),
-        }
+        """索引新鲜度诊断：正本 vs 投影的差异（供 governed_health 用）。
+
+        历史 key（``available`` / ``vault_notes`` / ``indexed`` / ``missing``）
+        保持不变，新增 ``stale`` / ``orphaned`` / ``fresh`` 等细分字段。
+        """
+        return self.index_status()
 
     # -- 读取 --------------------------------------------------------
 
@@ -466,7 +647,13 @@ class KnowledgeBase:
             return str(path)
 
     def get(self, title: str) -> Optional[Dict[str, Any]]:
-        """按标题读单篇（返回全文）。"""
+        """按标题读单篇（返回全文）。
+
+        读数本身来自 vault 正本（永远不会陈旧），门前仍走一次
+        :meth:`_ensure_fresh_index`：写完立刻被读到 → 下一次 ``search`` 就有它，
+        自愈不必等到下一次检索才发生。
+        """
+        status = self._ensure_fresh_index()
         for note in self._iter_notes():
             if note.title == title or note.path.stem == title:
                 return {
@@ -475,6 +662,7 @@ class KnowledgeBase:
                     "section": note.section,
                     "meta": note.meta,
                     "body": note.body,
+                    "index_status": dict(status),
                 }
         return None
 
@@ -555,10 +743,16 @@ class KnowledgeBase:
 
         返回项的 ``score`` 是融合分；``kind`` 标明主导来源（``keyword`` /
         ``semantic`` / ``hybrid``），便于诊断。
+
+        门前先做一次 :meth:`_ensure_fresh_index`（廉价 mtime 探测 + 必要时的
+        增量同步）：会话中新写入 / 外部写入 vault 的笔记不必等到进程重启才
+        能被搜到。同步前后的索引状态都挂在返回项的 ``index_status`` 上，所以
+        「结果可能不全」这件事对用户是可见的，而不是静默变少。
         """
         if not query.strip():
             return []
         top_k = max(1, min(int(top_k), 50))
+        status = self._ensure_fresh_index()
         notes = self._iter_notes()
         if section:
             notes = [n for n in notes if n.section == section]
@@ -592,6 +786,23 @@ class KnowledgeBase:
         active_sem /= total_w
 
         note_by_rel: Dict[str, _Note] = {self._rel(n.path): n for n in notes}
+
+        # 每个返回项都带上同一份索引新鲜度快照。字段只放标量计数，不放
+        # ``missing_paths`` 这类长列表，免得把每条结果都撑成一屏。
+        # ``fresh`` 可能是 None（探针不可用 → 未知），照原样透传，不要强行
+        # 折成 True/False —— 把「不知道」说成「新鲜」就是本次要消灭的静默失败。
+        snapshot = {
+            "fresh": status.get("fresh"),
+            "probe": status.get("probe", "unavailable"),
+            "available": bool(status.get("available", False)),
+            "vault_notes": status.get("vault_notes", 0),
+            "indexed": status.get("indexed", 0),
+            "missing": status.get("missing", 0),
+            "stale": status.get("stale", 0),
+            "orphaned": status.get("orphaned", 0),
+            "synced": bool(status.get("synced", False)),
+        }
+
         scored: Dict[str, Dict[str, Any]] = {}
         for rel in set(kw_norm) | set(sem_norm):
             kw = kw_norm.get(rel, 0.0)
@@ -612,6 +823,9 @@ class KnowledgeBase:
                 kind = "semantic"
             else:
                 kind = "keyword"
+            # 注意缩进：这一句必须在 for 循环体内。曾经因为一次编辑把它
+            # 顶格到循环外（只剩最后一轮迭代的值），结果 search() 对每条查询
+            # 只返回一条结果 —— 而既有测试是全绿的假象要靠新测试才暴露。
             scored[rel] = {
                 "title": title,
                 "path": rel,
@@ -623,6 +837,7 @@ class KnowledgeBase:
                 "tags": tags,
                 "concepts": concepts,
                 "snippet": snippet,
+                "index_status": dict(snapshot),
             }
 
         ranked = sorted(scored.values(), key=lambda x: x["score"], reverse=True)
