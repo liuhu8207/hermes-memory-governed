@@ -1289,7 +1289,132 @@ def cmd_remember(config: dict, text: str, agent: str,
 
     base.update({"ok": True, "content": cleaned[:600], "vector_dim": dim,
                  "embedding_backend": embedding.backend_name})
+
+    # Refresh the offline snapshot while LanceDB is already open — see
+    # :func:`cmd_snapshot`. Doing it here rather than at session start turns a
+    # second ~2s process+import into a table read, and it makes the snapshot
+    # track writes through the only entry point agents are supposed to use.
+    #
+    # A failure is *reported*, not swallowed: the write itself succeeded, and a
+    # caller whose next session silently matched against a stale file deserves
+    # to have been told at the moment it went stale.
+    snap = cmd_snapshot(config)
+    if not snap.get("ok"):
+        base["snapshot_error"] = snap.get("error")
     return base
+
+
+#: Bumped when the snapshot's shape changes, so a stale file written by an older
+#: CLI is recognisable instead of being parsed as if it were current.
+L2_SNAPSHOT_SCHEMA = 1
+
+#: Ceiling on how many facts a snapshot carries. A snapshot exists so an agent
+#: can ask "does the store already say something about this?" **without**
+#: spawning an interpreter, importing LanceDB or calling an embedding backend;
+#: past this size the file stops being cheap to read in-process. Measured
+#: 2026-09-17: the real store held 21 facts / 1015 characters of content, a
+#: ~3.5KB file. The limit is not a guess about today's data.
+L2_SNAPSHOT_MAX_FACTS = 2000
+
+
+def snapshot_path() -> str:
+    """Where the offline snapshot lives. Beside the store it mirrors."""
+    return os.path.join(hermes_home(), "memory", "l2_snapshot.json")
+
+
+def cmd_snapshot(config: dict, out_path: str = "", max_facts: int = 0) -> dict:
+    """Write every L2 fact to a JSON snapshot and report what was written.
+
+    Why this exists
+    ---------------
+    Measured 2026-09-17, on the real store, per ``recall`` invocation:
+
+        sh + python start .............. 0.71s
+        recall --lexical-only .......... 2.16s
+        recall (semantic) .............. 2.83s
+
+    The bulk is interpreter start plus LanceDB load and a full table scan; the
+    embedding round trip is only ~0.67s of it. That is acceptable once per
+    session and unacceptable once per prompt — so an agent had no affordable way
+    to ask the store a question *before* answering, which is exactly when the
+    answer would have been useful.
+
+    The store is small enough to answer from a file: 21 facts, 1015 characters
+    of content, ~3.5KB of JSON. This command writes that file; the caller then
+    matches in-process with no spawn, no LanceDB and no network.
+
+    ``truncated`` is reported rather than implied — the same rule the recall
+    path follows for withheld rows. A snapshot that silently dropped facts would
+    make the offline matcher confidently blind, and a confident miss is the
+    failure this store exists to eliminate.
+
+    Reads only. ``create_dim`` keeps :func:`open_l2_table` in its read-only
+    default, so asking for a snapshot can never conjure a table.
+    """
+    limit = int(max_facts) if max_facts else L2_SNAPSHOT_MAX_FACTS
+    path = out_path or snapshot_path()
+
+    # ``open_l2_table`` takes the plugin's config *object* (it needs
+    # ``l2_db_path``), not the CLI's plain dict — ``cmd_agents`` resolves it the
+    # same way. Passing the dict raises AttributeError at connect time.
+    table = open_l2_table(plugin_config(), create_dim=0)
+    if table is None:
+        return {"ok": False, "error": "l2 table missing", "path": path,
+                "count": 0, "facts": []}
+
+    try:
+        rows = table.to_arrow().to_pylist()
+    except Exception as exc:  # noqa: BLE001 — reported, never swallowed
+        return {"ok": False, "error": f"cannot read L2: {exc}", "path": path,
+                "count": 0, "facts": []}
+
+    wanted = ("content", "category", "agent", "project", "timestamp", "source", "role")
+    facts = []
+    for row in rows:
+        content = str(row.get("content") or "").strip()
+        if not content:
+            continue        # a fact with no text is not a fact
+        facts.append({k: row.get(k) for k in wanted if k in row})
+
+    # Newest first, so a truncated snapshot keeps the most recent facts rather
+    # than an arbitrary write-order prefix.
+    facts.sort(key=lambda f: f.get("timestamp") or 0, reverse=True)
+    truncated = len(facts) > limit
+    if truncated:
+        facts = facts[:limit]
+
+    from datetime import datetime, timezone  # noqa: PLC0415 — one caller
+
+    payload = {
+        "schema": L2_SNAPSHOT_SCHEMA,
+        "generated_at": datetime.now(timezone.utc).astimezone().isoformat(timespec="seconds"),
+        "home": hermes_home(),
+        "count": len(facts),
+        "truncated": truncated,
+        "max_facts": limit,
+        "facts": facts,
+    }
+
+    try:
+        parent = os.path.dirname(path)
+        if parent:
+            os.makedirs(parent, exist_ok=True)
+        tmp = f"{path}.tmp{os.getpid()}"
+        with open(tmp, "w", encoding="utf-8") as fh:
+            json.dump(payload, fh, ensure_ascii=False)
+        os.replace(tmp, path)
+    except OSError as exc:
+        return {"ok": False, "error": f"cannot write snapshot: {exc}",
+                "path": path, "count": 0, "facts": []}
+
+    return {
+        "ok": True,
+        "path": path,
+        "count": len(facts),
+        "truncated": truncated,
+        "bytes": os.path.getsize(path),
+        "generated_at": payload["generated_at"],
+    }
 
 
 def cmd_agents(config: dict) -> dict:
@@ -1919,7 +2044,7 @@ def cmd_health(config: dict):
 #: Commands whose answer depends on L2, and therefore on LanceDB being
 #: importable. Only these pay the cost of a possible interpreter re-exec; the
 #: read-only Markdown commands stay fast on a bare interpreter.
-_L2_COMMANDS = {"recall", "remember", "agents", "health", "runtime"}
+_L2_COMMANDS = {"recall", "remember", "agents", "health", "runtime", "snapshot"}
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -1978,6 +2103,15 @@ def build_parser() -> argparse.ArgumentParser:
 
     sub.add_parser("l1", parents=[common], help="Print the standing L1 rules + L4 persona")
     sub.add_parser("agents", parents=[common], help="Who has written what (provenance)")
+    sn = sub.add_parser(
+        "snapshot", parents=[common],
+        help="Dump every L2 fact to a JSON file, so a caller can match offline")
+    sn.add_argument("--out", default="",
+                    help="Where to write it "
+                         "(default: $HERMES_HOME/memory/l2_snapshot.json)")
+    sn.add_argument("--max-facts", type=int, default=0,
+                    help=f"Keep at most this many facts, newest first "
+                         f"(default: {L2_SNAPSHOT_MAX_FACTS})")
     sub.add_parser("health", parents=[common], help="Memory health report")
     sub.add_parser("runtime", parents=[common],
                    help="Which interpreter this ran under and what it can see")
@@ -2012,6 +2146,11 @@ def main():
     if args.cmd == "agents":
         print(json.dumps(cmd_agents(config), ensure_ascii=False, indent=2))
         return 0
+    if args.cmd == "snapshot":
+        out = cmd_snapshot(config, getattr(args, "out", ""),
+                           getattr(args, "max_facts", 0))
+        print(json.dumps(out, ensure_ascii=False, indent=2))
+        return 0 if out.get("ok") else 1
 
     if args.cmd == "recall":
         degraded: list = []

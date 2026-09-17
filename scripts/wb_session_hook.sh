@@ -28,6 +28,10 @@
 #   expansion is lexical-ordered by the shell itself, which is all we need.
 # * **No ``ls``/``find``.** Same class of hijack risk; the shell's own glob is
 #   both safer and faster.
+# * **No ``dirname`` either.** It is an external binary inside a ``$( )``, so it
+#   costs a subshell *and* a fork. Measured on this machine: swapping it for the
+#   builtin ``${0%/*}`` took the sibling ``UserPromptSubmit`` wrapper from 1.20s
+#   to 0.72s per invocation. Hooks are spawned per event; forks are the budget.
 # * Note the corollary: a *cleaned* PATH is more reliable here than the
 #   inherited one, because the inherited PATH puts Windows system directories
 #   ahead of the Git Bash ``usr/bin``.
@@ -42,7 +46,16 @@ set -u
 # is silent from the host's point of view, because this hook is designed to
 # degrade quietly. ``pwd -W`` is the Git Bash builtin that yields the Windows
 # form; plain ``pwd`` is kept only as a fallback for shells that lack ``-W``.
-DIR=$(dirname -- "$0" 2>/dev/null) || DIR="."
+# Strip the script name without forking — and handle **both** separators, because
+# Windows callers produce both (the docs' example uses ``D:/...``; a path that
+# was expanded from ``D:\...`` arrives with backslashes). Missing that case is
+# not cosmetic: DIR silently degrades to the current directory, the script is
+# then looked for in the wrong place, and the hook answers with nothing.
+case "$0" in
+    */*)  DIR=${0%/*} ;;
+    *\\*) DIR=${0%\\*} ;;
+    *)    DIR="." ;;
+esac
 case "$DIR" in
     [A-Za-z]:[\\/]*) ;;                     # already Windows-absolute
     *) DIR=$(cd -- "$DIR" 2>/dev/null && (pwd -W 2>/dev/null || pwd)) || DIR="." ;;
@@ -103,4 +116,12 @@ PY=$(find_python) || {
 # code propagates without an extra shell in between. Note that Git Bash
 # translates the POSIX-style ``$DIR`` into a Windows path when handing it to a
 # native ``python.exe``.
-exec "$PY" "${DIR}/wb_session_hook.py"
+SCRIPT="${DIR}/wb_session_hook.py"
+if [ ! -f "$SCRIPT" ]; then
+    # The contract, not the filesystem: the host parses stdout unconditionally,
+    # so a path problem must still produce JSON and exit 0.
+    printf '{"continue":true}\n'
+    exit 0
+fi
+
+exec "$PY" "$SCRIPT"

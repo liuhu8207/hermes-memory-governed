@@ -39,6 +39,7 @@ import os
 import re
 import subprocess
 import sys
+import time
 from pathlib import Path
 
 # Do this before anything can write, or the first line may already be mis-encoded.
@@ -115,6 +116,33 @@ python "{cli}" remember "<通用事实>" --project ""     # 显式标为全局�
 判断标准很简单：**换一台机器、换一个项目还成立**的，就是全局事实；
 **只有这个代码库才成立**的，就归属本项目。标错了不会丢数据，
 但会让它在别的项目里查不到。
+"""
+
+
+#: When to go and look, as opposed to what is there to look at. The capability
+#: hint below already says *what* exists and *how* to fetch it; measured
+#: experience is that this is not the part agents get wrong — they know the
+#: commands exist and still answer from memory. Naming the situations is what
+#: turns a tool into a habit.
+#:
+#: Deliberately short, and deliberately paired with a "do NOT look" line: a
+#: block that only ever says "look things up" trains the model to spend context
+#: on general-knowledge questions this store cannot answer.
+WHEN_TO_LOOK = """
+### 什么时候该先查再答
+
+命中任一条，先 `recall` 再回答，别凭印象：
+
+| 触发情形 | 例子 |
+|---|---|
+| 涉及本机或内网设施 | 哪台机器、什么端口、服务跑在哪 |
+| 凭据与访问方式 | 密码存哪、怎么连上、免密怎么配的 |
+| 动手改配置之前 | 重启服务、改代理、动网关或路由 |
+| 「上次／之前／为什么」 | 上次那个问题怎么修的、当初为什么这么定 |
+| 你正要写一条新事实 | 先查有无重复或与既有事实冲突 |
+
+**反过来**：纯通用知识（算法、语言语法、公开概念、常识）**不要查** —— 这个
+存储里只有你这套环境的事实，通用问题查了也只会得到无关内容。
 """
 
 
@@ -259,6 +287,65 @@ def _clean(text) -> str:
     return body if meaningful else ""
 
 
+#: How stale the offline snapshot may be before a session start refreshes it.
+#: ``remember`` refreshes the file itself (see ``memory_cli.cmd_snapshot``), so
+#: this normally finds a fresh one and does nothing; it is the safety net for
+#: facts the plugin wrote directly, which never pass through the CLI.
+SNAPSHOT_MAX_AGE_SECONDS = 3600
+
+#: Separate from the L1 timeout: a refresh is a convenience, and it must not be
+#: able to hold a session open for as long as a rulebook fetch may.
+SNAPSHOT_TIMEOUT_SECONDS = 20
+
+
+def snapshot_file():
+    """Where the CLI writes the snapshot. Asked of the CLI, not re-derived."""
+    try:
+        if str(REPO) not in sys.path:
+            sys.path.insert(0, str(REPO))
+        import memory_cli  # noqa: PLC0415 — deliberate; see resolve_project
+
+        return Path(memory_cli.snapshot_path())
+    except Exception:  # noqa: BLE001 — no path means no refresh
+        return None
+
+
+def ensure_snapshot() -> str:
+    """Refresh the offline snapshot when missing or stale; return a status word.
+
+    The snapshot exists so the per-prompt hook can answer "does the store
+    already say something about this?" without spawning an interpreter and
+    loading LanceDB on every message. Something has to keep it current, and the
+    two cheap moments are: right after a write (the CLI does that, LanceDB being
+    already open) and session start (here).
+
+    Never raises. A convenience that can fail a session is not a convenience.
+    """
+    path = snapshot_file()
+    if path is None:
+        return "path unknown"
+    age = None
+    try:
+        age = time.time() - path.stat().st_mtime
+        if age <= SNAPSHOT_MAX_AGE_SECONDS:
+            return f"fresh ({age / 60:.0f}m)"
+    except OSError:
+        pass                                  # missing — refresh it below
+
+    env = dict(os.environ)
+    env["PYTHONIOENCODING"] = "utf-8"
+    env["PYTHONUTF8"] = "1"
+    try:
+        proc = subprocess.run([sys.executable, str(CLI), "snapshot"],
+                              capture_output=True, env=env,
+                              timeout=SNAPSHOT_TIMEOUT_SECONDS)
+    except (OSError, subprocess.SubprocessError) as exc:
+        return f"refresh failed: {type(exc).__name__}"
+    if proc.returncode != 0:
+        return f"refresh rc={proc.returncode}"
+    return "refreshed" if age is not None else "created"
+
+
 def build_context(l1: dict, cwd: str = "") -> str:
     """Assemble the injected block, capped at :data:`MAX_CHARS`."""
     parts = [HEADER, ""]
@@ -285,6 +372,11 @@ def build_context(l1: dict, cwd: str = "") -> str:
         parts.append(PROJECT_HINT.format(cwd=cwd, project=project,
                                          cli=CLI.as_posix()))
 
+    # Ahead of the capability block: if the cap ever bites, the situations are
+    # worth more than the command syntax, which the agent can rediscover from
+    # `--help` while a missed lookup leaves it confidently wrong.
+    parts.append(WHEN_TO_LOOK.strip())
+
     parts.append(CAPABILITY.format(cli=CLI.as_posix()))
 
     text = "\n".join(parts).strip()
@@ -299,6 +391,9 @@ def build_context(l1: dict, cwd: str = "") -> str:
 def main() -> int:
     payload = read_payload()
     l1 = fetch_l1()
+    # Keep the per-prompt hook's data current. Cheap in the common case (a
+    # stat), and it runs once per session rather than once per message.
+    snap = ensure_snapshot()
     # Which project this session belongs to drives both the project block and
     # the write-attribution advice. The lookup is deliberately redundant —
     # see :func:`resolve_cwd` for why one field is not enough.
@@ -319,7 +414,7 @@ def main() -> int:
         sys.stderr.write(
             f"[hgm-hook] 已注入 {len(context)} 字符 "
             f"(L1 {'读取成功' if l1 else '读取失败，降级为能力提示'}; "
-            f"cwd 来源={cwd_source or '未取到'}; "
+            f"cwd 来源={cwd_source or '未取到'}; 快照={snap}; "
             f"session={payload.get('session_id', '?')})\n"
         )
     print(json.dumps(out, ensure_ascii=False))
