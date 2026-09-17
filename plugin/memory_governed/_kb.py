@@ -25,6 +25,7 @@ import json
 import logging
 import re
 import threading
+import time
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -35,6 +36,15 @@ from ._recall import row_to_score
 from . import _vault
 
 logger = logging.getLogger(__name__)
+
+try:  # pragma: no cover - _diag.py 尚未落地时的兼容回退（与 _recall.py 同一套）
+    from ._diag import log_degraded
+except Exception:  # noqa: BLE001
+    def log_degraded(component: str, reason: str, *, detail: str = "",
+                     exc: BaseException | None = None) -> None:
+        """Fallback: 无 _diag.py 时的 WARNING 级降级日志。"""
+        logger.warning("[degraded] %s: %s %s", component, reason, detail,
+                       exc_info=exc)
 
 #: [[Title]] / [[Title|alias]] / [[dir/Title]] / [[Title#heading]]
 _LINK_RE = re.compile(r"\[\[([^\]\|#]+)(?:\|[^\]]*)?\]\]")
@@ -133,7 +143,28 @@ class _Note:
 
 
 class KBIndex:
-    """向量索引投影层（可选）。不可用时 ``available=False`` 并记录原因。"""
+    """向量索引投影层（可选）。不可用时 ``available=False`` 并记录原因。
+
+    可用性**不是一次判定定终生**（P2，2026-09-17）：``__init__`` 那一刻的
+    瞬时失败（网络抖动 / API 限流 / key 临时不可用）会把整条语义通道锁死到
+    进程结束、且悄无声息 —— 这与「索引陈旧不自愈」同族，都是
+    「一次性判定 + 无自愈 + 不报错」。因此当判定为「不可用」时，
+    :attr:`available` 会按 :data:`REPROBE_TTL_SECONDS` **懒重探**：后端一旦
+    恢复就自愈，并把次数 / 结论写进状态字段（见
+    :meth:`KnowledgeBase._probe_state`）。
+
+    语义边界（别混）：本类的 ``available=False`` 严格表示「后端真的用不了」，
+    与「可用性未知」（``_probe_state`` 的 ``probe="unsupported"`` /
+    ``fresh=None``）是两个概念。重探失败只会维持 ``available=False``，
+    **绝不触碰** ``fresh`` 语义。
+    """
+
+    #: 「不可用」判定的懒重探间隔（秒）。
+    #:
+    #: 不能设 0：每次调用都重探会让每个检索多一次 lancedb connect，把廉价
+    #: 探测变成新的性能问题。也不能太大：恢复太慢。30s 是折中，且只有
+    #: **当前不可用**时才会走到这里 —— 可用状态下 :attr:`available` 零成本。
+    REPROBE_TTL_SECONDS: float = 30.0
 
     def __init__(self, config: GovernedMemoryConfig, db_path: Path):
         self._config = config
@@ -142,13 +173,67 @@ class KBIndex:
         self._store = None
         self._available = False
         self._last_error = ""
+        # 懒重探状态：锁保证并发检索时「TTL 内只探一次」
+        self._reprobe_lock = threading.Lock()
+        self._reprobe_count = 0
+        self._next_reprobe_at = 0.0
         self._init()
+        self._schedule_next_reprobe()
+
+    def _schedule_next_reprobe(self) -> None:
+        """把下一次懒重探排到 TTL 之后（可用状态下这个值用不到）。"""
+        self._next_reprobe_at = time.monotonic() + self.REPROBE_TTL_SECONDS
+
+    def _maybe_reprobe(self) -> None:
+        """当前不可用时按 TTL 懒重探一次；恢复则自愈并留下可观测痕迹。
+
+        只在 ``_available is False`` 时才被 :attr:`available` 调用，所以
+        可用状态下这条路径的成本是 0（一次属性判断）。
+        """
+        if self._available:
+            return
+        if time.monotonic() < self._next_reprobe_at:
+            return
+        with self._reprobe_lock:
+            # 双重检查：并发检索下可能已被另一个线程探过
+            if self._available or time.monotonic() < self._next_reprobe_at:
+                return
+            self._reprobe_count += 1
+            self._schedule_next_reprobe()
+            self._init(reprobe=True)
+            if self._available:
+                log_degraded(
+                    "kb_index", "recovered",
+                    detail="vector backend available again after "
+                           f"{self._reprobe_count} lazy re-probe attempt(s)",
+                )
+            else:
+                # 仍是「不可用」——如实上报；**不改** fresh 语义（那是
+                # _probe_state 的 probe="unsupported" 管的另一件事）。
+                log_degraded(
+                    "kb_index", "reprobe_still_unavailable",
+                    detail=f"attempt #{self._reprobe_count}: "
+                           f"{self._last_error or 'unknown'}",
+                )
 
     # -- 初始化 ------------------------------------------------------
 
-    def _init(self) -> None:
+    def _init(self, *, reprobe: bool = False) -> None:
+        """初始化（``reprobe=False``）或懒重探（``reprobe=True``）向量后端。
+
+        Args:
+            reprobe: 懒重探路径为 True。此时若拿到的是「启动那一刻就探测失败、
+                且被 :class:`EmbeddingService` 单例缓存住」的服务，必须先
+                ``reset()`` 丢弃它再重建 —— 否则 ``get()`` 会一直把同一个
+                不可用实例还给我们，重探等于空转，瞬时故障永远恢复不了。
+        """
         try:
             self._service = EmbeddingService.get(self._config)
+            if reprobe and not getattr(self._service, "available", False):
+                # reset() 只清空单例引用，已在用旧实例的调用方不受影响；
+                # 重建会真正重跑一次后端探针（API 限流解除后即可恢复）。
+                EmbeddingService.reset()
+                self._service = EmbeddingService.get(self._config)
         except Exception as e:  # noqa: BLE001 — 索引只是投影，失败不能影响主流程
             self._last_error = f"embedding: {e}"
             return
@@ -193,7 +278,20 @@ class KBIndex:
 
     @property
     def available(self) -> bool:
+        """向量后端是否可用；当前不可用时按 TTL 懒重探一次（见类文档）。
+
+        ``available=False`` 的含义严格是「后端真的用不了」，与「可用性未知」
+        （``KnowledgeBase._probe_state`` 的 ``probe="unsupported"`` /
+        ``fresh=None``）是两个概念 —— 重探逻辑不会把它们混回去。
+        """
+        if not self._available:
+            self._maybe_reprobe()
         return self._available
+
+    @property
+    def reprobe_count(self) -> int:
+        """进程启动以来懒重探的次数（诊断用，进 ``index_status``）。"""
+        return self._reprobe_count
 
     @property
     def last_error(self) -> str:
@@ -265,6 +363,7 @@ class KBIndex:
             logger.debug("kb index drop failed: %s", e)
         self._available = False
         self._init()
+        self._schedule_next_reprobe()
 
     # -- 读 ----------------------------------------------------------
 
@@ -346,6 +445,7 @@ class KnowledgeBase:
         available: bool,
         reason: str = "",
         probe: str = "ok",
+        reprobe_count: int = 0,
     ) -> Dict[str, Any]:
         """正本 vs 投影的差异分类（纯计算，无 I/O）。
 
@@ -354,6 +454,9 @@ class KnowledgeBase:
                 自身决定，绝不能被「探针能不能跑」污染（见下）。
             ``probe`` —— ``"ok"`` / ``"unavailable"`` / ``"unsupported"``。
                 区分「后端没了」和「这个索引实现没有 mtime 表，没法判断」。
+            ``reprobe_count`` —— 后端**懒重探**次数（P2）。``available=True``
+                且它 ``>0`` 表示「曾经不可用、后来自愈了」；这个恢复事件必须
+                可见，否则「一次瞬时故障永久降级」会再犯。
             ``vault_notes`` / ``indexed`` —— 两侧记录数
             ``missing`` / ``missing_paths`` —— 正本有、索引没有（新增/外部写入）
             ``stale`` / ``stale_paths`` —— mtime 不一致（修改过）
@@ -377,6 +480,7 @@ class KnowledgeBase:
             "available": bool(available),
             "reason": reason,
             "probe": probe,
+            "reprobe_count": int(reprobe_count),
             "vault_notes": len(vault_mtimes),
             "indexed": len(indexed),
             "missing": len(missing),
@@ -396,20 +500,27 @@ class KnowledgeBase:
         没有。那种情况下我们**无法判断**新鲜度（``fresh=None``），但这跟「向量
         后端不可用」是两件完全不同的事：语义通道该照常工作。历史教训之一就是
         把这两件事混成一个布尔值，于是补一个诊断功能顺手把召回砍掉一半。
+
+        读取 ``idx.available`` 本身可能触发一次懒重探（P2）—— 这正是
+        「瞬时故障自愈」的入口：可用性恢复后，下一次探测就会走到正常分支。
         """
-        if not idx.available:
+        available = idx.available
+        reprobe_count = int(getattr(idx, "reprobe_count", 0) or 0)
+        if not available:
             return self._diff_index_state(
                 {}, {}, False, idx.last_error or "index unavailable",
-                probe="unavailable",
+                probe="unavailable", reprobe_count=reprobe_count,
             )
         probe_mtimes = getattr(idx, "path_mtimes", None)
         if not callable(probe_mtimes):
             # available 仍然是 True：后端在，只是探针不可用。
             return self._diff_index_state(
                 {}, {}, True, "index has no path_mtimes()", probe="unsupported",
+                reprobe_count=reprobe_count,
             )
         return self._diff_index_state(
             self.scan_vault_mtimes(), probe_mtimes(), True, probe="ok",
+            reprobe_count=reprobe_count,
         )
 
     def index_status(self) -> Dict[str, Any]:
@@ -447,10 +558,16 @@ class KnowledgeBase:
 
         探针跑不动（索引没有 ``path_mtimes``）时不报「后端不可用」，只把
         ``fresh`` 标成未知然后照常返回 —— 自愈是增强，不能反过来把检索砍掉。
+
+        可用性本身也会自愈（P2）：``idx.available`` 在判定为不可用时按 TTL
+        懒重探，因此一次瞬时故障过后，这里会先恢复 ``available``、再照常做
+        增量同步 —— 无需重启进程。恢复次数随 ``reprobe_count`` 一起透出。
         """
         idx = self._index_get()
-        probe_mtimes = getattr(idx, "path_mtimes", None) if idx.available else None
-        if not idx.available or not callable(probe_mtimes):
+        available = idx.available  # 可能触发一次懒重探；必须先读它再读计数
+        reprobe_count = int(getattr(idx, "reprobe_count", 0) or 0)
+        probe_mtimes = getattr(idx, "path_mtimes", None) if available else None
+        if not available or not callable(probe_mtimes):
             # 后端真的不可用，或探针不可用：都没有可同步的依据，直接如实返回。
             self._index_status = self._probe_state(idx)
             return self._index_status
@@ -459,7 +576,8 @@ class KnowledgeBase:
             paths = self.scan_vault_paths()
             vault = {rel: _file_mtime(p) for rel, p in paths.items()}
             indexed = probe_mtimes()
-            state = self._diff_index_state(vault, indexed, True)
+            state = self._diff_index_state(vault, indexed, True,
+                                           reprobe_count=reprobe_count)
             self._index_status = state
             if state["fresh"] is False:
                 # 增量同步，并把已经算好的两侧映射传进去，避免重复 stat / 扫描
@@ -795,6 +913,8 @@ class KnowledgeBase:
             "fresh": status.get("fresh"),
             "probe": status.get("probe", "unavailable"),
             "available": bool(status.get("available", False)),
+            # 懒重探次数：>0 且 available 为真 = 「曾降级、已自愈」，必须可见
+            "reprobe_count": status.get("reprobe_count", 0),
             "vault_notes": status.get("vault_notes", 0),
             "indexed": status.get("indexed", 0),
             "missing": status.get("missing", 0),
@@ -1175,6 +1295,7 @@ class KnowledgeBase:
             "by_section": by_section,
             "index_available": idx.available,
             "index_error": idx.last_error or "",
+            "index_reprobe_count": int(getattr(idx, "reprobe_count", 0) or 0),
             "indexed": len(indexed),
             "index_missing": missing,
             "index_stale": stale,
