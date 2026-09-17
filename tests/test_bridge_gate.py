@@ -7,20 +7,30 @@
 「我儿子的准考证，考试前一天记得提醒我」一旦 promote 就会让 Hermes 永远
 记得提醒一场早已结束的考试。
 
-本文件钉死三件事：
+本文件钉死四件事：
 1. 时效性一次性待办进不了池；
 2. 模板骨架（USER.md / MEMORY.md 的脚手架）进不了池，且不会顺着
    persona → 候选 → promote 的环路回流 L1；
-3. 候选抽取用的是**统一**的强信号尺子，而不是另起一套词表。
+3. 候选抽取用的是**统一**的强信号尺子，而不是另起一套词表；
+4. 该「统一尺子」是**逐字调用**共享定义 ``_sync.dialogue_fact_admits``，
+   而不是在此处内联一行 ``_fact_signal_score(..., strong_only=True)`` ——
+   2026-09-17 的内联版本没去角色先验、也不消解疑问句式，把整类「能不能…」
+   疑问句当规则放行（见 ``TestBridgeSharesTheDialogueRuler``）。
 """
 
 from __future__ import annotations
+
+import ast
+from pathlib import Path
 
 import pytest
 
 from plugin.memory_governed import GovernedMemoryProvider
 from plugin.memory_governed._bridge import screen_bridge_content
 from plugin.memory_governed._sync import (
+    _fact_signal_score,
+    dialogue_fact_admits,
+    external_structural_evidence,
     has_template_scaffold,
     is_ephemeral_content,
     is_memory_aggregate,
@@ -304,12 +314,22 @@ class TestSessionCandidates:
     @pytest.mark.parametrize("text", [
         "我在NAS有装secretstore，但本地布署不能同步给其它地方装的secretstore",
         "我家里用的是虚拟机软路由，我打算换回硬件路由器，还要装tailscale进行组网",
-        "能不能做成免密？每次要输密码太麻烦了",
     ])
     def test_real_preferences_survive(self, text):
         got = self._extract(text)
         assert len(got) == 1, text
         assert got[0]["target"] == "memory"
+
+    def test_a_polar_question_is_no_longer_a_preference(self):
+        """放宽前的这条「真实偏好」实为疑问句，2026-09-17 起按规则拒收。
+
+        旧内联门槛把「能不能做成免密？每次要输密码太麻烦了」当偏好放行，因为
+        「能不能」字面含「不能」+ 角色先验加满。它是一条**请求**（问能不能做
+        成免密），不是承诺；写入路径与回放已按同一判断把它剔掉（见
+        ``TestBridgeSharesTheDialogueRuler``）。此处只把这一条的预期如实改掉，
+        不含其它两条真实部署事实。
+        """
+        assert self._extract("能不能做成免密？每次要输密码太麻烦了") == []
 
     def test_assistant_turns_are_never_candidates(self):
         """Bridge 只从 user 轮抽候选 —— 助手叙述没有「用户意愿」可言。"""
@@ -326,3 +346,127 @@ class TestSessionCandidates:
     def test_empty_multimodal_content_is_skipped(self):
         msgs = [{"role": "user", "content": [{"type": "image_url", "image_url": {}}]}]
         assert GovernedMemoryProvider._extract_session_candidates(_SessionStub(), msgs) == []
+
+
+# ---------------------------------------------------------------------------
+# 5) 桥接入口与写入 / 回放共用同一把尺子（2026-09-17）
+# ---------------------------------------------------------------------------
+
+#: 直呼 ``_fact_signal_score(..., strong_only=True)`` 曾让本入口把整类疑问句放行：
+#: 「能不能…」字面含「不能」，而旧内联表达式既不传 ``include_role=False``（于是
+#: 「谁说的」替「说了什么」作了证），也不消解疑问句式。修复前实测这五条全部
+#: ADMIT。Bridge 候选会 promote 进 L1（每轮注入的规则层），代价比 L2 更重。
+CHATTER_AT_BRIDGE = [
+    "能不能帮我改一下配置",
+    "能不能做成免密",
+    "这个能不能行",
+    "我能不能先看看",
+    "我一般都用这个",
+    # 非承诺型虚词句：「我的」已被移出强信号池（Defect C），只剩通用虚词。
+    "我的意思是再想想",
+]
+
+#: 真承诺：独立的模态信号（我需要…）必须照样放行 —— 收紧不得误伤规则本身。
+COMMITMENT_AT_BRIDGE = [
+    "我需要把网关换成 schtasks 启动",
+]
+
+#: 真结论：单条强信号 + 命名佐证（因为…PostgreSQL）。它只有一条强信号，靠
+#: ``dialogue_fact_admits`` 的佐证分支进来 —— 去掉该分支会在收紧时连带删掉
+#: 一整族「…因为…」结论，所以这里要在入口层面钉住。
+CORROBORATED_AT_BRIDGE = [
+    "我们决定用 PostgreSQL 因为它更公平稳定",
+]
+
+
+class TestBridgeSharesTheDialogueRuler:
+    """入口判定必须逐条等于共享尺子，疑问句不再借角色先验通行。"""
+
+    def _extract(self, text: str, role: str = "user"):
+        return GovernedMemoryProvider._extract_session_candidates(
+            _SessionStub(), [{"role": role, "content": text}]
+        )
+
+    @pytest.mark.parametrize("text", CHATTER_AT_BRIDGE)
+    def test_chatter_no_longer_becomes_an_l1_rule(self, text):
+        assert self._extract(text) == [], text
+
+    @pytest.mark.parametrize("text", COMMITMENT_AT_BRIDGE + CORROBORATED_AT_BRIDGE)
+    def test_real_commitments_still_become_candidates(self, text):
+        got = self._extract(text)
+        assert len(got) == 1, text
+        assert got[0]["target"] == "memory"
+
+    @pytest.mark.parametrize(
+        "text", CHATTER_AT_BRIDGE + COMMITMENT_AT_BRIDGE + CORROBORATED_AT_BRIDGE)
+    def test_entry_verdict_equals_the_shared_ruler_verbatim(self, text):
+        """不是「差不多」：入口布尔值必须逐条等于 ``dialogue_fact_admits``。"""
+        assert bool(self._extract(text)) == dialogue_fact_admits(text, "user"), text
+
+    def test_an_ip_port_fact_is_structured_but_names_no_pool(self):
+        """如实钉住当前边界（已知缺口，**不放宽门槛**）。
+
+        ``示例主路由 192.0.2.1 的 SSH 端口是 8022`` 结构证据齐全（IP + 数字 +
+        拉丁，struct>=1），却因强信号池为 0 而够不着佐证分支要求的
+        ``score >= _USER_SIGNAL_WEIGHT``，本入口因此仍拒收它。这是「IP:port 这类
+        命名事实不在强词表里」的缺口，不是本闸门的放行错误；补它需要另一套独立
+        工作（见任务报告）。此处只把现状钉住：将来口径若修正，这条会红，提醒复核。
+        """
+        text = "示例主路由 192.0.2.1 的 SSH 端口是 8022"
+        assert external_structural_evidence(text) >= 1           # 结构：有
+        assert _fact_signal_score(text, "", strong_only=True) == 0  # 强信号池：无
+        assert not dialogue_fact_admits(text, "user")            # 结论：拒收
+        assert self._extract(text) == []
+
+
+# ---------------------------------------------------------------------------
+# 6) 族守卫：``plugin/`` 下除尺子模块外不得再出现「私有尺子」
+# ---------------------------------------------------------------------------
+
+_PLUGIN_DIR = Path(__file__).resolve().parent.parent / "plugin"
+
+
+def _strong_only_calls(path: Path):
+    """返回行号列表：``path`` 里手写的 ``_fact_signal_score(..., strong_only=True)``。
+
+    用 AST 而非子串匹配，避免把 docstring / 注释里的示例误判成真实调用。
+    """
+    tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+    hits = []
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call):
+            continue
+        func = node.func
+        name = (func.attr if isinstance(func, ast.Attribute)
+                else getattr(func, "id", None))
+        if name != "_fact_signal_score":
+            continue
+        for kw in node.keywords:
+            if (kw.arg == "strong_only"
+                    and isinstance(kw.value, ast.Constant)
+                    and kw.value.value is True):
+                hits.append(node.lineno)
+    return hits
+
+
+class TestNoPrivateRuler:
+    def test_only_the_ruler_module_may_call_strong_only(self):
+        """``_sync.py`` 是唯一允许比较强信号分数的地方。
+
+        三个消费者（写入 ``_extract_atomic_facts`` / 回放 ``l2_apply_gate.py`` /
+        Bridge 候选 ``_extract_session_candidates``）必须共享
+        ``dialogue_fact_admits``。任何模块自己写
+        ``_fact_signal_score(..., strong_only=True)`` 比较式，都会长出第二把尺子
+        —— 本轮的 Bridge 漏点正是这样来的，这条守卫让它变成测试失败而非静默污染。
+        """
+        offenders = {}
+        for py in sorted(_PLUGIN_DIR.rglob("*.py")):
+            if py.name == "_sync.py":
+                continue
+            hits = _strong_only_calls(py)
+            if hits:
+                offenders[str(py.relative_to(_PLUGIN_DIR.parent))] = hits
+        assert offenders == {}, (
+            "发现 _sync.py 之外的私有强信号准入尺子，请改用 "
+            f"dialogue_fact_admits()：{offenders}"
+        )

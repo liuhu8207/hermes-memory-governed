@@ -1044,13 +1044,22 @@ def _fact_signal_score(sentence: str, role: str = "",
 
 
 def dialogue_fact_admits(text: str, role: str = "") -> bool:
-    """The dialogue-path admission gate — ONE definition, two consumers.
+    """The dialogue-path admission gate — ONE definition, THREE consumers.
 
-    Consumers: :meth:`WriteQueue._extract_atomic_facts` (the write path) and
-    ``scripts/l2_apply_gate.py`` (the replay). Writes and replays must use the
-    same ruler, so the rule lives here instead of in either caller. The caller
-    still owns the shape checks (:meth:`WriteQueue._looks_like_fact`); this only
-    scores and thresholds.
+    Consumers:
+      * :meth:`WriteQueue._extract_atomic_facts` — the write path (into L2);
+      * ``scripts/l2_apply_gate.py`` — the replay of already-written rows;
+      * :meth:`GovernedMemoryProvider._extract_session_candidates` — the Bridge
+        candidate collector (its output is promoted into **L1**).
+
+    Writes, replays and the Bridge *must* use the same ruler, so the rule lives
+    here instead of in any caller. The Bridge site was the last hold-out: it
+    hand-rolled ``_fact_signal_score(..., strong_only=True) <= _MIN_SIGNAL_USER``
+    (2026-09-17), which — unlike this gate — kept the role prior AND never
+    resolved interrogative frames, so every ``能不能…`` question was admitted as a
+    standing rule. The caller still owns the shape checks
+    (:meth:`WriteQueue._looks_like_fact` / ``_passes_structural_filter``); this
+    only scores and thresholds.
 
     Rule (2026-09-17): a self-sufficient modal commitment (我需要 / 必须 / 不能)
     may be admitted alone — it is a rule in its own right. Otherwise the

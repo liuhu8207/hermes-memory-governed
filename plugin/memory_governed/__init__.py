@@ -30,9 +30,8 @@ from ._recall import RecallEngine
 from ._sync import (
     WriteQueue,
     L3Writer,
-    _MIN_SIGNAL_USER,
     _content_to_text,
-    _fact_signal_score,
+    dialogue_fact_admits,
     is_ephemeral_content,
 )
 from ._compress import MermaidCompressor
@@ -1113,15 +1112,19 @@ class GovernedMemoryProvider:
     def _extract_session_candidates(self, messages: List[Dict[str, Any]]) -> List[dict]:
         """Extract Bridge candidates from a session's messages.
 
-        三道关（2026-09-16 统一到与 L2 同一把尺子）：
+        三道关（2026-09-16 与 L2 统一；2026-09-17 第三关并入共享尺子）：
 
         1. ``screen_bridge_content`` —— 整条硬拒（时效性待办 / 模板骨架 /
            多模态占位符 / 凭据 / 纯路径）。时效性尤其关键：候选会被 promote
            进 L1 成为**永久规则**，一条「考试前一天记得提醒我」会永远生效。
-        2. ``_looks_like_durable_fact`` —— 原有启发式（偏好关键词 + 长度 +
-           非问句 + 非列表）。
-        3. 强信号门槛 —— 与 ``WriteQueue._extract_atomic_facts`` 同一把尺子，
-           拦掉「都配吧，免得以后每次都弹窗」这类一次性确认。
+        2. ``_passes_structural_filter`` —— 结构性排除（太短 / 问句 / 列表 /
+           空白）。
+        3. ``dialogue_fact_admits`` —— **与写入路径、回放脚本完全相同的那把
+           尺子**（``_sync.dialogue_fact_admits``）。这里曾经内联
+           ``_fact_signal_score(content, "user", strong_only=True)``，既不传
+           ``include_role=False``、也不消解疑问句式，于是「能不能…」因为字面
+           含「不能」被整类放行 —— 而本入口的产物会 promote 进 L1，代价比 L2
+           还重。改为调用共享定义后，三个站点共用一条规则。
 
         另外用 ``_content_to_text`` 归一化 content：多模态消息的 content 是
         list，直接做字符串运算会崩（这正是 9-15 那次 P0 的成因）。
@@ -1140,8 +1143,10 @@ class GovernedMemoryProvider:
                 continue
             if not self._passes_structural_filter(content):
                 continue
-            # 强信号门槛：只算用户约束 / 技术结论 / 代码标识符
-            if _fact_signal_score(content, "user", strong_only=True) <= _MIN_SIGNAL_USER:
+            # 统一尺子（与写入 _sync._extract_atomic_facts / 回放 l2_apply_gate
+            # 共用同一个 dialogue_fact_admits）：去掉角色先验、消解「能不能…」
+            # 疑问句式、并要求单条信号必须带佐证 —— 一条证据不构成证据。
+            if not dialogue_fact_admits(content, "user"):
                 logger.debug("Session candidate below signal floor: %s", content[:60])
                 continue
 
@@ -1182,6 +1187,17 @@ class GovernedMemoryProvider:
     @staticmethod
     def _looks_like_durable_fact(content: str) -> bool:
         """Heuristic: does this look like a durable preference or decision?
+
+        DEAD CODE as of 2026-09-17 — no production caller. The Bridge path
+        (:meth:`_extract_session_candidates`) stopped consulting it on 2026-09-16
+        when it moved to the single strong-signal ruler, and grepping ``plugin/``
+        finds only this definition and docstring mentions. It is kept (not
+        deleted) solely because two regression suites still pin its historical
+        behaviour — ``tests/test_memory_governed.py::TestBuild`` and
+        ``tests/test_qa_concurrency.py::TestDurableFactHeuristic``. Do NOT wire
+        it back into any admission path: it carries an independent, narrower word
+        list and is exactly the kind of second ruler this module is consolidating
+        away (see ``_sync.dialogue_fact_admits``).
 
         Requires a preference/decision keyword AND that the content
         is a statement (not a question, shopping list, or short request).

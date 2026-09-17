@@ -4,7 +4,8 @@
 
 为什么需要它
 ------------
-质量门（``_sync._looks_like_fact`` + ``_fact_signal_score(strong_only=True)``）
+质量门（``WriteQueue._looks_like_fact`` + ``_sync.dialogue_fact_admits``，
+后者与写入路径 ``_extract_atomic_facts`` 逐字同源）
 只作用于**新写入**。规则收紧之后，历史存量仍是按旧标准进来的，必须回头清一遍，
 否则它们会继续参与向量召回、抬高无关查询的地板分。
 
