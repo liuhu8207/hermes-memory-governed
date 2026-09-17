@@ -74,16 +74,26 @@ L1 规则之外，还有三层**没有**自动注入，需要时再取，避免�
 
 | 层 | 内容 | 怎么取 |
 |---|---|---|
-| L2 | 向量事实层（结构化事实，带 agent 署名） | `recall "<查询>"` |
-| L3 | 对话归档（历史会话原文） | `recall "<查询>"` 一并返回 |
-| KB | Obsidian 知识库笔记 | `kb-search "<查询>"` |
+| L2 | 向量事实层（结构化事实，带 agent 署名） | `hgm_recall` |
+| L3 | 对话归档（历史会话原文） | `hgm_recall` 一并返回 |
+| KB | Obsidian 知识库笔记 | `hgm_kb_search` |
 
-写入通道（都会过质量门，被拒时 JSON 里带 `reason`，退出码 1）：
+**优先用 MCP 工具**——`hgm_recall` / `hgm_remember` / `hgm_kb_search` /
+`hgm_kb_add` / `hgm_agents`。它们是常驻进程，一次召回约 **0.3s**；
+而下面的 CLI 每次要 **2.8s**（要重新起解释器并加载索引）。
+
+> 工具不在你的工具列表里，才改用 CLI。以前这里只写了 CLI 命令，结果
+> agent 明明有工具却全部走 CLI——**指引写什么，它就用什么**。
+
+写入（都会过质量门，被拒时会说明原因）：
 
 ```
-python "{cli}" recall "<查询>"
-python "{cli}" remember "<具体事实>"      # 写 L2，需过门禁
-python "{cli}" kb-add "<标题>" "<正文>"    # 写 KB 笔记
+hgm_remember "<具体事实>"          # 写 L2；不传 project 时按工作目录归属
+hgm_kb_add "<标题>" "<正文>"        # 写 KB 笔记
+
+# 仅当没有 MCP 工具时：
+python "{cli}" remember "<具体事实>"
+python "{cli}" kb-add "<标题>" "<正文>"
 ```
 
 **边界**：L1 是只读的——它每轮作为规则注入，开放写入等于让 agent 改自己的行为准则。
@@ -108,10 +118,12 @@ PROJECT_HINT = """
 别的 agent 看不见。项目里发生的事，写进来才算共享：
 
 ```
-python "{cli}" recall "<查询>" --project {project}   # 本项目 + 全局事实，屏蔽其他项目
-python "{cli}" remember "<具体事实>"                  # 不传 --project 时自动归属本项目
-python "{cli}" remember "<通用事实>" --project ""     # 显式标为全局（主机、拓扑、凭据位置等）
+hgm_recall "<查询>" project="{project}"   # 本项目 + 全局事实，屏蔽其他项目
+hgm_remember "<具体事实>"                  # 不传 project 时自动归属本项目
+hgm_remember "<通用事实>" project=""       # 显式标为全局（主机、拓扑、凭据位置等）
 ```
+
+没有 MCP 工具时，等价命令是 `python "{cli}" recall|remember ...`。
 
 判断标准很简单：**换一台机器、换一个项目还成立**的，就是全局事实；
 **只有这个代码库才成立**的，就归属本项目。标错了不会丢数据，
@@ -131,7 +143,7 @@ python "{cli}" remember "<通用事实>" --project ""     # 显式标为全局�
 WHEN_TO_LOOK = """
 ### 什么时候该先查再答
 
-命中任一条，先 `recall` 再回答，别凭印象：
+命中任一条，先 `hgm_recall` 再回答，别凭印象：
 
 | 触发情形 | 例子 |
 |---|---|

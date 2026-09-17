@@ -150,9 +150,34 @@ class TestBuildContext:
 
     def test_the_block_still_tells_the_agent_about_the_store(self):
         ctx = hook.build_context(L1, WIN_REPO)
-        assert "kb-search" in ctx          # KB is reachable and named
+        assert "hgm_recall" in ctx         # the tool surface is named…
+        assert "hgm_kb_search" in ctx      # …including the knowledge base
         assert "L1 是只读" in ctx          # and the boundary is stated
         assert "互不感知" in ctx           # WorkBuddy's own memory is separate
+
+    def test_it_names_the_tools_before_the_cli(self):
+        """The instruction is what the agent follows — measured, not assumed.
+
+        The first version of this block told the agent to run
+        ``python memory_cli.py recall`` and never mentioned the MCP tools. A turn
+        later the host had listed the tools 13 times and called them **zero**
+        times: the agent did exactly what it was told. So the tools must be the
+        first thing named, and the CLI must be framed as the fallback.
+
+        Compared *inside the instruction block*, not across the whole payload:
+        L1's own text happens to mention ``memory_cli.py`` in a stored rule, and
+        a whole-payload comparison would have been measuring that instead. The
+        first version of this test passed for exactly that wrong reason.
+        """
+        section = hook.build_context(L1, "").split("### 这个存储里还有什么", 1)[1]
+        assert "hgm_recall" in section and "memory_cli.py" in section
+        assert section.index("hgm_recall") < section.index("memory_cli.py"), (
+            "CLI 出现在 MCP 工具之前 —— agent 会照着先出现的那个做")
+        assert "没有 MCP 工具时" in section, "CLI 没有被写成后备路径"
+
+    def test_the_project_block_also_leads_with_the_tools(self):
+        hint = hook.build_context(L1, WIN_REPO).split("### 当前项目", 1)[1]
+        assert hint.index("hgm_recall") < hint.index("memory_cli.py")
 
 
 # -- the contract the host relies on ---------------------------------------
