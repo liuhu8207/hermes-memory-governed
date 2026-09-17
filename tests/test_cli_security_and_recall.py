@@ -437,6 +437,41 @@ class TestRefusalSchemaIsUniform:
         assert payload["error"] == "refused: " + payload["reason"]
 
 
+class TestKbGetMissIsNotSilent:
+    """A missing note used to come back as a payload with no ``ok`` at all.
+
+    An agent keying on the presence of a payload read "note not found" as a
+    delivered note and carried on — the quiet-empty failure this project keeps
+    running into. It is still *not* a refusal: no ``refused: `` prefix and not
+    built by ``_refusal``, so a caller can still tell "nothing was refused" from
+    "nothing was found".
+    """
+
+    def test_a_miss_carries_ok_false_and_the_error_text(self, store):
+        out = cli.cmd_kb_get(store.cfg, "no-such-note")
+        assert out["ok"] is False
+        assert out["error"] == "note not found: no-such-note"
+        assert not out["error"].startswith("refused:")
+
+    def test_a_hit_carries_ok_true(self, store):
+        # `ok: false` is only meaningful if the hit says `ok: true` — otherwise
+        # a caller testing truthiness inverts the meaning.
+        cli.cmd_kb_add(store.cfg, "运维笔记", "示例主路由 8022", "notes",
+                       [], [], None, agent="dsh")
+        out = cli.cmd_kb_get(store.cfg, "运维笔记")
+        assert out["ok"] is True
+        assert "ROS" in out["body"]
+
+    def test_a_miss_exits_1_and_stays_json(self, store, monkeypatch, capsys):
+        monkeypatch.setattr(sys, "argv",
+                            ["memory_cli.py", "kb-get", "no-such-note"])
+        rc = cli.main()
+        payload = json.loads(capsys.readouterr().out)  # raises on a traceback
+        assert rc == 1
+        assert payload["ok"] is False
+        assert not payload["error"].startswith("refused:")
+
+
 # -- P2: a dot-directory is not writable ------------------------------------
 class TestDotDirectoryIsNotWritable:
     """``kb-add --section .git`` was accepted and wrote into ``.git``, but
@@ -552,17 +587,53 @@ class TestL2ScoreShape:
                 < cli.DEFAULT_L2_LEXICAL_FLOOR)
 
 
+def _lexical_hits(query, top_k=10, project=""):
+    """The one L2 entry point, asked for the keyword channel.
+
+    ``search_l2`` used to wrap this and was deleted: a second entry point whose
+    docstring promised "no embedding model" is exactly the wrapper someone uses
+    by mistake, and by then it is load-bearing. Tests that mean "lexical" now
+    say so at the call site.
+    """
+    return cli.recall_l2(query, top_k, [], project=project,
+                         lexical_only=True)["hits"]
+
+
+class TestL2HasOneEntryPoint:
+    """``search_l2`` was a second public entry point with no callers left.
+
+    It survived on its docstring alone — "keyword-scan L2 without an embedding
+    model" — which is exactly how a wrapper becomes load-bearing by accident:
+    someone reads the name, assumes it is the simple one, and quietly gets the
+    pre-semantic-channel answer. Deleted; ``recall_l2`` is the only way in, and
+    "which channel" is an argument, not a choice of function.
+    """
+
+    def test_the_second_entry_point_is_gone(self):
+        assert not hasattr(cli, "search_l2")
+
+    def test_recall_l2_is_the_entry_point(self):
+        assert callable(getattr(cli, "recall_l2", None))
+
+    def test_the_channel_is_chosen_by_argument_not_by_function(self):
+        # The point of deleting the wrapper: one function, explicit channel.
+        import inspect
+
+        sig = inspect.signature(cli.recall_l2)
+        assert "lexical_only" in sig.parameters
+
+
 class TestCliL2Ranking:
     def test_hits_are_ordered_by_relevance_not_write_order(self, store):
         # Write order is the worst possible ranking: it hands back whichever
         # facts happened to be stored first.
         _seed(store.home, [_PARTIAL, _OFF_TOPIC, _ON_TOPIC])
-        hits = cli.search_l2("SecretStore ROCKET_TLS", 10, [])
+        hits = _lexical_hits("SecretStore ROCKET_TLS")
         assert [h["content"] for h in hits] == [_ON_TOPIC, _PARTIAL]
 
     def test_score_is_evidence_not_a_constant(self, store):
         _seed(store.home, [_PARTIAL, _OFF_TOPIC, _ON_TOPIC])
-        hits = cli.search_l2("SecretStore ROCKET_TLS", 10, [])
+        hits = _lexical_hits("SecretStore ROCKET_TLS")
         scores = [h["score"] for h in hits]
         assert scores == [1.0, 0.5]
         # The bug, pinned: every hit used to carry 0.9 regardless of overlap.
@@ -574,14 +645,14 @@ class TestCliL2Ranking:
         # filtered_out 3. The question shares exactly one entity with the fact,
         # which is what a lexical channel has to work with.
         _seed(store.home, [_ON_TOPIC, _PARTIAL, _OFF_TOPIC])
-        hits = cli.search_l2("SecretStore 跑在哪台机器上", 10, [])
+        hits = _lexical_hits("SecretStore 跑在哪台机器上")
         assert hits, "the QA reproduction still returns nothing through the CLI"
         assert _ON_TOPIC in [h["content"] for h in hits]
 
     def test_irrelevant_query_is_filtered_by_the_default_floor(self, store):
         _seed(store.home, ["只有 alpha 这一个词是重合的"])
-        assert cli.search_l2(_OFF_TOPIC_QUERY, 10, []) == []
-        assert cli.search_l2("alpha beta gamma delta", 10, []) == []
+        assert _lexical_hits(_OFF_TOPIC_QUERY) == []
+        assert _lexical_hits("alpha beta gamma delta") == []
         # ... and reported as filtered rather than as an empty vault: this count
         # is what made the regression visible in the first place.
         ranking = cli.recall_l2("alpha beta gamma delta", 10, [],
@@ -590,7 +661,7 @@ class TestCliL2Ranking:
 
     def test_relevant_query_survives_the_default_floor(self, store):
         _seed(store.home, [_ON_TOPIC, _PARTIAL])
-        hits = cli.search_l2("SecretStore ROCKET_TLS", 10, [])
+        hits = _lexical_hits("SecretStore ROCKET_TLS")
         assert [h["content"] for h in hits] == [_ON_TOPIC, _PARTIAL]
 
     def test_the_cosine_floor_is_not_applied_to_this_channel(self, store):
@@ -786,6 +857,58 @@ class TestL2SemanticChannel:
         assert parser.parse_args(["recall", "openssl"]).lexical_only is False
 
 
+# -- P2: threshold drift must be visible, not corrected ---------------------
+class TestL2ThresholdDriftIsVisible:
+    """The CLI's semantic floor and the plugin's cosine floor cut the same
+    quantity (bge-m3 cosine, 1 - d/2).
+
+    They are separate keys on purpose, so nothing here aligns them — but a gap
+    wide enough to change answers has to be *readable*, because nothing fails
+    when it happens: the same query simply returns different hits depending on
+    which entry point asked.
+    """
+
+    @staticmethod
+    def _write(store, recall):
+        (store.home / "governed_memory.json").write_text(
+            json.dumps({"wiki_dir": str(store.vault), "recall": recall}),
+            encoding="utf-8")
+
+    def test_no_warning_when_both_sides_are_unset(self, store):
+        # An unset value is an absence, not a disagreement.
+        self._write(store, {})
+        assert "l2_threshold_drift" not in cli.cmd_health(store.cfg)
+
+    def test_no_warning_when_only_one_side_is_tuned(self, store):
+        self._write(store, {"l2_semantic_min_score": 0.9})
+        assert "l2_threshold_drift" not in cli.cmd_health(store.cfg)
+
+    def test_a_gap_wider_than_the_tolerance_names_both_sides(self, store):
+        self._write(store, {"l2_semantic_min_score": 0.9, "l2_min_score": 0.5})
+        drift = cli.cmd_health(store.cfg)["l2_threshold_drift"]
+        assert drift["cli_l2_semantic_min_score"]["value"] == 0.9
+        assert drift["plugin_l2_min_score"]["value"] == 0.5
+        assert drift["delta"] == pytest.approx(0.4)
+        assert "0.400" in drift["warning"]
+        # Sources are named: "who said 0.9" is half the diagnosis.
+        assert drift["cli_l2_semantic_min_score"]["source"]
+        assert drift["plugin_l2_min_score"]["source"]
+
+    def test_a_gap_inside_the_tolerance_is_quiet(self, store):
+        # 0.78 vs 0.76 — the shipped values, which is why the tolerance exists.
+        self._write(store, {"l2_semantic_min_score": 0.78, "l2_min_score": 0.76})
+        assert "l2_threshold_drift" not in cli.cmd_health(store.cfg)
+
+    def test_the_warning_does_not_change_either_threshold(self, store):
+        # Reported, never corrected: aligning them silently would hide which one
+        # an operator meant to change.
+        self._write(store, {"l2_semantic_min_score": 0.9, "l2_min_score": 0.5})
+        cli.cmd_health(store.cfg)
+        floor, source = cli._resolve_l2_semantic_floor(None)
+        assert floor == 0.9
+        assert source == "config-file"
+
+
 # -- P2: the CLI can bootstrap a brand new store ----------------------------
 class TestColdStart:
     """A fresh HERMES_HOME could not be written to at all.
@@ -831,6 +954,34 @@ class TestColdStart:
         assert first["ok"] is True, first
         assert second["ok"] is True, second
         assert "cold_start" not in second
+
+    def test_the_created_width_is_named_because_it_cannot_be_changed(self,
+                                                                    store,
+                                                                    monkeypatch):
+        # The vector column's dimension is fixed by the first write. A fresh
+        # home with no config cold-starts on the local 512-d model; configuring
+        # a 1024-d API backend months later does not widen it, it turns every
+        # subsequent write into a dimension mismatch whose cause is a config
+        # file nobody remembers changing. The number is already in the response
+        # as `vector_dim` — what was missing is that it is now permanent.
+        _install_fake_embedding(monkeypatch)
+        first = cli.cmd_remember(
+            {}, "家用NAS 192.0.2.62 上重度使用 Docker 部署服务", "dsh")
+        assert first.get("cold_start") is True
+        note = first.get("vector_dim_note", "")
+        assert note, "a cold start must name the width it just froze"
+        assert str(first["vector_dim"]) in note
+        assert first["embedding_backend"] in note
+
+    def test_a_warm_write_does_not_repeat_the_note(self, store, monkeypatch):
+        # Only the write that chose the width says so. On every later call the
+        # width is no longer a decision, and repeating it would be noise.
+        _install_fake_embedding(monkeypatch)
+        cli.cmd_remember(
+            {}, "家用NAS 192.0.2.62 上重度使用 Docker 部署服务", "dsh")
+        second = cli.cmd_remember(
+            {}, "SecretStore 使用 ROCKET_TLS 而不是 SSL_CERT_FILE", "dsh")
+        assert "vector_dim_note" not in second
 
     def test_a_read_does_not_conjure_a_table(self, store):
         # open_l2_table stays read-only unless the caller passes a dimension:

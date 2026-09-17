@@ -180,7 +180,7 @@ def bootstrap_interpreter() -> None:
 
     Why this exists (measured 2026-09-16): the DSH plugin shells out with
     ``PYTHON = 'python'``, and on this machine the bare ``python`` on PATH is a
-    bare runtime with no LanceDB. ``search_l2`` swallowed the ImportError and
+    bare runtime with no LanceDB. ``recall_l2`` swallowed the ImportError and
     returned ``[]``, so DSH silently saw an empty fact layer forever — the
     failure was invisible from both ends. Rather than force every agent to know
     which interpreter to use, the CLI relocates itself.
@@ -912,19 +912,6 @@ def _l2_semantic_hits(query: str, top_k: int, project: str = "",
                             f"({type(e).__name__}: {e})")
 
 
-def search_l2(query: str, top_k: int, errors: list = None,
-              project: str = "", l2_floor: float = None) -> list:
-    """Keyword-scan L2 without an embedding model. See :func:`recall_l2`.
-
-    Lexical **by construction**. "Without an embedding model" is the contract of
-    this wrapper, so it passes ``lexical_only=True`` rather than relying on the
-    backend happening to be unavailable — which also keeps every lexical test
-    deterministic and offline instead of silently depending on a network call.
-    """
-    return recall_l2(query, top_k, errors, project, l2_floor,
-                     lexical_only=True)["hits"]
-
-
 def recall_l2(query: str, top_k: int, errors: list = None,
               project: str = "", l2_floor: float = None,
               lexical_only: bool = False) -> dict:
@@ -1258,6 +1245,20 @@ def cmd_remember(config: dict, text: str, agent: str,
         # Said rather than implied: creating the store is an event, and a caller
         # that bootstrapped a home by accident deserves to see that it did.
         base["cold_start"] = True
+        # And so is the width it was created at, which is the part that costs
+        # later. The vector column's dimension is fixed by this write and
+        # cannot be widened in place: a home that cold-starts on the 512-d
+        # local model and is afterwards pointed at a 1024-d API backend starts
+        # failing every write with a dimension mismatch, whose cause is a
+        # config change and whose symptom is weeks later and somewhere else.
+        # One sentence, at the only moment the width was still a choice —
+        # nothing here refuses or rewrites anything.
+        base["vector_dim_note"] = (
+            f"L2 table created at {len(vector)} dims from backend "
+            f"'{embedding.backend_name}'. The width is fixed at creation: a "
+            f"later backend that embeds at a different width needs this table "
+            f"rebuilt, or writes fail with a dimension mismatch."
+        )
 
     if cleaned in _l2_existing_contents(table):
         base.update({"ok": True, "duplicate": True, "content": cleaned[:600]})
@@ -1275,7 +1276,7 @@ def cmd_remember(config: dict, text: str, agent: str,
         "agent": agent,
         # NULL rather than "" when global. LanceDB keeps the two distinct, and
         # "belongs to no project" is a real fact rather than a missing string —
-        # search_l2 relies on the difference to decide what a project-scoped
+        # recall_l2 relies on the difference to decide what a project-scoped
         # query is allowed to see.
         "project": resolved_project or None,
     }
@@ -1689,13 +1690,21 @@ def cmd_kb_search(config: dict, query: str, top_k: int, section: str,
 
 
 def cmd_kb_get(config: dict, title: str):
+    """Read one note by title.
+
+    A miss answers with ``ok: false``. It is **not** built by :func:`_refusal`
+    and carries no ``refused: `` prefix, because nothing was refused — but the
+    caller is an agent, and an answer without ``ok`` was being read as a
+    delivered note: "note not found" and "here is your note" looked the same to
+    anything keying on the presence of the payload.
+    """
     target = slugify(title).lower()
     for p in iter_notes(config):
         meta, body = parse_frontmatter(p.read_text(encoding="utf-8", errors="replace"))
         if (meta.get("title") or p.stem).lower() == target or p.stem.lower() == target:
-            return {"title": meta.get("title") or p.stem, "path": str(p),
-                    "meta": meta, "body": body}
-    return None
+            return {"ok": True, "title": meta.get("title") or p.stem,
+                    "path": str(p), "meta": meta, "body": body}
+    return {"ok": False, "error": f"note not found: {title}"}
 
 
 def cmd_kb_add(config: dict, title: str, body: str, section: str,
@@ -1815,13 +1824,80 @@ def cmd_kb_add(config: dict, title: str, body: str, section: str,
 
 
 # -- health ----------------------------------------------------------------
+#: How far the CLI's semantic floor may sit from the plugin's cosine floor
+#: before ``health`` says so.
+#:
+#: They measure the *same* quantity (bge-m3 cosine, mapped 1 - d/2), so a gap
+#: wider than this means the two entry points are cutting a different amount —
+#: "two entry points, two answers" in its quietest form, where nothing fails and
+#: the same question just gets different hits depending on who asked.
+_L2_THRESHOLD_DRIFT_TOLERANCE = 0.05
+
+
+def _l2_threshold_drift() -> dict:
+    """Describe a gap between the CLI's semantic floor and the plugin's.
+
+    Returns ``{}`` when there is nothing to report — including when either side
+    is simply at its default, because an unset value is not a disagreement, it
+    is an absence.
+
+    Deliberately does not correct or fall back. The two are separate keys on
+    purpose: silently aligning them would hide which one an operator meant to
+    change, and that is the same loss of signal as never comparing them. This
+    only makes the gap readable to whoever reads ``health``.
+    """
+    try:
+        semantic_floor, semantic_source = _resolve_l2_semantic_floor(None)
+    except Exception:  # noqa: BLE001 — health must not fail on a dirty config
+        return {}
+
+    plugin_value, plugin_source = None, ""
+    try:
+        raw = float(getattr(plugin_config().recall, "l2_min_score", 0.0) or 0.0)
+        if raw > 0.0:
+            plugin_value, plugin_source = raw, "recall.l2_min_score"
+    except (TypeError, ValueError):
+        plugin_value = None
+    except Exception:  # noqa: BLE001
+        plugin_value = None
+    if plugin_value is None:
+        try:
+            raw = float((load_config().get("recall") or {}).get("l2_min_score") or 0.0)
+            if raw > 0.0:
+                plugin_value, plugin_source = raw, "recall.l2_min_score (file)"
+        except Exception:  # noqa: BLE001
+            return {}
+
+    # An unset CLI floor is not a disagreement with the plugin — it just means
+    # nobody tuned this side, and warning about it would be noise.
+    if plugin_value is None or semantic_source == "default":
+        return {}
+    delta = abs(float(semantic_floor) - plugin_value)
+    if delta <= _L2_THRESHOLD_DRIFT_TOLERANCE:
+        return {}
+    return {
+        "warning": (f"the CLI's semantic floor and the plugin's cosine floor "
+                    f"differ by {delta:.3f} (tolerance "
+                    f"{_L2_THRESHOLD_DRIFT_TOLERANCE}). Both cut bge-m3 cosine "
+                    f"similarity, so the same query is being thresholded "
+                    f"differently depending on the entry point. Not corrected: "
+                    f"they are separate keys on purpose — change the one you "
+                    f"meant."),
+        "cli_l2_semantic_min_score": {"value": float(semantic_floor),
+                                      "source": semantic_source},
+        "plugin_l2_min_score": {"value": plugin_value,
+                                "source": plugin_source},
+        "delta": round(delta, 4),
+    }
+
+
 def cmd_health(config: dict):
     h = hermes_home()
     l2 = Path(h) / "memory" / "l2"
     l3 = Path(h) / "memory" / "l3" / "l3.db"
     l1 = cmd_l1()
     count_notes = len(iter_notes(config))
-    return {
+    out = {
         "hermes_home": h,
         "l1_memory_md": bool(l1["memory_rules_md"]),
         "l1_user_md": bool(l1["user_profile_md"]),
@@ -1832,6 +1908,12 @@ def cmd_health(config: dict):
         "vault_note_count": count_notes,
         "ok": bool(l1["memory_rules_md"] or l1["user_profile_md"]),
     }
+    # Emitted only when there is something to say: a health line that is always
+    # present is a health line nobody reads.
+    drift = _l2_threshold_drift()
+    if drift:
+        out["l2_threshold_drift"] = drift
+    return out
 
 
 #: Commands whose answer depends on L2, and therefore on LanceDB being
@@ -1969,7 +2051,7 @@ def main():
         if refused:
             out["refused"] = refused
     elif args.cmd == "kb-get":
-        out = cmd_kb_get(config, args.title) or {"error": f"note not found: {args.title}"}
+        out = cmd_kb_get(config, args.title)
     elif args.cmd == "kb-add":
         out = cmd_kb_add(config, args.title, args.body, args.section,
                          args.tags, args.concepts, args.confidence,

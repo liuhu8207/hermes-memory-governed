@@ -863,7 +863,8 @@ class TestProjectScopedRecall:
 
     def test_scoped_query_keeps_own_project_and_globals(self, shared):
         self._seeded(shared)
-        hits = cli.search_l2("alpha", 10, [], project="p1")
+        hits = cli.recall_l2("alpha", 10, [], project="p1",
+                             lexical_only=True)["hits"]
         body = " | ".join(h["content"] for h in hits)
         assert "属于 p1" in body
         assert "全局事实" in body
@@ -871,14 +872,15 @@ class TestProjectScopedRecall:
 
     def test_scoped_query_hides_other_projects(self, shared):
         self._seeded(shared)
-        hits = cli.search_l2("alpha", 10, [], project="p2")
+        hits = cli.recall_l2("alpha", 10, [], project="p2",
+                             lexical_only=True)["hits"]
         body = " | ".join(h["content"] for h in hits)
         assert "属于 p2" in body
         assert "属于 p1" not in body
 
     def test_unscoped_query_sees_everything(self, shared):
         self._seeded(shared)
-        hits = cli.search_l2("alpha", 10, [])
+        hits = cli.recall_l2("alpha", 10, [], lexical_only=True)["hits"]
         body = " | ".join(h["content"] for h in hits)
         assert "属于 p1" in body and "属于 p2" in body
 
@@ -886,14 +888,15 @@ class TestProjectScopedRecall:
         # A project with no facts of its own must not be blinded to the
         # infrastructure knowledge that applies everywhere.
         self._seeded(shared)
-        hits = cli.search_l2("alpha", 10, [], project="never-heard-of-it")
+        hits = cli.recall_l2("alpha", 10, [], project="never-heard-of-it",
+                             lexical_only=True)["hits"]
         body = " | ".join(h["content"] for h in hits)
         assert "全局事实" in body
         assert "属于 p1" not in body and "属于 p2" not in body
 
     def test_hits_carry_their_project(self, shared):
         self._seeded(shared)
-        hits = cli.search_l2("alpha", 10, [])
+        hits = cli.recall_l2("alpha", 10, [], lexical_only=True)["hits"]
         by_content = {h["content"]: h for h in hits}
         assert by_content["alpha 事项属于 p1"]["project"] == "p1"
         # A global fact has no project key at all — absent, not empty.

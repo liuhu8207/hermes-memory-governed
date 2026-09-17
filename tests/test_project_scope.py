@@ -2,7 +2,7 @@
 """``project`` 维度对插件读路径生效的回归测试（P0，2026-09-17）。
 
 **缺陷**：``project`` 维度只装在 CLI 的一条读路径上（``memory_cli.py`` 的
-``search_l2`` / ``recall_l2``），而 Hermes 插件走 ``_recall.py`` —— 全文件里
+``recall_l2``），而 Hermes 插件走 ``_recall.py`` —— 全文件里
 ``project`` 出现 0 次。同一份存储、两个入口、两套答案：CLI 会按项目收窄，
 插件却把所有项目的事实一锅端注入上下文。
 
