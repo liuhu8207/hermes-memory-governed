@@ -36,6 +36,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import subprocess
 import sys
 from pathlib import Path
@@ -130,6 +131,51 @@ def read_payload() -> dict:
     except (ValueError, TypeError):
         return {}
     return data if isinstance(data, dict) else {}
+
+
+#: MSYS hands out ``/d/repos/x``, which a native ``python.exe`` cannot resolve.
+#: The host exports that form, so it must be normalised before use.
+_MSYS_DRIVE = re.compile(r"^/([A-Za-z])/(.*)$")
+
+
+def to_windows_path(raw: str) -> str:
+    """``/d/foo`` -> ``D:/foo``. Anything else is returned unchanged."""
+    m = _MSYS_DRIVE.match(str(raw or "").strip())
+    if m:
+        return f"{m.group(1).upper()}:/{m.group(2)}"
+    return str(raw or "").strip()
+
+
+def resolve_cwd(payload: dict) -> tuple:
+    """Find the session's working directory **and say where it came from**.
+
+    Measured 2026-09-17: the SessionStart payload does not reliably carry
+    ``cwd``. The IDE hook reference documents it, the CLI reference does not
+    (it lists ``permission_mode`` in its place), and a field report from an
+    instrumented desktop session lists only
+    ``session_id / source / transcript_path``.
+
+    Betting on a single field is the failure this store exists to eliminate:
+    when the bet loses, the project block below vanishes **silently**, and
+    that block is the only thing telling an agent that the facts it writes are
+    invisible to every other agent.
+
+    Order: the payload, then the variables the host documents, then the
+    process cwd (the hook reference states hooks run inside it). The source
+    travels with the value — a fallback that quietly named the wrong project
+    would be worse than no project block at all.
+    """
+    cwd = str(payload.get("cwd") or "").strip()
+    if cwd:
+        return cwd, "payload.cwd"
+    for var in ("CODEBUDDY_PROJECT_DIR", "CLAUDE_PROJECT_DIR"):
+        value = os.environ.get(var, "").strip()
+        if value:
+            return to_windows_path(value), var
+    try:
+        return os.getcwd(), "os.getcwd()"
+    except OSError:
+        return "", ""
 
 
 def resolve_project(cwd: str) -> str:
@@ -253,10 +299,10 @@ def build_context(l1: dict, cwd: str = "") -> str:
 def main() -> int:
     payload = read_payload()
     l1 = fetch_l1()
-    # WorkBuddy sends the working directory on every SessionStart. It is the
-    # only signal that says *which* project this session belongs to, so it
-    # drives both the project block and the write-attribution advice.
-    cwd = str(payload.get("cwd") or "")
+    # Which project this session belongs to drives both the project block and
+    # the write-attribution advice. The lookup is deliberately redundant —
+    # see :func:`resolve_cwd` for why one field is not enough.
+    cwd, cwd_source = resolve_cwd(payload)
     context = build_context(l1, cwd)
 
     out = {
@@ -273,6 +319,7 @@ def main() -> int:
         sys.stderr.write(
             f"[hgm-hook] 已注入 {len(context)} 字符 "
             f"(L1 {'读取成功' if l1 else '读取失败，降级为能力提示'}; "
+            f"cwd 来源={cwd_source or '未取到'}; "
             f"session={payload.get('session_id', '?')})\n"
         )
     print(json.dumps(out, ensure_ascii=False))
