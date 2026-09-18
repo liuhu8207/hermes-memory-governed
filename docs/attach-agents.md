@@ -60,6 +60,12 @@ tools are `hgm_recall`, `hgm_remember`, `hgm_kb_search`, `hgm_kb_add`,
 `hgm_agents`; `memory_cli.py` is their only implementation, so the gate and the
 provenance rules are identical to the CLI's.
 
+⚠️ **The MCP surface is narrower than the CLI.** `hgm_kb_add` takes only
+`title` / `body` / `section` — tags, concepts, confidence and the source line are
+neither exposed nor accepted, and are discarded if a client sends them. There is
+also no `kb-get` over MCP, so an agent on this surface can search the knowledge
+base but cannot read a full note back. Use the CLI for those.
+
 Declare the agent's identity in the server's environment — that is the second
 step of the identity chain below:
 
@@ -138,6 +144,34 @@ agent asked on 2026-09-18 whether to add `export HGM_AGENT=<itself>` to
 - A gate refusal is **structured JSON** (`{"ok": false, "error": "refused: …"}`),
   not a traceback — the caller is an agent, and a stack trace tells it nothing
   actionable. Do not retry a refusal unchanged; read the reason.
+
+## Bringing in a document — Word, Excel, PDF
+
+A document does **not** become searchable by being placed in the vault. Three
+stages, and the store only owns the first:
+
+    get the text   →   the agent summarises it   →   kb-add a .md note
+
+- **The vault index reads `*.md` only** — the walker's single entry point is
+  `vault.rglob("*.md")`. A `.docx` / `.xlsx` / `.pdf` sitting in the vault is
+  invisible to `kb-search`, and **nothing reports that**: it looks exactly like
+  a note that simply matched nothing.
+- **The store's own readers are optional and may be absent.** `memory_cli.py` has
+  no ingest subcommand and the MCP surface exposes no ingest tool. Hermes does
+  register `governed_kb_read_file` / `_fetch` / `_transcribe`, but its PDF and
+  DOCX paths need `pypdf` / `python-docx`, which are **not installed in the
+  Hermes venv on this machine**; `.xlsx` is not supported at all (nor `.doc` /
+  `.xls`). The failures are graceful —
+  `{"ok": false, "error": "reading PDF requires pypdf: pip install pypdf"}` —
+  but they are still failures. Check the returned `ok`, never the intent.
+- **So read it yourself, then store the distillation.** Extract → summarise →
+  `kb-add`. The note is the durable summary, not a transcript: keep identifiers,
+  paths, hostnames, versions, parameters and constraints. Put the source — URL,
+  file path, date — **in the body**; there is no `--source` flag, and over MCP
+  `hgm_kb_add` accepts only `title` / `body` / `section` and ignores the rest.
+
+Storing documents directly is **not implemented** — ingestion lives with the
+agent, not with the store. Do not assume otherwise without checking.
 
 ## Verify the attachment
 
