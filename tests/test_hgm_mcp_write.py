@@ -86,6 +86,11 @@ class Sandbox:
 
 @pytest.fixture(scope="module")
 def box(tmp_path_factory):
+    # Every test here performs a **real write into LanceDB**, so the whole file
+    # needs the vector backend. Without this guard the CI `core` leg (which
+    # installs no backend on purpose) reported them as failures rather than
+    # skips — the write itself fails, before any assertion runs.
+    pytest.importorskip("lancedb")
     root = tmp_path_factory.mktemp("hgm-mcp-write")
     s = Sandbox(root)
     try:
