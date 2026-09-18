@@ -165,6 +165,27 @@ TOOLS = [
         ),
     },
     {
+        "name": "hgm_transcribe",
+        "description": (
+            "Transcribe a local audio file (a meeting recording or voice memo) to "
+            "text. Long files are split automatically, so an hour-long recording "
+            "works, and formats ffmpeg can decode (.amr/.silk included) are "
+            "normalised first. Returns the raw transcript and stores nothing — "
+            "summarise it yourself and persist the distilled notes with "
+            "hgm_kb_add."),
+        "inputSchema": _schema(
+            {
+                "path": {"type": "string",
+                         "description": "Absolute path to the audio file."},
+                "chunk_minutes": {"type": "number",
+                                  "description": "Split audio longer than this many "
+                                                 "minutes (default: config "
+                                                 "asr.chunk_minutes)."},
+            },
+            ["path"],
+        ),
+    },
+    {
         "name": "hgm_agents",
         "description": ("Who has written what: fact and note counts per agent, including how "
                         "many entries carry no attribution. Use it to tell whether a fact "
@@ -277,6 +298,16 @@ def tool_kb_add(args: dict) -> str:
     return json.dumps(result, ensure_ascii=False, indent=2)
 
 
+def tool_transcribe(args: dict) -> str:
+    cli = _cli()
+    path = str(args.get("path") or "").strip()
+    if not path:
+        raise ValueError("path is required")
+    result = cli.cmd_transcribe(cli.load_config(), path, None,
+                                args.get("chunk_minutes"))
+    return json.dumps(result, ensure_ascii=False, indent=2)
+
+
 def tool_agents(_args: dict) -> str:
     return json.dumps(_cli().cmd_agents(_cli().load_config()),
                       ensure_ascii=False, indent=2)
@@ -287,6 +318,7 @@ HANDLERS = {
     "hgm_remember": tool_remember,
     "hgm_kb_search": tool_kb_search,
     "hgm_kb_add": tool_kb_add,
+    "hgm_transcribe": tool_transcribe,
     "hgm_agents": tool_agents,
 }
 

@@ -192,6 +192,13 @@ class AsrConfig:
     base_url: str = ""           # 如 https://api.siliconflow.cn/v1
     model: str = "XingChenAGI/XingChenASR-V3.2-Ultra"
     language: str = ""           # 空 = auto；显式 "zh" 可提升中文转写
+    #: 单次转写请求的超时上限（秒）。实测该 ASR 端点约 6.7~8.3 秒/音频分钟，
+    #: 旧的硬编码 180s 让约 25 分钟以上的录音必然超时；拆段（见
+    #: ``_ingest.split_audio``）后每段都远低于此值。
+    timeout_seconds: float = 600.0
+    #: 超过这个分钟数就自动拆段转写。0 或负数属于脏配置 —— 会退回默认值，
+    #: 绝不因此抛异常（见 ``_validate_positive_asr_fields``）。
+    chunk_minutes: float = 10.0
 
 
 @dataclass
@@ -280,6 +287,7 @@ def load_governed_config(hermes_home: str | Path) -> GovernedMemoryConfig:
             logger.warning("Failed to load config from %s: %s — using defaults", config_path, e)
 
     _validate_numeric_fields(config)
+    _validate_positive_fields(config)
 
     # Env var overrides (backward compat)
     _apply_env_overrides(config)
@@ -362,7 +370,38 @@ _NUMERIC_FIELDS = {
     "embedding": ["dimensions"],
     "kb": ["top_k", "min_score", "recall_min_score", "recall_min_kw_score",
            "recall_max_notes"],
+    "asr": ["timeout_seconds", "chunk_minutes"],
 }
+
+#: 必须为正的数值字段（超时 / 拆段阈值）。0 或负数不是「关闭功能」而是脏配置：
+#: 0 会让拆段永不触发（回到会超时的老路），或让单次请求没有上限。按本文件一贯
+#: 做法 —— 告警并回落默认值，绝不抛异常。
+_POSITIVE_FIELDS = {
+    "asr": ["timeout_seconds", "chunk_minutes"],
+}
+
+
+def _validate_positive_fields(config: GovernedMemoryConfig) -> None:
+    """Coerce non-positive numeric fields back to their defaults (never raises)."""
+    defaults = GovernedMemoryConfig()
+    for section_name, fields in _POSITIVE_FIELDS.items():
+        section = getattr(config, section_name, None)
+        if section is None:
+            continue
+        for field_name in fields:
+            value = getattr(section, field_name, None)
+            if value is None:
+                continue
+            if isinstance(value, bool) or not isinstance(value, (int, float)):
+                continue  # 类型问题交给 _validate_numeric_fields
+            if value > 0:
+                continue
+            default_value = getattr(getattr(defaults, section_name), field_name)
+            logger.warning(
+                "Config %s.%s must be > 0, got %r — reset to default %s",
+                section_name, field_name, value, default_value,
+            )
+            setattr(section, field_name, default_value)
 
 
 def _validate_numeric_fields(config: GovernedMemoryConfig) -> None:

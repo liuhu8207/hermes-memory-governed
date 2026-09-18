@@ -2123,6 +2123,25 @@ def cmd_health(config: dict):
     return out
 
 
+# -- audio transcription ----------------------------------------------------
+def cmd_transcribe(config: dict, path: str, timeout: "float | None" = None,
+                   chunk_minutes: "float | None" = None) -> dict:
+    """Transcribe a local audio file to text (long recordings split automatically).
+
+    Delegates to ``_ingest.transcribe_audio_auto`` through the plugin's own
+    dataclass config, so the CLI and the plugin resolve the same ASR settings.
+    ``timeout`` and ``chunk_minutes`` override ``config.asr`` only when given.
+    The result is returned unchanged — including a partial/failed envelope, so a
+    caller can still see the text that *was* obtained.
+    """
+    cfg = plugin_config()
+    if timeout is not None:
+        cfg.asr.timeout_seconds = timeout
+    if chunk_minutes is not None:
+        cfg.asr.chunk_minutes = chunk_minutes
+    return plugin_module("_ingest").transcribe_audio_auto(path, cfg)
+
+
 #: Commands whose answer depends on L2, and therefore on LanceDB being
 #: importable. Only these pay the cost of a possible interpreter re-exec; the
 #: read-only Markdown commands stay fast on a bare interpreter.
@@ -2171,6 +2190,17 @@ def build_parser() -> argparse.ArgumentParser:
     ka.add_argument("--confidence", type=float, default=None)
     ka.add_argument("--overwrite", action="store_true",
                     help="Take over a note currently owned by another agent")
+
+    tr = sub.add_parser("transcribe", parents=[common],
+                        help="Transcribe a local audio file to text "
+                             "(long recordings are split automatically)")
+    tr.add_argument("path")
+    tr.add_argument("--timeout", type=float, default=None,
+                    help="Per-request ASR timeout in seconds "
+                         "(default: config asr.timeout_seconds, else 600)")
+    tr.add_argument("--chunk-minutes", type=float, default=None,
+                    help="Split audio longer than this many minutes "
+                         "(default: config asr.chunk_minutes, else 10)")
 
     rm = sub.add_parser("remember", parents=[common],
                         help="Admit a durable fact into L2 (shared admission gate)")
@@ -2281,6 +2311,10 @@ def main():
         out = cmd_remember(config, args.fact, agent,
                            category=args.category, dry_run=args.dry_run,
                            project=args.project)
+    elif args.cmd == "transcribe":
+        out = cmd_transcribe(config, args.path,
+                             getattr(args, "timeout", None),
+                             getattr(args, "chunk_minutes", None))
     else:
         parser.print_help()
         return 2

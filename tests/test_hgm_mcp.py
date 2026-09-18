@@ -114,7 +114,7 @@ class TestToolSurface:
         tools = r["result"]["tools"]
         names = {t["name"] for t in tools}
         assert names == {"hgm_recall", "hgm_remember", "hgm_kb_search",
-                         "hgm_kb_add", "hgm_agents"}
+                         "hgm_kb_add", "hgm_transcribe", "hgm_agents"}
         for t in tools:
             assert t["description"].strip(), f"{t['name']} 没有描述，模型无法判断何时用"
             assert t["inputSchema"]["type"] == "object"
@@ -153,7 +153,7 @@ class TestErrorPaths:
 
     def test_the_server_keeps_serving_after_all_of_that(self, client):
         r = client.request("tools/list", msg_id=9)
-        assert len(r["result"]["tools"]) == 5
+        assert len(r["result"]["tools"]) == 6
 
 
 class TestRealCalls:
@@ -261,7 +261,7 @@ class TestObservability:
         text = (tmp_path / "memory" / "mcp_log.txt").read_text(encoding="utf-8")
         assert "first_frame" in text
         assert "initialize" in text and "client=obs/1" in text, text
-        assert "tools/list" in text and "count=5" in text, text
+        assert "tools/list" in text and "count=6" in text, text
 
     def test_the_first_frame_shape_is_recorded_without_its_content(self, tmp_path):
         """Framing is the one mismatch that shows up only as the host giving up."""

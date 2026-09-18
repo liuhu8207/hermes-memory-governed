@@ -214,9 +214,11 @@ KB_TRANSCRIBE_SCHEMA = {
     "name": "governed_kb_transcribe",
     "description": (
         "Transcribe an audio file to text via the configured ASR service "
-        "(e.g. SiliconFlow XingChenASR). Returns the transcript; you (the agent) "
-        "should then summarize it and persist via governed_kb_add. Use for "
-        "meeting recordings or voice memos."
+        "(e.g. SiliconFlow XingChenASR). Long recordings are split automatically "
+        "and transcribed chunk by chunk, so an hour-long meeting works; recordings "
+        "ffmpeg can decode (.amr/.silk included) are normalised to mp3 first. "
+        "Returns the transcript; you (the agent) should then summarize it and "
+        "persist via governed_kb_add. Use for meeting recordings or voice memos."
     ),
     "parameters": {
         "type": "object",
@@ -1068,7 +1070,7 @@ class GovernedMemoryProvider:
         if not path:
             return json.dumps({"error": "Missing path parameter"}, ensure_ascii=False)
         try:
-            result = _ingest.transcribe_audio(path, self._config)
+            result = _ingest.transcribe_audio_auto(path, self._config)
         except Exception as e:  # noqa: BLE001
             logger.warning("governed_kb_transcribe failed: %s", e)
             return json.dumps({"error": f"transcribe failed: {e}"}, ensure_ascii=False)
