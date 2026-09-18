@@ -320,6 +320,8 @@ def test_non_native_container_is_transcoded_even_when_short(tmp_path, monkeypatc
     assert transcode_calls == [str(amr)]
     # 转写用的是转出来的 mp3，不是原始 amr
     assert seen == [str(converted)]
+    # 但信封里的 path 必须指调用方传入的 amr —— 临时 mp3 返回前已被删除
+    assert r["path"] == str(amr)
 
 
 def test_non_native_container_without_ffmpeg_is_refused(tmp_path, monkeypatch):

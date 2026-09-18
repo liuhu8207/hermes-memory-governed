@@ -568,7 +568,13 @@ def transcribe_audio_auto(path: str, config: Any) -> Dict[str, Any]:
 
         # 时长未知或足够短：单次请求，原样返回（保持历史行为）
         if duration is None or duration <= threshold:
-            return transcribe_audio(work_path, config, timeout=timeout)
+            result = transcribe_audio(work_path, config, timeout=timeout)
+            # 归一化时转写的是临时 mp3，而那个临时目录马上就会在 finally 里被删。
+            # 把它的路径当作 path 返回，对一个要落库/回读的 agent 毫无意义 —— 信封里
+            # 的 path 永远指调用方传入的那个文件（长录音分支也是这么做的）。
+            if work_path != raw_path and isinstance(result, dict):
+                result["path"] = str(src)
+            return result
 
         # 长录音：必须有 ffmpeg 才能拆 —— 缺了就说清楚缺什么，而不是等到超时
         if _ffmpeg_tool("ffmpeg") is None:
