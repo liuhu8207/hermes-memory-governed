@@ -33,7 +33,7 @@ agent may use more than one.
 | Surface | How it reaches the store | Good for |
 |---|---|---|
 | **CLI** | `python memory_cli.py <cmd>` | Any agent that can run a command. The lowest common denominator. |
-| **MCP tools** | A stdio MCP server exposing five tools | Hosts with MCP support. **~10× faster per call** than the CLI (see below). |
+| **MCP tools** | A stdio MCP server exposing six tools | Hosts with MCP support. **~10× faster per call** than the CLI (see below). |
 | **Host hooks** | `SessionStart` / `UserPromptSubmit` / `PreToolUse` | Automating *when* memory is consulted and injected, so the agent does not have to remember to. |
 
 ### Why MCP is worth preferring
@@ -55,16 +55,19 @@ python memory_cli.py agents                 # who wrote what
 
 ### MCP tools
 
-Run the server as a stdio MCP server and register it with the host. The five
+Run the server as a stdio MCP server and register it with the host. The six
 tools are `hgm_recall`, `hgm_remember`, `hgm_kb_search`, `hgm_kb_add`,
-`hgm_agents`; `memory_cli.py` is their only implementation, so the gate and the
-provenance rules are identical to the CLI's.
+`hgm_agents` and `hgm_transcribe`; `memory_cli.py` is their only implementation,
+so the gate and the provenance rules are identical to the CLI's.
 
 ⚠️ **The MCP surface is narrower than the CLI.** `hgm_kb_add` takes only
 `title` / `body` / `section` — tags, concepts, confidence and the source line are
 neither exposed nor accepted, and are discarded if a client sends them. There is
 also no `kb-get` over MCP, so an agent on this surface can search the knowledge
 base but cannot read a full note back. Use the CLI for those.
+
+The one ingest path that **is** on this surface is audio: `hgm_transcribe` turns a
+recording into text — see *Bringing in a recording* below.
 
 Declare the agent's identity in the server's environment — that is the second
 step of the identity chain below:
@@ -156,12 +159,14 @@ stages, and the store only owns the first:
   `vault.rglob("*.md")`. A `.docx` / `.xlsx` / `.pdf` sitting in the vault is
   invisible to `kb-search`, and **nothing reports that**: it looks exactly like
   a note that simply matched nothing.
-- **The store's own readers are optional and may be absent.** `memory_cli.py` has
-  no ingest subcommand and the MCP surface exposes no ingest tool. Hermes does
-  register `governed_kb_read_file` / `_fetch` / `_transcribe`, but its PDF and
-  DOCX paths need `pypdf` / `python-docx`, which are **not installed in the
-  Hermes venv on this machine**; `.xlsx` is not supported at all (nor `.doc` /
-  `.xls`). The failures are graceful —
+- **The store's own readers are optional and may be absent.** For documents,
+  `memory_cli.py` has no ingest subcommand and the MCP surface exposes no ingest
+  tool — audio is the one exception, in the other direction (`transcribe` /
+  `hgm_transcribe`, see *Bringing in a recording* below). Hermes does register
+  `governed_kb_read_file` / `_fetch` / `_transcribe`, but its PDF and DOCX paths
+  need `pypdf` / `python-docx`, which are **not installed in the Hermes venv on
+  this machine**; `.xlsx` is not supported at all (nor `.doc` / `.xls`). The
+  failures are graceful —
   `{"ok": false, "error": "reading PDF requires pypdf: pip install pypdf"}` —
   but they are still failures. Check the returned `ok`, never the intent.
 - **So read it yourself, then store the distillation.** Extract → summarise →
@@ -172,6 +177,43 @@ stages, and the store only owns the first:
 
 Storing documents directly is **not implemented** — ingestion lives with the
 agent, not with the store. Do not assume otherwise without checking.
+
+## Bringing in a recording — audio and voice notes
+
+A recording does **not** become searchable by being placed in the vault either.
+Same shape as a document, and the same three stages — the store owns the first:
+
+    transcribe the audio   →   the agent summarises it   →   kb-add a .md note
+
+- **The vault index reads `*.md` only.** An `.mp3` / `.m4a` / `.wav` sitting in
+  the vault is invisible to `kb-search`, and **nothing reports that** — it looks
+  exactly like a note that simply matched nothing.
+- **Both surfaces have this path.** Over MCP it is `hgm_transcribe`; from the CLI
+  it is `memory_cli.py transcribe <path> [--chunk-minutes N] [--timeout S]`.
+  Prefer the MCP tool — it is one of the six above and answers from the resident
+  process instead of paying the CLI's per-call start-up (see *Why MCP is worth
+  preferring*). The CLI is the fallback for a host without MCP.
+- **The endpoint is OpenAI-compatible `/audio/transcriptions`**, configured under
+  `asr` in `governed_memory.json` (SiliconFlow `XingChenAGI/XingChenASR-V3.2-Ultra`
+  in this deployment).
+- **Natively accepted suffixes** are `.flac .m4a .mp3 .mp4 .ogg .wav .webm`. The
+  WeChat / QQ voice exports (`.amr` / `.silk`) are **not** on that list — yet they
+  work, because each chunk is re-encoded to mp3 through ffmpeg, which normalises
+  any ffmpeg-decodable input into a suffix the endpoint accepts.
+- **Long recordings split automatically.** Anything longer than `asr.chunk_minutes`
+  (default 10) is cut into chunks and the chunk transcripts are joined in order;
+  each request is bounded by `asr.timeout_seconds` (default 600). Both default
+  sensibly, so no config edit is needed. Extracted text is capped at
+  **50000 characters**.
+- **`asr.language` is empty by default — auto-detect.** Worth stating, because
+  Chinese meeting audio is a primary use case.
+- **A partial result is not a success.** If some chunks fail, the tool returns
+  `ok: false` while still including whatever text it obtained. Check `ok`; never
+  assume the whole recording was transcribed.
+
+Then **summarise it** — decisions, owners, dates, numbers — and `kb-add` the note
+with the source in the body, exactly as for a document: the note is the durable
+distillation, not the transcript.
 
 ## Verify the attachment
 
@@ -197,7 +239,7 @@ actually attached for.** Do 4 as well.
    name**. Measured: an agent reported "proves cross-agent visibility" from two
    `agent=None` rows — the check looked passed and had tested nothing.
 5. If hooks are wired: start a fresh session and confirm the injection arrived
-6. If MCP is wired: confirm the host lists the five tools, then confirm a call
+6. If MCP is wired: confirm the host lists the six tools, then confirm a call
    actually happens — a tool that is *listed* and never *called* is the common
    failure, and it is invisible without a log
 

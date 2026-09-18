@@ -197,7 +197,7 @@ LLM 归纳（与 agent 对话模型同款）
 | `governed_kb_review` | KB | 审核 inbox 候选（approve/reject） |
 | `governed_kb_fetch` | KB | 抓取 URL → 文本 |
 | `governed_kb_read_file` | KB | 读取本地文件 → 文本 |
-| `governed_kb_transcribe` | KB | 音频转写（ASR） |
+| `governed_kb_transcribe` | KB | 音频转写（ASR；长音频自动切分） |
 
 ## 模块地图
 
@@ -211,7 +211,7 @@ LLM 归纳（与 agent 对话模型同款）
 | `_kb.py` | 知识库门面（search/add/get/review/reindex）+ `KBIndex` |
 | `_vault.py` | Obsidian vault 存储（PARA 骨架、frontmatter、wikilink） |
 | `_synthesize.py` | 会话归纳 → 候选卡片（LLM，同款模型） |
-| `_ingest.py` | 内容获取（fetch/read/transcribe，全部可选依赖降级） |
+| `_ingest.py` | 内容获取（fetch/read/transcribe，含长音频自动切分，全部可选依赖降级） |
 | `_bridge.py` | Scope Recall 的持久候选（密钥模式、导出） |
 | `_compress.py` | 长任务的 Mermaid 短期压缩 |
 | `_migrations.py` | 幂等 schema 迁移（`run_pending`） |

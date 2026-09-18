@@ -197,7 +197,7 @@ The plugin registers **10 tools** (3 memory + 7 KB):
 | `governed_kb_review` | KB | Approve/reject inbox candidates |
 | `governed_kb_fetch` | KB | Fetch a URL → text |
 | `governed_kb_read_file` | KB | Read a local file → text |
-| `governed_kb_transcribe` | KB | Transcribe audio → text (ASR) |
+| `governed_kb_transcribe` | KB | Transcribe audio → text (ASR; long audio auto-split) |
 
 ## Module map
 
@@ -211,7 +211,7 @@ The plugin registers **10 tools** (3 memory + 7 KB):
 | `_kb.py` | Knowledge base facade (search/add/get/review/reindex) + `KBIndex` |
 | `_vault.py` | Obsidian vault store (PARA skeleton, frontmatter, wikilinks) |
 | `_synthesize.py` | Session distillation → candidate cards (LLM, same model) |
-| `_ingest.py` | Content acquisition (fetch/read/transcribe, all optional-dep degradable) |
+| `_ingest.py` | Content acquisition (fetch/read/transcribe incl. long-audio auto-split, all optional-dep degradable) |
 | `_bridge.py` | Durable-memory candidates for Scope Recall (secret patterns, export) |
 | `_compress.py` | Mermaid short-term compression for long tasks |
 | `_migrations.py` | Idempotent schema migrations (`run_pending`) |
