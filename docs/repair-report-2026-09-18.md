@@ -134,9 +134,9 @@ except UnicodeEncodeError:
 | 6 | network topology router MikroTik | `semantic-cosine` | 0 | 0 | ✅ |
 | 7 | embedding 失败 surrogates | `semantic-cosine` | 0 | 1 | ✅ |
 | 8 | 飞书 Lark API integration | `semantic-cosine` | 0 | 5 | ✅ |
-| 9 | 密码管理器 示例密码管理器 配置 | `semantic-cosine` | 0 | 0 | ✅ |
+| 9 | 示例密码管理器 配置 | `semantic-cosine` | 0 | 0 | ✅ |
 | 10 | Hermes gateway restart 方法 | `semantic-cosine` | 4 | 5 | ✅ |
-| 11 | NAS 示例NAS 配置 | `semantic-cosine` | 0 | 5 | ✅ |
+| 11 | 示例NAS 配置 | `semantic-cosine` | 0 | 5 | ✅ |
 | 12 | git push GitHub proxy | `semantic-cosine` | 2 | 5 | ✅ |
 | 13 | Tailscale 组网方案 示例路由器 | `semantic-cosine` | 1 | 0 | ✅ |
 | 14 | pyarrow LanceDB add_columns | `semantic-cosine` | 1 | 0 | ✅ |
