@@ -159,6 +159,42 @@ class TestWalkRefusesOutOfVaultLinks:
         assert any("outside" in r for r in refusals), (
             "拒绝记录里没说清它跑到库外哪儿去了：%s" % refusals)
 
+    def test_a_link_whose_target_has_no_notes_is_still_reported(self, tmp_path):
+        """The refusal must not depend on ``rglob`` having descended the link.
+
+        ``pathlib`` will not descend a directory **symlink** (cycle guard), while
+        a Windows **junction** is transparent to ``scandir`` and *is* descended.
+        So on POSIX an out-of-vault link produced no hits and, with them, no
+        refusal: the escape was excluded silently, and "that link is ignored"
+        looked identical to "there is nothing there".
+
+        Pointing the link at a directory that holds no notes reproduces that
+        situation on Windows as well — the walk finds nothing, so only the
+        explicit link check can report it. The test therefore has teeth on both
+        platforms rather than only on the one that happened to fail.
+        """
+        vault = tmp_path / "vault"
+        (vault / "notes").mkdir(parents=True)
+        (vault / "notes" / "a.md").write_text(NOTE_A, encoding="utf-8")
+        outside = tmp_path / "outside"          # deliberately contains no .md
+        outside.mkdir()
+
+        link = vault / "leak"
+        _make_dir_link(link, outside)
+        if not link.exists():
+            pytest.fail("目录链接没建起来：%s —— 无法验证越界行为，此测试不能算通过"
+                        % link)
+
+        kb = _make_kb(vault, tmp_path)
+        assert "notes/a.md" in kb.scan_vault_paths()
+
+        refusals = kb.last_walk_refusals
+        assert refusals, "越界链接被静默忽略 —— 又是一次没有任何痕迹的失败"
+        assert any("leak" in r for r in refusals), (
+            "拒绝记录里没点名越界的那个链接：%s" % refusals)
+        assert any("outside" in r for r in refusals), (
+            "拒绝记录里没说清它跑到库外哪儿去了：%s" % refusals)
+
     def test_domain_content_never_reaches_the_note_set(self, escaped_vault):
         """端到端：域外文件内容一条都不能进检索集（不是只挡路径）。"""
         vault, tmp = escaped_vault

@@ -29,6 +29,7 @@ inbox —— 笔记**同时存在于 inbox 和 notes**。这是真实产品缺�
 
 from __future__ import annotations
 
+import os
 import threading
 from pathlib import Path
 
@@ -140,6 +141,11 @@ class TestApproveDoesNotPretendSuccess:
         assert not src.exists(), "旧文件必须被删掉"
         assert kb.list_review() == [], "批准之后待审列表必须清空"
 
+    @pytest.mark.skipif(
+        os.name != "nt",
+        reason="依赖 Windows 的强制文件锁：句柄未释放时 unlink 抛 WinError 32。"
+               "POSIX 上删除被打开的文件是**成功**的，所以这个场景在那里不存在 —— "
+               "契约本身由下方用 monkeypatch 的确定性用例在所有平台覆盖")
     def test_locked_original_reports_failure_not_ok(self, kb):
         """句柄一直不放：必须报失败，且还清清楚楚留在待审列表里。"""
         src = _add_pending(kb)
@@ -160,6 +166,38 @@ class TestApproveDoesNotPretendSuccess:
         pending = kb.list_review()
         assert len(pending) == 1, (
             "批准失败后待审列表必须仍然看得到它：%s" % pending)
+
+    def test_a_permanent_unlink_failure_is_reported_deterministically(
+            self, kb, monkeypatch):
+        """同一个契约，**不依赖文件锁语义**，因此每个平台都验证得到。
+
+        上面那条用真实句柄更像线上，但只在 Windows 成立。这条把 unlink 对**这一个
+        文件**钉成永久失败，于是「旧笔记删不掉就必须报失败、并回滚刚写的副本」
+        在 POSIX 上也有人看着 —— 那正是它要挡的重复数据（同时留在 inbox 和 notes）。
+        """
+        src = _add_pending(kb)
+        real = Path.unlink
+
+        def locked_for_src_only(self, *a, **kw):
+            if self == src:
+                raise PermissionError(13, "being used by another process")
+            return real(self, *a, **kw)
+
+        monkeypatch.setattr(Path, "unlink", locked_for_src_only)
+        try:
+            r = kb.approve(TITLE)
+        finally:
+            monkeypatch.setattr(Path, "unlink", real)
+
+        assert r["ok"] is False, (
+            "旧笔记删不掉却返回 ok=True —— approve 谎报成功，"
+            "笔记会同时留在 inbox 和 notes（重复数据）")
+        assert r["rolled_back"] is True, "应当回滚刚写的副本，还原成只存在于 inbox"
+        assert r["partial"] is False
+        assert src.exists(), "旧笔记确实还在 inbox，这正是不能报成功的原因"
+        assert _notes_copy(kb) is None, "回滚后 notes 里不该留下副本"
+        assert len(kb.list_review()) == 1, (
+            "批准失败后待审列表必须仍然看得到它：%s" % kb.list_review())
 
     def test_lock_clearing_mid_retry_lets_the_move_finish(self, kb, monkeypatch):
         """占用在第 3 次才解开 → ``approve`` 整体必须成功。
@@ -188,6 +226,10 @@ class TestApproveDoesNotPretendSuccess:
         assert kb.list_review() == [], "移动成功后待审列表必须清空"
         assert _notes_copy(kb) is not None, "新位置必须真的有这份笔记"
 
+    @pytest.mark.skipif(
+        os.name != "nt",
+        reason="同上：靠真实句柄制造 WinError 32，POSIX 无此语义。"
+               "重试的确定性与契约覆盖由 monkeypatch 版用例承担")
     def test_transient_lock_is_retried_and_the_move_succeeds(self, kb):
         """占位句柄很快就放开 → 重试应当救回这次移动。
 

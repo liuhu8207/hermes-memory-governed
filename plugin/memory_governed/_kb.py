@@ -523,6 +523,10 @@ def iter_vault_notes(vault: Path, *,
     if not vault.exists():
         return
     vault_real = Path(os.path.realpath(str(vault)))
+    #: Paths already named in a refusal, so the link pass below does not repeat
+    #: what the loop already reported (on Windows a junction is walked into, so
+    #: its escaping files are named individually there).
+    seen_refusals: List[str] = []
     for p in sorted(vault.rglob("*.md")):
         try:
             if not p.is_file():
@@ -535,6 +539,7 @@ def iter_vault_notes(vault: Path, *,
             msg = ("refused: '%s' resolves to '%s', outside the vault '%s'"
                    % (p, real, vault_real))
             logger.warning("[kb] vault walk %s", msg)
+            seen_refusals.append(str(p))
             if errors is not None:
                 errors.append(msg)
             continue
@@ -548,6 +553,39 @@ def iter_vault_notes(vault: Path, *,
         if p.name == "index.md":  # MOC 导航不参与检索
             continue
         yield p
+
+    # rglob descends in a platform-dependent way, and that difference is exactly
+    # the one that hid a silent failure: a Windows **junction** is transparent to
+    # ``scandir`` so the loop above walks into it and records a refusal per file,
+    # while ``pathlib`` refuses to descend a directory **symlink** (cycle guard).
+    # On POSIX an out-of-vault link therefore produced no hits and, with them, no
+    # refusal — the escape was excluded **silently**, so "that link is ignored"
+    # looked identical to "there is nothing there", which is the pair this
+    # function's ``errors`` sink exists to keep apart.
+    #
+    # So links are checked explicitly. Pruning them from ``dirnames`` also
+    # guarantees the walk never leaves the vault: ``os.path.islink`` reports
+    # False for a junction, so ``os.walk`` alone would happily descend one.
+    for dirpath, dirnames, _files in os.walk(vault, followlinks=False):
+        for name in list(dirnames):
+            candidate = Path(dirpath) / name
+            if not _is_link(candidate):
+                continue
+            dirnames.remove(name)
+            try:
+                real = Path(os.path.realpath(str(candidate)))
+            except OSError:  # pragma: no cover — unresolvable link
+                continue
+            if _is_within(real, vault_real):
+                continue
+            if any(str(candidate) in seen for seen in seen_refusals):
+                continue  # already named by the loop above (Windows junction)
+            msg = ("refused: '%s' is a link to '%s', outside the vault '%s'"
+                   % (candidate, real, vault_real))
+            logger.warning("[kb] vault walk %s", msg)
+            seen_refusals.append(str(candidate))
+            if errors is not None:
+                errors.append(msg)
 
 
 class KnowledgeBase:

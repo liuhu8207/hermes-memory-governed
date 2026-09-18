@@ -1687,6 +1687,21 @@ def split_vault_section(section: str) -> list:
             empty once split.
     """
     raw = str(section or "").replace("\\", "/")
+    # An absolute section is refused, not quietly made relative.
+    #
+    # Splitting "/a/b" on "/" and dropping the empty first component turned it
+    # into "a/b" — inside the vault, so containment passed and the note was
+    # written to a directory the caller never named. Exactly what
+    # :func:`safe_vault_path` says must not happen: a refused write is
+    # recoverable, a silently relocated one is not.
+    #
+    # This went unnoticed because on Windows the mistake is caught by accident —
+    # the drive letter's colon trips the alternate-data-stream rule below — so
+    # only a POSIX runner (where "/tmp/..." has no colon) exposed it.
+    if raw.startswith("/") or re.match(r"^[A-Za-z]:", raw):
+        raise VaultPathEscape(
+            f"refused: '{section}' is an absolute path; --section must name a "
+            f"directory inside the vault")
     parts = [p for p in raw.split("/") if p not in ("", ".")]
     if not parts:
         raise VaultPathEscape(

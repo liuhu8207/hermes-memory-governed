@@ -113,13 +113,56 @@ class TestKbAddSectionContainment:
         with pytest.raises(cli.VaultPathEscape):
             cli.safe_vault_path(store.vault, "../memory", "MEMORY.md")
 
+    @pytest.mark.parametrize("section", [
+        "/tmp/outside",                     # POSIX absolute — no colon to trip on
+        "/",                                # the root itself
+        "//server/share",                   # UNC
+        "C:/outside", "C:\\outside",        # Windows absolute
+        "c:relative",                       # drive-relative
+    ])
+    def test_an_absolute_section_is_refused_by_the_validator(self, section):
+        """The validator, not just the outcome — so it bites on every platform.
+
+        Asserting only through ``cmd_kb_add`` was not enough: on Windows the
+        drive letter's colon trips the ADS rule and the refusal happens for the
+        wrong reason, so a regression on POSIX would stay invisible here. The
+        input is a plain string, so this test means the same thing everywhere.
+        """
+        with pytest.raises(cli.VaultPathEscape) as err:
+            cli.split_vault_section(section)
+        assert "absolute" in str(err.value)
+
+    def test_ordinary_relative_sections_still_work(self):
+        """The fix must not turn 'a/b' or a bare name into a refusal."""
+        assert cli.split_vault_section("notes") == ["notes"]
+        assert cli.split_vault_section("notes/sub") == ["notes", "sub"]
+        assert cli.split_vault_section("notes\\sub") == ["notes", "sub"]
+
     def test_absolute_section_is_refused(self, store, tmp_path):
+        """Absolute, not only traversal.
+
+        Splitting ``/a/b`` on ``/`` and dropping the empty first component turned
+        it into ``a/b`` — **inside** the vault, so containment passed and the note
+        was written to a directory the caller never named. Nothing escaped, but
+        the location was silently rewritten, which is the outcome
+        ``safe_vault_path`` says must not happen.
+
+        This passed on Windows by accident: the drive letter's colon trips the
+        alternate-data-stream rule, so ``C:\\...`` was refused for the wrong
+        reason. A POSIX runner — where ``/tmp/...`` has no colon — is what showed
+        the real behaviour.
+        """
         outside = tmp_path / "outside"
         outside.mkdir()
         out = cli.cmd_kb_add(store.cfg, "USER", "pwned", str(outside),
                              [], [], None, agent="dsh")
         assert out["ok"] is False
+        assert out["error"].startswith("refused:")
+        # Outside the vault…
         assert not (outside / "USER.md").exists()
+        # …and not quietly repositioned inside it under the absolute path's tail.
+        assert not list(store.home.parent.rglob("USER.md")), (
+            "绝对 section 被静默改写成相对路径，写进了库里另一个位置")
 
     def test_absolute_section_within_the_home_tree_is_refused(self, store):
         # The QA reproduction pointed at <sandbox>/memory, i.e. the sibling of
