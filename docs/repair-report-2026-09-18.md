@@ -174,6 +174,10 @@ except UnicodeEncodeError:
 | embedding 后端 | ✅ | api:siliconflow, dim=1024 |
 | Python 运行时 | ✅ | Python 3.12, 无缺失模块 |
 
+> **追记（2026-09-18 晚）**：上面「5 个工具」是当时的真实值，表格保留原样作为当天
+> 的记录。同日 `hgm_transcribe` 落地后 MCP 工具面为 **6 个** —— 新增音频转写，
+> 长录音自动拆段。以此表为准的读者请注意这处时间差。
+
 ---
 
 ## 五、修改文件清单
