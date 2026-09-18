@@ -128,6 +128,43 @@ def check_l3(h: HealthCheck):
 
         if "messages_fts" in tables:
             h.check("L3 FTS5", True, "indexed")
+            # Existence is not the invariant. The write path mirrors every row,
+            # but nothing re-checks it afterwards — so a delete issued outside
+            # the product (an ad-hoc ``DELETE FROM messages``), or a mirror that
+            # failed quietly, leaves the two tables diverged with **no symptom
+            # anywhere**. The direction that matters is "in messages, not in the
+            # index": that text can never be found again, which is the outcome
+            # ``_sync``'s own docstring calls data loss rather than a
+            # debug-level curiosity.
+            #
+            # Measured 2026-09-18: this store held exactly one FTS-only orphan
+            # and no component reported it. Previously the report printed
+            # "indexed" and stopped.
+            try:
+                unsearchable = conn.execute(
+                    "SELECT COUNT(*) FROM messages m WHERE NOT EXISTS ("
+                    "  SELECT 1 FROM messages_fts f"
+                    "  WHERE f.session_id = m.session_id AND f.content = m.content)"
+                ).fetchone()[0]
+                orphans = conn.execute(
+                    "SELECT COUNT(*) FROM messages_fts f WHERE NOT EXISTS ("
+                    "  SELECT 1 FROM messages m"
+                    "  WHERE m.session_id = f.session_id AND m.content = f.content)"
+                ).fetchone()[0]
+                if unsearchable:
+                    h.check("L3 FTS mirror", False,
+                            f"{unsearchable} 行在 messages 里但不在索引里 —— "
+                            f"这些内容再也搜不到")
+                elif orphans:
+                    h.check_warning(
+                        "L3 FTS mirror",
+                        f"{orphans} 行只在索引里（源已删除）—— 检索仍会返回原文，"
+                        f"但源记录已不在，说明有一次未经产品的删除")
+                else:
+                    n = conn.execute("SELECT COUNT(*) FROM messages").fetchone()[0]
+                    h.check("L3 FTS mirror", True, f"{n} 行两侧一致")
+            except Exception as e:  # noqa: BLE001 — a check must not break the report
+                h.check_warning("L3 FTS mirror", f"无法校验: {e}")
         else:
             h.check_warning("L3 FTS5", "not created")
 

@@ -59,6 +59,9 @@ SERVER_NAME = "hgm-governed-memory"
 
 MAX_LOG_LINES = 500
 
+#: ``tools/list`` is logged once per process; see the branch in :func:`handle`.
+_LOGGED_TOOLS_LIST = False
+
 
 # -- logging ----------------------------------------------------------------
 def log_path() -> Path:
@@ -324,7 +327,15 @@ def handle(msg: dict) -> dict:
     if method == "ping":
         return _result(msg_id, {})
     if method == "tools/list":
-        log("tools/list", f"count={len(TOOLS)}")
+        # Logged once per process, not once per call. A host re-lists the tools
+        # on every turn, and with a 500-line cap that flood **evicted every
+        # `call` record** — the log looked healthy while the answer to "did any
+        # agent use a tool today?" had already been pushed out of it. The single
+        # line still proves the host read the tool list.
+        global _LOGGED_TOOLS_LIST
+        if not _LOGGED_TOOLS_LIST:
+            _LOGGED_TOOLS_LIST = True
+            log("tools/list", f"count={len(TOOLS)} (logged once per process)")
         return _result(msg_id, {"tools": TOOLS})
     if method == "tools/call":
         params = msg.get("params") or {}
@@ -389,7 +400,11 @@ def ensure_usable_interpreter() -> None:
         current = Path(sys.executable).resolve()
     except OSError:
         current = None
-    log("bootstrap", f"missing={missing} from={current}")
+    log("bootstrap", f"missing={missing} from={current} "
+                     f"venv={'yes' if sys.prefix != sys.base_prefix else 'no'} "
+                     f"PYTHONHOME={'set' if os.environ.get('PYTHONHOME') else 'unset'} "
+                     f"PYTHONPATH={'set' if os.environ.get('PYTHONPATH') else 'unset'} "
+                     f"base={sys.base_prefix}")
     script = str(Path(__file__).resolve())
     for cand in candidates:
         target = Path(cand)
