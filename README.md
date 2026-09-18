@@ -286,7 +286,7 @@ Configuration lives in `$HERMES_HOME/governed_memory.json` (see [`config/governe
 | `embedding` | remote embedding API (OpenAI-compatible `/embeddings`) |
 | `reranking` | optional reranker (SiliconFlow bge-reranker) |
 | `kb` | KB top-k, thresholds, semantic/keyword toggles, autolink |
-| `asr` | audio transcription (XingChenASR) |
+| `asr` | audio transcription (XingChenASR) — `timeout_seconds` (default 600: per-request ceiling) and `chunk_minutes` (default 10: recordings longer than this are split and their transcripts joined in order). Both have defaults, so no config edit is needed. |
 | `synthesis` | session distillation (provider/model/key, enabled flag) |
 
 > ⚠️ **Dimension consistency**: a given L2 table can hold only one vector dimension. Switching backends (API ↔ local) or models changes the dimension, so you must rebuild L2: `python scripts/l2_rebuild.py`.
