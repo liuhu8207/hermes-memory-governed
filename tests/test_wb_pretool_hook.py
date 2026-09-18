@@ -330,6 +330,55 @@ class TestNamingIsNotWriting:
             "echo/printf 不带重定向不是写 —— 它们会把只打印一行的命令也拦下")
 
 
+class TestItDoesNotLeanOnThePlatformsPathRules:
+    """The guard must behave the same on a case-sensitive filesystem.
+
+    Measured: the CI `vector` leg failed 26 tests with
+    ``C:\\fake-hermes\\memory\\MEMORY.md 没被拦住``. The cause was not the tests
+    — it was :func:`_name_if_in_l1` comparing a lowercased canonical name against
+    a token that still carried its original case. That worked on Windows only
+    because ``_resolve_key``'s ``os.path.normcase`` lowercases the path first, and
+    ``normcase`` is a **no-op on POSIX**.
+
+    Stubbing ``normcase`` to the identity function reproduces exactly that, so the
+    regression is caught here instead of on a Linux runner.
+    """
+
+    @pytest.fixture
+    def posix_paths(self, monkeypatch):
+        """Make ``os.path.normcase`` behave as it does on Linux."""
+        import os.path as osp
+        monkeypatch.setattr(osp, "normcase", lambda p: p)
+
+    @pytest.mark.parametrize("name", ["MEMORY.md", "memory.md", "Memory.MD",
+                                      "mEmOrY.mD", "USER.md", "user.MD",
+                                      "PERSONA.md", "Persona.MD"])
+    def test_a_differently_cased_name_is_still_the_l1_file(self, posix_paths, name):
+        assert hook.protected_hit(f"{L1_DIR}/{name}"), (
+            f"{name} 没被拦住 —— 名字比较依赖了 normcase，POSIX 上会失配")
+
+    @pytest.mark.parametrize("name", ["MEMORY.md.", "USER.md...", "persona.md."])
+    def test_a_trailing_dot_is_still_the_l1_file(self, posix_paths, name):
+        assert hook.protected_hit(f"{L1_DIR}/{name}")
+
+    def test_the_backslash_spelling_survives(self, posix_paths):
+        win = L1_DIR.replace("/", "\\")
+        assert hook.protected_hit(win + "\\MEMORY.md")
+
+    def test_the_real_case_still_decides_containment(self, posix_paths):
+        """Case-folding the *name* must not case-fold the *path*.
+
+        On a case-sensitive filesystem a directory spelled differently is a
+        different directory, so a path outside the L1 dir stays outside — the fix
+        must not turn into "match anything containing the name".
+        """
+        assert not hook.protected_hit("D:/somewhere/else/MEMORY.md")
+
+    def test_decide_is_unaffected(self, posix_paths):
+        assert hook.decide(edit(f"{L1_DIR}/memory.md"))[0] == "deny"
+        assert hook.decide(edit("D:/proj/MEMORY.md"))[0] == "allow"
+
+
 class TestTheContract:
     def _run(self, raw, capsys):
         import sys

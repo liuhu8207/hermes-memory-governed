@@ -160,12 +160,26 @@ class TestRealCalls:
     """The integration itself — kept to a minimum because each call is real."""
 
     def test_recall_returns_attributed_facts(self, client):
+        """Every hit must carry its writer; zero hits must say so.
+
+        This reads the real store, which this machine has and CI does not. The
+        first version asserted that a *particular* fact was present — true here,
+        never true on CI, so it failed there for a reason that had nothing to do
+        with the code. The sandboxed equivalent (seed a fact, read it back) is in
+        ``test_hgm_mcp_write.py``; this one checks the shape of the reply against
+        whatever the store actually holds.
+        """
         r = client.call("hgm_recall", {"query": "怎么免密登录", "top_k": 3}, msg_id=10)
         text = r["result"]["content"][0]["text"]
         assert not r["result"].get("isError"), text
         assert "L2 facts:" in text
-        assert "能不能做成免密" in text, text            # a fact known to exist
-        assert "<" in text and ">" in text, "命中没有署名，调用方无法判断是谁写的"
+
+        hits = [ln.strip() for ln in text.splitlines() if ln.strip().startswith("- (")]
+        if hits:
+            assert all("<" in h and ">" in h for h in hits), (
+                f"命中没有署名，调用方无法判断是谁写的: {hits[:2]}")
+        else:
+            assert "0 hit" in text, f"零命中必须明说，而不是留白: {text}"
 
     def test_a_query_with_no_answer_says_so_instead_of_going_quiet(self, client):
         """'Nothing matched' and 'could not read' must not look identical."""

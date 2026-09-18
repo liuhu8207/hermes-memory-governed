@@ -104,7 +104,11 @@ def _rows(box):
     names = [t.name if hasattr(t, "name") else str(t) for t in names]
     if "memories" not in names:
         return []
-    return db.open_table("memories").to_pandas().to_dict("records")
+    # ``to_arrow().to_pylist()``, not ``to_pandas()``: the deployed vector extras
+    # are lancedb + pyarrow + fastembed, and **pandas is not among them**. The
+    # product code avoids ``to_pandas`` for exactly this reason (see the notes in
+    # ``test_l4_persona.py``); this helper had reintroduced it.
+    return db.open_table("memories").to_arrow().to_pylist()
 
 
 class TestRememberWrites:

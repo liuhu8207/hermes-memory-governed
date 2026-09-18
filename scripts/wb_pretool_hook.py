@@ -256,7 +256,11 @@ def _tokens_naming_a_protected_file(text: str) -> list:
     flat = _expand_home(_resolve_key(text))
     found = []
     for name in PROTECTED_NAMES:
-        for match in re.finditer(re.escape(name.lower()), flat):
+        # ``re.IGNORECASE`` rather than relying on ``_resolve_key`` having
+        # lowercased the text. ``normcase`` is a no-op on POSIX, so without this
+        # the search for ``memory.md`` never matched ``MEMORY.md`` and the guard
+        # extracted **no tokens at all** — it matched nothing, on every path.
+        for match in re.finditer(re.escape(name.lower()), flat, re.IGNORECASE):
             start, end = match.start(), match.end()
             while start > 0 and flat[start - 1] not in _TOKEN_BOUNDARY:
                 start -= 1
@@ -269,8 +273,22 @@ def _tokens_naming_a_protected_file(text: str) -> list:
 
 
 def _name_if_in_l1(token: str) -> str:
-    """The guarded name this single token addresses, or ``""``."""
-    base = token.rsplit("/", 1)[-1]
+    """The guarded name this single token addresses, or ``""``.
+
+    The name comparison lowercases **explicitly** rather than leaning on
+    ``_resolve_key``'s ``normcase``. ``normcase`` is a no-op on POSIX, so on Linux
+    the token kept its original case and ``"memory.md" == "MEMORY.md"`` was
+    False — the guard silently stopped matching anything. That is the failure
+    this whole file is about, and it was measured: the CI `vector` leg showed 26
+    tests failing with "``C:\\fake-hermes\\memory\\MEMORY.md`` 没被拦住".
+
+    Case-folding the *name* is right on every platform: the point is to recognise
+    that a write is aimed at the L1 file, and on a case-insensitive filesystem
+    ``Memory.MD`` is that file. Path *containment* is a different question and
+    stays with ``normcase``, because whether two paths are the same file really is
+    a filesystem property.
+    """
+    base = token.rsplit("/", 1)[-1].lower()
     canonical = next((n for n in PROTECTED_NAMES if n.lower() == base), "")
     if not canonical:
         return ""
