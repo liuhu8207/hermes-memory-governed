@@ -38,9 +38,18 @@ def _load():
 hook = _load()
 
 
+#: The guarded directory is decided by HERMES_HOME, so the tests fix it
+#: rather than hard-coding a path. Before the guard was scoped to that directory
+#: every test used a made-up path and still passed — because the guard matched on
+#: the file name alone, which is the bug this suite now pins.
+FAKE_HERMES_HOME = "C:/fake-hermes"
+L1_DIR = FAKE_HERMES_HOME + "/memory"
+
+
 @pytest.fixture(autouse=True)
-def _no_real_log(monkeypatch):
-    """Never let a test append to the real guard log."""
+def _fake_hermes_home(monkeypatch):
+    """Point the guard at a predictable directory, and never log for real."""
+    monkeypatch.setenv("HERMES_HOME", FAKE_HERMES_HOME)
     monkeypatch.setenv("HGM_GUARD_LOG", "0")
 
 
@@ -58,9 +67,8 @@ class TestItBlocksTheRealCase:
 
     def test_editing_l1_memory_is_refused(self):
         for path in (
-            r"C:\Users\example\AppData\Local\hermes\memory\MEMORY.md",
-            "C:/Users/example/AppData/Local/hermes/memory/MEMORY.md",
-            "~/AppData/Local/hermes/memory/MEMORY.md",
+            r"C:\fake-hermes\memory\MEMORY.md",
+            "C:/fake-hermes/memory/MEMORY.md",
         ):
             decision, reason, _, hit = hook.decide(edit(path))
             assert decision == "deny", f"{path} 没被拦住"
@@ -69,12 +77,12 @@ class TestItBlocksTheRealCase:
 
     @pytest.mark.parametrize("name", ["USER.md", "persona.md", "persona_meta.json"])
     def test_the_other_protected_files_too(self, name):
-        decision, _, _, hit = hook.decide(edit(rf"C:\x\hermes\memory\{name}"))
+        decision, _, _, hit = hook.decide(edit(rf"C:\fake-hermes\memory\{name}"))
         assert decision == "deny" and hit == name
 
     def test_writing_a_protected_file_is_refused(self):
         payload = {"tool_name": "Write",
-                   "tool_input": {"file_path": "C:/x/memory/persona.md",
+                   "tool_input": {"file_path": "C:/fake-hermes/memory/persona.md",
                                   "content": "覆盖它"}}
         assert hook.decide(payload)[0] == "deny"
 
@@ -101,9 +109,9 @@ class TestItDoesNotBlockRealWork:
             assert hook.decide(edit(path))[0] == "allow", path
 
     @pytest.mark.parametrize("command", [
-        "cat C:/Users/x/hermes/memory/MEMORY.md",
+        "cat C:/fake-hermes/memory/MEMORY.md",
         "grep -n schtasks ~/AppData/Local/hermes/memory/MEMORY.md",
-        "ls -l C:/Users/x/hermes/memory/",
+        "ls -l C:/fake-hermes/memory/",
     ])
     def test_reading_through_the_shell_is_allowed(self, command):
         assert hook.decide(bash(command))[0] == "allow", command
@@ -119,7 +127,7 @@ class TestItDoesNotBlockRealWork:
 class TestTheShellPath:
     def test_a_redirect_into_l1_is_refused(self):
         decision, _, _, hit = hook.decide(
-            bash('echo "新规则" >> C:/Users/x/hermes/memory/MEMORY.md'))
+            bash('echo "新规则" >> C:/fake-hermes/memory/MEMORY.md'))
         assert decision == "deny" and hit == "MEMORY.md"
 
     def test_naming_a_protected_file_without_writing_is_allowed(self):
@@ -137,18 +145,18 @@ class TestTheFilesystemSpelling:
     """
 
     @pytest.mark.parametrize("path", [
-        r"C:\Users\example\AppData\Local\hermes\memory\memory.md",
-        "C:/Users/example/AppData/Local/hermes/memory/Memory.MD",
-        "C:/Users/example/AppData/Local/hermes/memory/mEmOrY.mD",
+        r"C:\fake-hermes\memory\memory.md",
+        "C:/fake-hermes/memory/Memory.MD",
+        "C:/fake-hermes/memory/mEmOrY.mD",
     ])
     def test_another_case_is_the_same_file(self, path):
         decision, _, _, hit = hook.decide(edit(path))
         assert decision == "deny" and hit == "MEMORY.md", path
 
     @pytest.mark.parametrize("path", [
-        "C:/x/hermes/memory/MEMORY.md.",
-        r"C:\x\hermes\memory\USER.md...",
-        "C:/x/hermes/memory/persona.md.",
+        "C:/fake-hermes/memory/MEMORY.md.",
+        r"C:\fake-hermes\memory\USER.md...",
+        "C:/fake-hermes/memory/persona.md.",
     ])
     def test_a_trailing_dot_is_the_same_file(self, path):
         decision, _, _, hit = hook.decide(edit(path))
@@ -156,7 +164,7 @@ class TestTheFilesystemSpelling:
 
     def test_the_shell_path_is_normalised_too(self):
         assert hook.decide(
-            bash("echo x >> C:/x/hermes/memory/memory.md"))[0] == "deny"
+            bash("echo x >> C:/fake-hermes/memory/memory.md"))[0] == "deny"
 
     def test_a_near_miss_is_still_a_different_file(self):
         """Normalising must not swallow names that are *not* the protected file."""
@@ -180,7 +188,7 @@ class TestBothToolNamingStyles:
                                       "multi_replace_in_file", "insert_content"])
     def test_ide_style_file_writers_are_recognised(self, tool):
         payload = {"tool_name": tool,
-                   "tool_input": {"filePath": "C:/x/hermes/memory/MEMORY.md",
+                   "tool_input": {"filePath": "C:/fake-hermes/memory/MEMORY.md",
                                   "content": "x"}}
         decision, reason, _, hit = hook.decide(payload)
         assert decision == "deny" and hit == "MEMORY.md", (
@@ -188,7 +196,7 @@ class TestBothToolNamingStyles:
 
     def test_ide_style_shell_is_recognised(self):
         payload = {"tool_name": "execute_command",
-                   "tool_input": {"command": "echo x >> C:/x/hermes/memory/USER.md"}}
+                   "tool_input": {"command": "echo x >> C:/fake-hermes/memory/USER.md"}}
         assert hook.decide(payload)[0] == "deny"
 
     def test_the_camel_case_path_key_is_read(self):
@@ -196,8 +204,130 @@ class TestBothToolNamingStyles:
         assert "filePath" in hook.PATH_KEYS
 
     def test_cli_style_still_works(self):
-        assert hook.decide(edit("C:/x/hermes/memory/MEMORY.md"))[0] == "deny"
-        assert hook.decide(bash("echo x >> C:/x/hermes/memory/MEMORY.md"))[0] == "deny"
+        assert hook.decide(edit("C:/fake-hermes/memory/MEMORY.md"))[0] == "deny"
+        assert hook.decide(bash("echo x >> C:/fake-hermes/memory/MEMORY.md"))[0] == "deny"
+
+
+class TestItIsScopedToTheL1Directory:
+    """The guard must not fire on a file that merely *shares a name*.
+
+    Measured 2026-09-18: this project keeps its own workspace memory at
+    ``.workbuddy/memory/MEMORY.md``, and the host's instructions require agents
+    to maintain it. The first version of the guard matched on the base name
+    alone, so it refused its own author's attempt to update that file. That is
+    the over-blocking failure worth avoiding: a guard that stops legitimate work
+    gets switched off, and then nothing is guarded.
+    """
+
+    L1 = "C:/fake-hermes/memory"
+    WORKSPACE = "D:/Sync/Drive/proj/.workbuddy/memory"
+
+    @pytest.mark.parametrize("path", [
+        L1 + "/MEMORY.md",
+        L1 + "/memory.md",                      # case-insensitive filesystem
+        L1 + "/MEMORY.md.",                     # trailing dot is stripped by FS
+        L1.replace("/", "\\") + "\\MEMORY.md",  # Windows separator
+        L1 + "/USER.md",
+        L1 + "/persona.md",
+    ])
+    def test_the_real_l1_files_are_still_refused(self, path):
+        assert hook.protected_hit(path), f"{path} 没被拦住 —— 洞还在"
+
+    @pytest.mark.parametrize("path", [
+        WORKSPACE + "/MEMORY.md",
+        "./.workbuddy/memory/MEMORY.md",
+        "D:/proj/MEMORY.md",
+        str(REPO / ".workbuddy/memory/MEMORY.md"),
+    ])
+    def test_a_same_named_file_elsewhere_is_allowed(self, path):
+        assert not hook.protected_hit(path), (
+            f"{path} 被误拦 —— 它不在 L1 目录里，只是重名")
+
+    def test_the_l1_directory_itself_is_not_a_file_hit(self):
+        assert not hook.protected_hit(self.L1 + "/memory")
+
+    def test_a_bare_name_is_refused(self):
+        """The hook cannot see the working directory, so assume the worst."""
+        assert hook.protected_hit("MEMORY.md")
+
+    def test_the_default_dir_is_used_when_hermes_home_is_unset(self, monkeypatch):
+        """A hook's environment need not carry HERMES_HOME.
+
+        With it unset the guarded directory is derived from the user's home, and
+        a ``~``-spelled path must compare equal to the absolute one — otherwise
+        the L1 file is protected only when it is written the long way round.
+        """
+        monkeypatch.delenv("HERMES_HOME", raising=False)
+        assert hook.protected_hit("~/AppData/Local/hermes/memory/MEMORY.md")
+        assert hook.protected_hit(str(Path.home() / "AppData" / "Local"
+                                     / "hermes" / "memory" / "USER.md"))
+        assert not hook.protected_hit("~/somewhere/else/MEMORY.md")
+
+    def test_the_protected_dir_follows_hermes_home(self, monkeypatch, tmp_path):
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        assert hook.protected_hit(str(tmp_path / "memory" / "MEMORY.md"))
+        assert not hook.protected_hit(self.L1 + "/MEMORY.md"), (
+            "换了 HERMES_HOME 之后，别处的同名文件不该还算受保护")
+
+    def test_a_shell_redirect_into_l1_is_still_refused(self):
+        assert hook.decide({"tool_name": "Bash",
+                            "tool_input": {"command":
+                                           f'echo "x" >> {self.L1}/MEMORY.md'}})[0] == "deny"
+
+    def test_a_shell_write_to_the_workspace_copy_is_allowed(self):
+        assert hook.decide({"tool_name": "Bash",
+                            "tool_input": {"command":
+                                           f'echo "x" >> {self.WORKSPACE}/MEMORY.md'}})[0] == "allow"
+
+    def test_editing_the_workspace_copy_is_allowed(self):
+        for tool in ("Edit", "Write"):
+            payload = {"tool_name": tool,
+                       "tool_input": {"file_path": self.WORKSPACE + "/MEMORY.md"}}
+            assert hook.decide(payload)[0] == "allow", tool
+
+
+class TestNamingIsNotWriting:
+    """Mentioning a guarded file is not the same as writing to it.
+
+    Measured 2026-09-18, two false positives in a row made the guard block its own
+    author: a command that merely *printed* a line naming MEMORY.md (because bare
+    ``echo`` counted as a write indicator), and a command that tried to *back the
+    file up* (because the name appeared anywhere in the string). Both are the
+    over-blocking failure — a guard that stops real work gets switched off, and
+    then nothing is guarded.
+    """
+
+    L1 = "C:/fake-hermes/memory"
+
+    @pytest.mark.parametrize("command", [
+        'echo "MANUAL 说明：不要手改 MEMORY.md"',
+        "grep -n TODO " + "C:/fake-hermes/memory/MEMORY.md",
+        "wc -c < C:/fake-hermes/memory/MEMORY.md",
+        "diff C:/fake-hermes/memory/MEMORY.md /tmp/other",
+    ])
+    def test_reading_or_printing_is_allowed(self, command):
+        assert hook.decide(bash(command))[0] == "allow", command
+
+    def test_backing_the_file_up_is_allowed(self):
+        """The destination decides, not the mention."""
+        assert hook.decide(bash(
+            "cp C:/fake-hermes/memory/MEMORY.md D:/backups/MEMORY.md.bak"))[0] == "allow"
+
+    def test_copying_into_the_l1_file_is_refused(self):
+        assert hook.decide(bash(
+            "cp D:/other/MEMORY.md C:/fake-hermes/memory/MEMORY.md"))[0] == "deny"
+
+    @pytest.mark.parametrize("command", [
+        "rm C:/fake-hermes/memory/MEMORY.md",
+        "mv D:/x " + "C:/fake-hermes/memory/USER.md",
+        "sed -i s/a/b/ C:/fake-hermes/memory/persona.md",
+    ])
+    def test_writing_with_the_target_last_is_refused(self, command):
+        assert hook.decide(bash(command))[0] == "deny", command
+
+    def test_bare_echo_is_not_a_write_indicator(self):
+        assert "echo " not in hook.WRITE_TOKENS and "printf " not in hook.WRITE_TOKENS, (
+            "echo/printf 不带重定向不是写 —— 它们会把只打印一行的命令也拦下")
 
 
 class TestTheContract:
@@ -214,7 +344,7 @@ class TestTheContract:
 
     def test_a_denial_is_valid_json_with_the_decision(self, capsys):
         rc, out = self._run(json.dumps(
-            edit("C:/x/hermes/memory/MEMORY.md")), capsys)
+            edit("C:/fake-hermes/memory/MEMORY.md")), capsys)
         assert rc == 0
         data = json.loads(out)
         assert data["continue"] is True

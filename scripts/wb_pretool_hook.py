@@ -25,12 +25,19 @@ What is blocked, and what is deliberately not
   path is matched the way the filesystem reads it, not the way it is typed:
   ``memory.md`` and ``MEMORY.md.`` are the same file as ``MEMORY.md`` here, so
   they are denied too (:func:`_resolve_key`).
+* **And the path must be inside the L1 directory.** The name alone is not
+  distinctive: this project keeps its own workspace memory at
+  ``.workbuddy/memory/MEMORY.md``, which agents are *required* to maintain.
+  Measured 2026-09-18, matching on the name alone refused its own author's
+  attempt to update that file — the over-blocking failure, which gets a guard
+  switched off and then nothing is guarded at all (:func:`protected_dir`).
 * ``Bash`` mentioning a protected file **and** a write indicator — denied. This
   one is a heuristic, and a narrow one: both conditions must hold, so ``cat``,
-  ``grep``, ``ls`` and every other read still pass. A command that writes to
-  those files through something this does not recognise will get through; the
-  goal is to close the obvious door and to make the intent unmistakable, not to
-  claim a sandbox.
+  ``grep``, ``ls`` and every other read still pass. Its limits are real and
+  worth stating: the check is **textual**, so a command that merely *quotes* a
+  write to L1 is refused as well, and a write spelled in a way it does not
+  recognise gets through. The goal is to close the obvious door and to make the
+  intent unmistakable, not to claim a sandbox.
 * Everything else — allowed. A guard that blocks legitimate work is worse than
   the hole it closes, because it gets switched off.
 
@@ -84,9 +91,18 @@ SHELL_TOOLS = ("Bash", "execute_command")
 
 #: Tokens that make a shell command a write rather than a read. Narrow on
 #: purpose: a false positive here blocks real work.
+#:
+#: ``echo`` and ``printf`` used to be on this list, which was wrong — on their own
+#: they write nothing; they only write when a redirect follows, and the redirect
+#: operators below already cover that. Measured 2026-09-18, the bare ``echo``
+#: entry refused a command that merely *printed* a line mentioning MEMORY.md,
+#: which is the over-blocking failure that gets a guard switched off.
 WRITE_TOKENS = (">", ">>", "tee ", "sed -i", "Set-Content", "Add-Content",
                 "Out-File", "open(", "write_text", "writeFile", "cp ", "mv ",
-                "rm ", "del ", "truncate", "printf ", "echo ")
+                "rm ", "del ", "truncate")
+
+#: A shell redirect and the path it writes to.
+_REDIRECT = re.compile(r">>?\s*([^\s\"'`;|&()<>=,]+)")
 
 REASON = (
     "refused: {name} 属于人工手写层（L1 规则 / L4 人格），agent 不可写 —— "
@@ -197,20 +213,113 @@ def _resolve_key(text: str) -> str:
     return _TRAILING_DOTS.sub("", flat)
 
 
-def protected_hit(text: str) -> str:
-    """The protected file name this text names as a *path*, or ``""``.
+def protected_dir() -> str:
+    """The hand-written layer's directory, normalised for comparison.
 
-    Both separators are accepted because Windows callers produce both, and the
-    comparison is spelling-insensitive because the filesystem is — see
-    :func:`_resolve_key`.
+    Without this the guard matched on the **file name alone**, so
+    ``D:/proj/.workbuddy/memory/MEMORY.md`` — this project's *workspace* memory,
+    which the host's own instructions require an agent to maintain — was refused
+    for sharing a name with the L1 file. Measured 2026-09-18: the guard blocked
+    its own author from updating exactly that file, which is the over-blocking
+    failure that gets a guard switched off and then nothing is guarded at all.
+
+    ``HERMES_HOME`` may be absent in a hook's environment, so the default is
+    derived from the user's home rather than assumed.
     """
-    if not text:
-        return ""
-    flat = _resolve_key(text)
+    home = os.environ.get("HERMES_HOME")
+    base = Path(home) if home else Path.home() / "AppData" / "Local" / "hermes"
+    return _resolve_key(str(Path(base) / "memory"))
+
+
+def _expand_home(flat: str) -> str:
+    """Turn a leading ``~`` into the real home, so both spellings compare equal."""
+    if flat == "~":
+        return _resolve_key(str(Path.home()))
+    if flat.startswith("~/"):
+        return _resolve_key(str(Path.home())) + flat[1:]
+    return flat
+
+
+#: Characters that end a path token in a shell command or a JSON string.
+_TOKEN_BOUNDARY = set(" \t\r\n\"'`;|&()<>=,")
+
+
+def _tokens_naming_a_protected_file(text: str) -> list:
+    """Every whitespace-delimited token in ``text`` that ends in a guarded name.
+
+    Extracting tokens first is what makes this work for a shell command as well
+    as for a bare path. Treating the whole command as the path — the obvious
+    simplification — makes ``echo x >> /…/memory/MEMORY.md`` compare its parent
+    against ``echo x >> /…/memory``, conclude they differ, and **allow the very
+    write the guard exists to stop**.
+    """
+    flat = _expand_home(_resolve_key(text))
+    found = []
     for name in PROTECTED_NAMES:
-        if re.search(r"(?:^|[/\s=])" + re.escape(name) + r"(?:$|[\"'\s,)])",
-                     flat, re.IGNORECASE):
-            return name
+        for match in re.finditer(re.escape(name.lower()), flat):
+            start, end = match.start(), match.end()
+            while start > 0 and flat[start - 1] not in _TOKEN_BOUNDARY:
+                start -= 1
+            while end < len(flat) and flat[end] not in _TOKEN_BOUNDARY:
+                end += 1
+            token = flat[start:end]
+            if token not in found:
+                found.append(token)
+    return found
+
+
+def _name_if_in_l1(token: str) -> str:
+    """The guarded name this single token addresses, or ``""``."""
+    base = token.rsplit("/", 1)[-1]
+    canonical = next((n for n in PROTECTED_NAMES if n.lower() == base), "")
+    if not canonical:
+        return ""
+    if "/" not in token:
+        return canonical
+    return canonical if token.rsplit("/", 1)[0] == protected_dir() else ""
+
+
+def protected_hit(text: str) -> str:
+    """The guarded file name this text addresses *inside the L1 directory*.
+
+    Two conditions, and both are needed: the name must be one of the hand-written
+    files, **and** the path must sit in the directory where those files live. The
+    name alone is not distinctive — ``MEMORY.md`` is a common file name and this
+    project keeps one of its own at ``.workbuddy/memory/MEMORY.md``.
+
+    A bare name with no directory is treated as guarded: the hook cannot see the
+    working directory, and assuming the worst there costs one refusal instead of
+    leaving the real door open.
+    """
+    for token in _tokens_naming_a_protected_file(text):
+        hit = _name_if_in_l1(token)
+        if hit:
+            return hit
+    return ""
+
+
+def shell_targets_protected(text: str) -> str:
+    """The guarded file a *shell command writes to*, or ``""``.
+
+    Being *mentioned* is not the same as being *written*. A command that copies
+    the L1 file out to a backup, or greps it, or prints a line naming it, mentions
+    it — and refusing those is what made this guard block its own author's
+    backup attempt. What matters is the destination: the path after a redirect,
+    or the final path-like argument (``rm``, ``mv``, ``sed -i`` all put the target
+    last).
+
+    The check stays textual, so a write spelled in a way this does not recognise
+    still gets through. That limit is deliberate and documented — the goal is to
+    close the obvious door, not to claim a sandbox.
+    """
+    flat = _expand_home(_resolve_key(text))
+    for match in _REDIRECT.finditer(flat):
+        hit = _name_if_in_l1(match.group(1))
+        if hit:
+            return hit
+    for token in reversed([t for t in re.split(r"[\s\"'`;|&()<>=,]+", flat) if t]):
+        if "/" in token:
+            return _name_if_in_l1(token)
     return ""
 
 
@@ -241,13 +350,13 @@ def decide(payload: dict) -> tuple:
     if tool in SHELL_TOOLS:
         strings = []
         _strings(tool_input, strings)
-        # Both conditions are required: naming the file is not enough (the agent
-        # may be reading it), and a write token alone is not enough (it may be
-        # writing something else).
-        named = next((s for s in strings if protected_hit(s)), "")
+        # Two conditions, and both are required: the command must *write to* a
+        # guarded path (not merely name it), and it must carry a write indicator.
+        # ``cat``/``grep`` pass because they have no write token; copying the L1
+        # file out to a backup passes because its destination is elsewhere.
+        hit = next((h for s in strings if (h := shell_targets_protected(s))), "")
         writes = any(tok in s for s in strings for tok in WRITE_TOKENS)
-        if named and writes:
-            hit = protected_hit(named)
+        if hit and writes:
             return "deny", REASON.format(name=hit), tool, hit
         return "allow", "", tool, ""
 
