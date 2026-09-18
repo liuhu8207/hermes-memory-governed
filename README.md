@@ -230,6 +230,14 @@ The plugin registers **10 tools** (3 memory + 7 KB):
 
 ## Installation
 
+> **Already installed on this machine?** Then **do not reinstall.** This is one
+> shared store, installed once. Another agent attaches to it instead — and
+> re-running the manual steps would overwrite the hand-written L1 rules.
+> Check with `python memory_cli.py health` and read
+> [docs/install.md](docs/install.md) §0 where the answer is `"ok": true`.
+> For wiring up a second (non-Hermes) agent, see
+> [docs/attach-agents.md](docs/attach-agents.md).
+
 ### Agent install (recommended)
 
 ```bash
@@ -324,7 +332,7 @@ python scripts/scope_recall_bridge.py validate        # validate candidates
 
 ## Testing & CI
 
-- Local full suite: `python -m pytest tests/ -q` → **391 passed**.
+- Local full suite: `python -m pytest tests/ -q` → **1327 passed** (2026-09-18).
 - CI (`[.github/workflows/ci.yml](.github/workflows/ci.yml)`) runs a **4-dimension matrix** — `py3.10` / `py3.13` × `core` / `vector`:
   - `core` installs `.[dev]` only (no vector backend → exercises the degradation path).
   - `vector` installs the lightweight backend (`lancedb` + `pyarrow` + `fastembed`, **not** `sentence-transformers`, which would pull ~2GB of torch).
@@ -335,7 +343,8 @@ python scripts/scope_recall_bridge.py validate        # validate candidates
 - [docs/hybrid-architecture.md](docs/hybrid-architecture.md) — cloud + local hybrid deployment design
 - [docs/phase3-design.md](docs/phase3-design.md) — knowledge distillation design
 - [docs/configuration.md](docs/configuration.md) — all config options
-- [docs/install.md](docs/install.md) — installation guide
+- [docs/install.md](docs/install.md) — installation guide (start at §0: already installed?)
+- [docs/attach-agents.md](docs/attach-agents.md) — attaching a second agent: CLI, MCP tools, host hooks
 - [docs/operations.md](docs/operations.md) — cron order and operations
 - [docs/acceptance-report.md](docs/acceptance-report.md) — acceptance verification
 

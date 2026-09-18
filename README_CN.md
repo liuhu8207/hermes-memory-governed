@@ -230,6 +230,12 @@ LLM 归纳（与 agent 对话模型同款）
 
 ## 安装
 
+> **这台机器已经装过了？那就不要重装。** 这是**一份共享存储，只需装一次**；
+> 之后接入的其它 agent 是「接入」，不是「再装一遍」——照着手工步骤重跑会
+> **覆盖手写的 L1 规则**。先跑 `python memory_cli.py health`，若已返回
+> `"ok": true`，请看 [docs/install.md](docs/install.md) 第 0 节；
+> 接入第二个（非 Hermes）agent 见 [docs/attach-agents.md](docs/attach-agents.md)。
+
 ### Agent 安装（推荐）
 
 ```bash
@@ -324,7 +330,7 @@ python scripts/scope_recall_bridge.py validate        # 校验候选
 
 ## 测试与 CI
 
-- 本地全量测试：`python -m pytest tests/ -q` → **391 passed**。
+- 本地全量测试：`python -m pytest tests/ -q` → **1327 passed**（2026-09-18）。
 - CI（[`.github/workflows/ci.yml`](.github/workflows/ci.yml)）跑 **4 维矩阵**——`py3.10` / `py3.13` × `core` / `vector`：
   - `core` 只装 `.[dev]`（无向量后端 → 验证降级路径）。
   - `vector` 装轻量后端（`lancedb` + `pyarrow` + `fastembed`，**不装** `sentence-transformers`，避免拖 ~2GB 的 torch）。
