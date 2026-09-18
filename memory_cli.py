@@ -1248,6 +1248,10 @@ def cmd_remember(config: dict, text: str, agent: str,
     """
     sync = plugin_module("_sync")
     cleaned = " ".join(str(text or "").split())
+    # Surrogate hygiene comes from the plugin's single implementation rather
+    # than a copy of it: LanceDB stores Arrow strings, which demand strict
+    # UTF-8, so a lone surrogate makes the row unwritable. See _text.py.
+    cleaned = plugin_module("_text").sanitize_utf8(cleaned)
     admitted, reason = sync.external_write_verdict(cleaned)
     resolved_project = (infer_project() if project is None
                         else normalize_project(project))

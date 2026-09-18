@@ -43,7 +43,7 @@ import sys
 import traceback
 from pathlib import Path
 
-for _stream in (sys.stdout, sys.stderr):
+for _stream in (sys.stdin, sys.stdout, sys.stderr):
     if hasattr(_stream, "reconfigure"):
         try:
             _stream.reconfigure(encoding="utf-8")
@@ -184,7 +184,7 @@ def _agent() -> str:
 
 def tool_recall(args: dict) -> str:
     cli = _cli()
-    query = str(args.get("query") or "").strip()
+    query = _ensure_utf8(str(args.get("query") or "").strip())
     if not query:
         raise ValueError("query is required")
     top_k = int(args.get("top_k") or 5)
@@ -222,9 +222,18 @@ def tool_recall(args: dict) -> str:
     return "\n".join(lines)
 
 
+def _ensure_utf8(text: str) -> str:
+    """Delegate to the plugin's single implementation; see ``_text.py``.
+
+    There were three copies of this logic and none of them guarded the path
+    that actually reaches L2. This one is now a call, not a copy.
+    """
+    return _cli().plugin_module("_text").sanitize_utf8(text)
+
+
 def tool_remember(args: dict) -> str:
     cli = _cli()
-    fact = str(args.get("fact") or "").strip()
+    fact = _ensure_utf8(str(args.get("fact") or "").strip())
     if not fact:
         raise ValueError("fact is required")
     raw_project = args.get("project", None)

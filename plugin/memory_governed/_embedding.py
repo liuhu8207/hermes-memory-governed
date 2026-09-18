@@ -31,6 +31,8 @@ import os
 import threading
 from typing import TYPE_CHECKING, Any, List, Optional, Protocol
 
+from ._text import sanitize_utf8
+
 if TYPE_CHECKING:  # pragma: no cover - 仅供类型检查，避免运行时循环导入
     from ._config import GovernedMemoryConfig
 
@@ -272,20 +274,34 @@ class EmbeddingService:
         """后端标识（"api:<provider>" / "local:<backend>" / "none"）。"""
         return self._backend_name
 
+    @staticmethod
+    def _sanitize(text: str) -> str:
+        """Kept as a thin alias; the implementation lives in :mod:`._text`.
+
+        There used to be three copies of this logic. This one, plus
+        ``hgm_mcp._ensure_utf8`` and an inline block in ``memory_cli``, were
+        identical — and none of them covered the plugin's own extraction path,
+        which is where a fact actually reaches L2. One definition now, and the
+        write pipeline sanitizes once at its ingress.
+        """
+        return sanitize_utf8(text)
+
     def embed_one(self, text: str) -> Optional[List[float]]:
         """单条嵌入。不可用或失败时返回 None（不抛异常）。"""
         if not text or not str(text).strip():
             return None
+
+        text = self._sanitize(str(text))
 
         with self._call_lock:
             if not self._available:
                 return None
             try:
                 if self._api_base_url:
-                    vectors = self._embed_via_api([str(text)])
+                    vectors = self._embed_via_api([text])
                     return vectors[0] if vectors else None
                 if self._backend is not None:
-                    vectors = self._encode_local([str(text)])
+                    vectors = self._encode_local([text])
                     return vectors[0] if vectors else None
             except Exception as e:  # noqa: BLE001 — 嵌入永远不能打断主流程
                 self._last_error = f"embed_one failed: {e}"
@@ -297,7 +313,7 @@ class EmbeddingService:
         """批量嵌入，返回与输入等长的列表，失败项为 None。"""
         if not texts:
             return []
-        normalized = ["" if t is None else str(t) for t in texts]
+        normalized = [self._sanitize("" if t is None else str(t)) for t in texts]
 
         with self._call_lock:
             if not self._available:

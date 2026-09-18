@@ -200,6 +200,54 @@ class TestKbAddWrites:
         assert not outside.exists(), "目录穿越真的写出去了"
 
 
+class TestSurrogateInput:
+    """A lone surrogate must not reach the store, and must not kill the server.
+
+    This is the regression for the 2026-09-18 report. Verified by hand first,
+    then pinned here: the embedding call used to raise on it (so the semantic
+    channel silently fell back to lexical), and Arrow cannot encode it (so the
+    row was unwritable).
+    """
+
+    def test_a_lone_surrogate_does_not_break_the_write(self, box):
+        box.n += 1
+        frame = {"jsonrpc": "2.0", "id": box.n, "method": "tools/call",
+                 "params": {"name": "hgm_remember",
+                            "arguments": {"fact": "代理对回归测试的地址是 10.9.9.9 \udcae"}}}
+        # ``ensure_ascii`` defaults to True, which escapes the surrogate as
+        # \udcae — the only way to transport it at all. With ensure_ascii=False
+        # the *sender* raises UnicodeEncodeError and nothing is ever sent, so a
+        # test written that way would prove nothing about the server.
+        box.proc.stdin.write(json.dumps(frame) + "\n")
+        box.proc.stdin.flush()
+        line = box.proc.stdout.readline()
+        assert line, f"代理对把 server 打崩了: {box.proc.stderr.read()[-300:]}"
+        payload = json.loads(json.loads(line)["result"]["content"][0]["text"])
+        assert payload.get("ok") is True, payload
+
+        rows = [r for r in _rows(box) if "10.9.9.9" in str(r.get("content"))]
+        assert rows, "工具说写成功了，但库里没有这条"
+        stored = str(rows[0]["content"])
+        assert not any(0xD800 <= ord(c) <= 0xDFFF for c in stored), (
+            f"库里存进了代理对 —— Arrow 之后会读不出来: {stored!r}")
+        stored.encode("utf-8")                       # must not raise
+        assert "代理对回归测试" in stored, "好字符不该被一起丢掉"
+
+    def test_a_surrogate_in_a_query_does_not_break_recall(self, box):
+        """The read side hits the same encoder, and used to fail the same way."""
+        box.n += 1
+        frame = {"jsonrpc": "2.0", "id": box.n, "method": "tools/call",
+                 "params": {"name": "hgm_recall",
+                            "arguments": {"query": "代理对回归测试 \udcae", "top_k": 3}}}
+        box.proc.stdin.write(json.dumps(frame) + "\n")
+        box.proc.stdin.flush()
+        line = box.proc.stdout.readline()
+        assert line, "查询里的代理对把 server 打崩了"
+        result = json.loads(line)["result"]
+        assert not result.get("isError"), result["content"][0]["text"][:200]
+        assert "L2 facts" in result["content"][0]["text"]
+
+
 class TestTheRoundTrip:
     """One agent writes, a *separate process* running as another agent reads.
 

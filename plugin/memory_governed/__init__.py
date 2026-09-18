@@ -37,6 +37,7 @@ from ._sync import (
 from ._compress import MermaidCompressor
 from ._bridge import BridgeExporter, screen_bridge_content
 from ._kb import KnowledgeBase
+from ._text import sanitize_messages
 from . import _ingest
 from . import _synthesize
 
@@ -579,6 +580,17 @@ class GovernedMemoryProvider:
             messages = self._messages_from_contents(user_content, assistant_content)
         if not messages:
             return
+
+        # Sanitize once, here, rather than at each layer that would otherwise
+        # fail on a lone surrogate: SQLite encodes text parameters as UTF-8 (the
+        # archive and its FTS mirror), Arrow demands strict UTF-8 (the L2 row),
+        # and the embedding call raises before either. Measured 2026-09-18, the
+        # last of those had been silently degrading the semantic channel —
+        # embed_one turned the exception into a None and recall fell back to
+        # lexical without saying so. One sanitization at the ingress covers all
+        # four consumers, which is also why the three duplicate copies that used
+        # to live in _embedding / hgm_mcp / memory_cli are gone.
+        messages = sanitize_messages(messages)
 
         # L3: synchronous write (<10ms, WAL mode); returns content→rowid map
         rowid_map: dict = {}
