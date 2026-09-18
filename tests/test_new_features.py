@@ -141,7 +141,7 @@ class TestMemoryDream:
         # NOTE: read via a FRESH connection — LanceDB table objects hold a
         # version snapshot, so the pre-dream wq._l2_store would miss the rows
         # that memory_dream added through its own connection.
-        import lancedb
+        lancedb = pytest.importorskip("lancedb")
 
         fresh = lancedb.connect(str(cfg.l2_db_path)).open_table("memories")
         rows = fresh.to_arrow().to_pylist()

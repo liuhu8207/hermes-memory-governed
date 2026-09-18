@@ -127,7 +127,7 @@ class TestL2SourceRef:
 
     def test_config_driven_dim(self, tmp_path, monkeypatch):
         pytest.importorskip("lancedb")
-        import pyarrow as pa
+        pa = pytest.importorskip("pyarrow")
         from plugin.memory_governed._sync import WriteQueue
         from plugin.memory_governed._config import GovernedMemoryConfig
 
@@ -392,7 +392,7 @@ def _prepare_rebuild(tmp_path, monkeypatch):
 class TestL2RebuildKeepsProvenance:
     def test_rebuilt_table_carries_all_three_attribution_columns(self, tmp_path, monkeypatch):
         """The schema is the bug: a fresh table must not be narrower than an old one."""
-        import lancedb
+        lancedb = pytest.importorskip("lancedb")
 
         home, l2_dir = _prepare_rebuild(tmp_path, monkeypatch)
         assert _run_rebuild(tmp_path, monkeypatch) == 0
@@ -403,7 +403,7 @@ class TestL2RebuildKeepsProvenance:
             assert col in names, f"rebuilt table is missing '{col}': {names}"
 
     def test_rebuilt_rows_keep_the_role_they_came_from(self, tmp_path, monkeypatch):
-        import lancedb
+        lancedb = pytest.importorskip("lancedb")
 
         _home, l2_dir = _prepare_rebuild(tmp_path, monkeypatch)
         assert _run_rebuild(tmp_path, monkeypatch) == 0
@@ -414,7 +414,7 @@ class TestL2RebuildKeepsProvenance:
 
     def test_drop_is_preceded_by_a_backup(self, tmp_path, monkeypatch):
         """No silent drops: the old table must still exist somewhere afterwards."""
-        import lancedb
+        lancedb = pytest.importorskip("lancedb")
 
         home, l2_dir = _prepare_rebuild(tmp_path, monkeypatch)
         l2_dir.mkdir(parents=True, exist_ok=True)
@@ -440,7 +440,7 @@ class TestL2RebuildKeepsProvenance:
         They are also the rows whose admission rests on structural evidence, so
         losing them is permanent — they would not pass the gate a second time.
         """
-        import lancedb
+        lancedb = pytest.importorskip("lancedb")
 
         home, l2_dir = _prepare_rebuild(tmp_path, monkeypatch)
         l2_dir.mkdir(parents=True, exist_ok=True)
@@ -465,7 +465,7 @@ class TestL2RebuildKeepsProvenance:
 
     def test_rebuild_aborts_when_it_cannot_back_up(self, tmp_path, monkeypatch, caplog):
         """A backup failure must stop the run, not fall through to the drop."""
-        import lancedb
+        lancedb = pytest.importorskip("lancedb")
 
         home, l2_dir = _prepare_rebuild(tmp_path, monkeypatch)
         l2_dir.mkdir(parents=True, exist_ok=True)

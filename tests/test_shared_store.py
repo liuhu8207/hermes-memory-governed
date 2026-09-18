@@ -21,7 +21,6 @@ import json
 import types
 from pathlib import Path
 
-import pyarrow as pa
 import pytest
 
 import memory_cli as cli
@@ -518,7 +517,12 @@ class TestRemember:
         monkeypatch.setattr(cli, "plugin_module", dispatch)
 
     def _make_table(self, shared, dim=8):
-        import lancedb
+        # Imported here, not at module scope: the CI `core` leg installs no
+        # vector backend on purpose, and a module-level import of either of
+        # these aborts collection for the whole file — taking every test that
+        # does *not* need them down with it, and turning the leg red in ~1s.
+        lancedb = pytest.importorskip("lancedb")
+        pa = pytest.importorskip("pyarrow")
         db = lancedb.connect(str(shared.home / "memory" / "l2"))
         schema = pa.schema([
             pa.field("content", pa.string()),
@@ -539,7 +543,7 @@ class TestRemember:
                                "dsh", category="ops")
         assert out["ok"] is True, out
 
-        import lancedb
+        lancedb = pytest.importorskip("lancedb")
         table = lancedb.connect(str(shared.home / "memory" / "l2")).open_table("memories")
         arrow = table.to_arrow()
         assert arrow.column("agent").to_pylist() == ["dsh"]
@@ -552,7 +556,7 @@ class TestRemember:
 
         cli.cmd_remember({}, "家用NAS 192.0.2.62 上重度使用 Docker 部署服务", "dsh")
 
-        import lancedb
+        lancedb = pytest.importorskip("lancedb")
         table = lancedb.connect(str(shared.home / "memory" / "l2")).open_table("memories")
         assert "agent" in [f.name for f in table.schema]
 
@@ -564,7 +568,7 @@ class TestRemember:
         assert out["ok"] is False
         assert out["reason"] == "weak_signal"
 
-        import lancedb
+        lancedb = pytest.importorskip("lancedb")
         table = lancedb.connect(str(shared.home / "memory" / "l2")).open_table("memories")
         assert table.count_rows() == 0
 
@@ -577,7 +581,7 @@ class TestRemember:
         second = cli.cmd_remember({}, fact, "dsh")
         assert second["ok"] is True and second["duplicate"] is True
 
-        import lancedb
+        lancedb = pytest.importorskip("lancedb")
         table = lancedb.connect(str(shared.home / "memory" / "l2")).open_table("memories")
         assert table.count_rows() == 1
 
@@ -610,7 +614,7 @@ class TestRemember:
                                dry_run=True)
         assert out["ok"] is True and out["dry_run"] is True
 
-        import lancedb
+        lancedb = pytest.importorskip("lancedb")
         table = lancedb.connect(str(shared.home / "memory" / "l2")).open_table("memories")
         assert table.count_rows() == 0
 
@@ -695,6 +699,7 @@ class TestVaultScanning:
         assert cli.cmd_kb_get(cfg, "运维笔记") is not None
 
     def test_provenance_sees_notes_outside_the_standard_sections(self, shared):
+        pytest.importorskip("lancedb")
         cfg = {"wiki_dir": str(shared.vault)}
         cli.cmd_kb_add(cfg, "运维笔记", "body", "运维", [], [], None, agent="workbuddy")
         assert cli.cmd_agents(cfg)["agents"]["workbuddy"]["kb_notes"] == 1
@@ -725,12 +730,14 @@ class TestRuntimeReport:
         assert "runtime" in cli._L2_COMMANDS
 
     def test_relocation_is_stated_not_hidden(self, monkeypatch):
+        pytest.importorskip("lancedb")
         monkeypatch.setenv(cli._ORIGINAL_PYTHON_FLAG, "/usr/bin/python3")
         report = cli.runtime_report()
         assert report["requested_interpreter"] == "/usr/bin/python3"
         assert "note" in report
 
     def test_no_relocation_means_no_extra_fields(self, monkeypatch):
+        pytest.importorskip("lancedb")
         monkeypatch.delenv(cli._ORIGINAL_PYTHON_FLAG, raising=False)
         report = cli.runtime_report()
         assert "requested_interpreter" not in report
@@ -836,7 +843,7 @@ class TestProjectScopedRecall:
 
     @staticmethod
     def _seed(home, rows):
-        import lancedb
+        lancedb = pytest.importorskip("lancedb")
 
         l2 = home / "memory" / "l2"
         l2.mkdir(parents=True, exist_ok=True)
@@ -986,7 +993,7 @@ class TestL2SchemaDeclaresProject:
         assert {"source_rowid", "role", "agent", "project"} <= set(names)
 
     def test_open_l2_table_backfills_project_on_a_legacy_table(self, shared):
-        import lancedb
+        lancedb = pytest.importorskip("lancedb")
 
         l2 = shared.home / "memory" / "l2"
         db = lancedb.connect(str(l2))

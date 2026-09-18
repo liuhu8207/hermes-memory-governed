@@ -220,6 +220,7 @@ def _make_kb(tmp_path: Path) -> KnowledgeBase:
 class TestEndToEndRecovery:
     def test_semantic_channel_returns_after_transient_failure(
             self, tmp_path, flaky_embedding):
+        pytest.importorskip("lancedb")
         kb = _make_kb(tmp_path)
         idx = kb._index_get()
 
@@ -248,6 +249,7 @@ class TestEndToEndRecovery:
         assert snap["reprobe_count"] == 1, "自愈这件事要在检索结果里可见"
 
     def test_recovery_is_idempotent_after_healing(self, tmp_path, flaky_embedding):
+        pytest.importorskip("lancedb")
         kb = _make_kb(tmp_path)
         idx = kb._index_get()
         flaky_embedding.arm(True)
@@ -258,6 +260,7 @@ class TestEndToEndRecovery:
         assert idx.reprobe_count == 1, "已可用后不得再重探"
 
     def test_stats_reports_reprobe_count(self, tmp_path, flaky_embedding):
+        pytest.importorskip("lancedb")
         kb = _make_kb(tmp_path)
         idx = kb._index_get()
         assert kb.stats()["index_reprobe_count"] == 0

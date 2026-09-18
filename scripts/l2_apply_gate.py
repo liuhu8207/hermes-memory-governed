@@ -34,8 +34,6 @@ import sys
 from pathlib import Path
 from typing import List
 
-import lancedb
-
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from plugin.memory_governed._sync import (  # noqa: E402
@@ -105,6 +103,13 @@ def main(argv: List[str] | None = None) -> int:
                     help="额外剔除的内容子串（人工补刀），可重复")
     ap.add_argument("--dry-run", action="store_true")
     args = ap.parse_args(argv)
+
+    # Imported here rather than at module scope: this module's gate logic
+    # (`admits`, and the verdicts re-exported from `_sync`) is pure and is used
+    # by tests on installs that have no vector backend. A module-level import
+    # made the whole file unimportable there — the CI `core` leg installs no
+    # lancedb on purpose, and that leg went red for days because of it.
+    import lancedb
 
     db = lancedb.connect(args.l2_dir)
     table = db.open_table(args.table)

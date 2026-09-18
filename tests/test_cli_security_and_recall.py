@@ -28,7 +28,6 @@ import sys
 import types
 from pathlib import Path
 
-import pyarrow as pa
 import pytest
 
 import memory_cli as cli
@@ -428,6 +427,7 @@ class TestRefusalSchemaIsUniform:
     ])
     def test_every_cli_refusal_carries_both_keys(self, store, monkeypatch,
                                                  capsys, argv):
+        pytest.importorskip("lancedb")
         monkeypatch.setattr(sys, "argv", ["memory_cli.py", *argv])
         rc = cli.main()
         payload = json.loads(capsys.readouterr().out)  # raises on a traceback
@@ -519,7 +519,7 @@ _OFF_TOPIC_QUERY = "推荐一本讲罗马历史的书"
 
 
 def _seed(home, texts) -> None:
-    import lancedb
+    lancedb = pytest.importorskip("lancedb")
 
     l2 = home / "memory" / "l2"
     l2.mkdir(parents=True, exist_ok=True)
@@ -731,7 +731,7 @@ def _fake_vec(text: str) -> list:
 
 
 def _seed_vectors(home, texts) -> None:
-    import lancedb
+    lancedb = pytest.importorskip("lancedb")
 
     l2 = home / "memory" / "l2"
     l2.mkdir(parents=True, exist_ok=True)
@@ -921,6 +921,7 @@ class TestColdStart:
     """
 
     def test_remember_bootstraps_a_fresh_store(self, store, monkeypatch):
+        pytest.importorskip("lancedb")
         _install_fake_embedding(monkeypatch)
         out = cli.cmd_remember(
             {}, "家用NAS 192.0.2.62 上重度使用 Docker 部署服务", "dsh")
@@ -935,7 +936,7 @@ class TestColdStart:
         _install_fake_embedding(monkeypatch)
         cli.cmd_remember(
             {}, "家用NAS 192.0.2.62 上重度使用 Docker 部署服务", "dsh")
-        import lancedb
+        lancedb = pytest.importorskip("lancedb")
 
         db = lancedb.connect(str(store.home / "memory" / "l2"))
         cols = [f.name for f in db.open_table("memories").schema]
@@ -944,6 +945,7 @@ class TestColdStart:
         assert "vector" in cols
 
     def test_a_second_write_does_not_recreate_the_table(self, store, monkeypatch):
+        pytest.importorskip("lancedb")
         # Idempotent: the second call finds the table and must not report a
         # cold start, nor rebuild it.
         _install_fake_embedding(monkeypatch)
@@ -958,6 +960,7 @@ class TestColdStart:
     def test_the_created_width_is_named_because_it_cannot_be_changed(self,
                                                                     store,
                                                                     monkeypatch):
+        pytest.importorskip("lancedb")
         # The vector column's dimension is fixed by the first write. A fresh
         # home with no config cold-starts on the local 512-d model; configuring
         # a 1024-d API backend months later does not widen it, it turns every
@@ -984,10 +987,11 @@ class TestColdStart:
         assert "vector_dim_note" not in second
 
     def test_a_read_does_not_conjure_a_table(self, store):
+        pytest.importorskip("lancedb")
         # open_l2_table stays read-only unless the caller passes a dimension:
         # `agents` must not create a store just because it was asked to report.
         cli.cmd_agents(store.cfg)
-        import lancedb
+        lancedb = pytest.importorskip("lancedb")
 
         db = lancedb.connect(str(store.home / "memory" / "l2"))
         assert "memories" not in [t.name for t in db.list_tables().tables]
@@ -1009,6 +1013,7 @@ class TestL2ProvenanceColumns:
         assert {"source_rowid", "role", "agent", "project"} <= names
 
     def test_fields_carry_the_declared_types(self):
+        pytest.importorskip("lancedb")
         fields = {f.name: str(f.type) for f in l2_provenance_fields()}
         assert fields["role"] == "string"
         assert fields["agent"] == "string"
@@ -1017,7 +1022,8 @@ class TestL2ProvenanceColumns:
 
     def test_remember_succeeds_on_a_table_without_the_role_column(
             self, store, monkeypatch, dim=8):
-        import lancedb
+        lancedb = pytest.importorskip("lancedb")
+        pa = pytest.importorskip("pyarrow")
 
         real = cli.plugin_module
 

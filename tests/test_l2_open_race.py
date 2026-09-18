@@ -102,7 +102,7 @@ def no_backoff(monkeypatch):
 
 
 def _wire(monkeypatch, db):
-    import lancedb
+    lancedb = pytest.importorskip("lancedb")
 
     monkeypatch.setattr(lancedb, "connect", lambda _path: db)
     return db

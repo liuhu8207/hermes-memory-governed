@@ -96,7 +96,7 @@ def box(tmp_path_factory):
 
 def _rows(box):
     """Read the sandbox store directly — the reply is not the evidence."""
-    import lancedb
+    lancedb = pytest.importorskip("lancedb")
     db = lancedb.connect(str(box.home / "memory" / "l2"))
     lister = getattr(db, "list_tables", None)
     listing = lister() if callable(lister) else db.table_names()
