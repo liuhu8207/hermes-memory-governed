@@ -89,7 +89,9 @@ def test_short_audio_does_one_call_and_never_splits(tmp_path, monkeypatch):
 
 
 def test_unknown_duration_falls_back_to_single_call(tmp_path, monkeypatch):
-    audio = tmp_path / "weird.bin"
+    # 用「已接受」的容器，专测「探测不到时长 → 单次」这条路，
+    # 避免被容器归一化分支抢先（那条另有专门的测试）。
+    audio = tmp_path / "weird.m4a"
     audio.write_bytes(b"x")
     cfg = GovernedMemoryConfig()
 
@@ -157,10 +159,11 @@ def test_one_chunk_fails_keeps_the_rest_and_reports_the_index(tmp_path, monkeypa
     r = _ingest.transcribe_audio_auto(str(audio), cfg)
     assert r["ok"] is False
     assert r["partial"] is True
-    assert r["chunks_failed"] == [1]
+    # 1-based：chunk_0001 是第 2 段
+    assert r["chunks_failed"] == [2]
     assert "part-0" in r["text"] and "part-2" in r["text"]
     assert "part-1" not in r["text"]
-    assert "1" in r["error"] and "502" in r["error"]
+    assert "chunk 2/3 failed" in r["error"] and "502" in r["error"]
     assert r["chunks"] == 3
 
 
@@ -175,7 +178,22 @@ def test_all_chunks_fail_yields_empty_text(tmp_path, monkeypatch):
     assert r["ok"] is False
     assert r["partial"] is True
     assert r["text"] == ""
-    assert r["chunks_failed"] == [0, 1, 2]
+    assert r["chunks_failed"] == [1, 2, 3]  # 1-based
+
+
+def test_split_producing_no_chunks_is_not_a_success(tmp_path, monkeypatch):
+    """一个没有内容的成功报告正是本项目反复被坑的那类静默失败。"""
+    audio, cfg = _long_setup(tmp_path, monkeypatch, duration=418.0,
+                             chunk_minutes=1.0, n_chunks=3)
+    monkeypatch.setattr(_ingest, "split_audio", lambda *a, **k: [])
+    monkeypatch.setattr(_ingest, "transcribe_audio",
+                        lambda path, config, timeout=180.0: _ok("x"))
+
+    r = _ingest.transcribe_audio_auto(str(audio), cfg)
+    assert r["ok"] is False
+    assert r["chunks"] == 0
+    assert r["text"] == ""
+    assert r["error"].strip(), "空片段必须带非空 error"
 
 
 def test_ffmpeg_missing_and_long_audio_names_ffmpeg_not_timeout(tmp_path, monkeypatch):
@@ -248,6 +266,100 @@ def test_temp_directory_is_removed_even_when_splitting_fails(tmp_path, monkeypat
     assert "split failed" in r["error"]
     assert "dir" in created
     assert not Path(created["dir"]).exists()
+
+
+# ---------------------------------------------------------------------------
+# container normalisation (_AUDIO_MIME 之外的容器，无论长短)
+# ---------------------------------------------------------------------------
+
+def test_empty_path_is_a_structured_error(tmp_path):
+    cfg = GovernedMemoryConfig()
+    for blank in ("", "   ", "\t\n"):
+        r = _ingest.transcribe_audio_auto(blank, cfg)
+        assert r["ok"] is False
+        assert "no path given" in r["error"]
+
+
+def test_non_native_container_is_transcoded_even_when_short(tmp_path, monkeypatch):
+    """短 .amr 也必须归一化 —— 端点解不了 amr，原文上传只会 HTTP 400。"""
+    amr = tmp_path / "voice.amr"
+    amr.write_bytes(b"#!AMR\n fake")
+    cfg = GovernedMemoryConfig()
+    cfg.asr.chunk_minutes = 10.0
+
+    converted = tmp_path / "voice.mp3"
+    converted.write_bytes(b"fake-mp3")
+    monkeypatch.setattr(_ingest, "_ffmpeg_tool", lambda name: "ffmpeg")
+
+    transcode_calls = []
+
+    def _fake_transcode(src, out_dir):
+        transcode_calls.append(str(src))
+        return converted
+
+    monkeypatch.setattr(_ingest, "_transcode_to_mp3", _fake_transcode)
+    # 转出来的 mp3 是「已接受」容器；短 → 单次
+    monkeypatch.setattr(_ingest, "probe_audio_duration", lambda p: 11.4)
+
+    seen = []
+
+    def _fake_transcribe(path, config, timeout=180.0):
+        seen.append(str(path))
+        return _ok("hello from amr")
+
+    monkeypatch.setattr(_ingest, "transcribe_audio", _fake_transcribe)
+
+    def _boom(*a, **k):
+        raise AssertionError("短录音不应触发拆段")
+
+    monkeypatch.setattr(_ingest, "split_audio", _boom)
+
+    r = _ingest.transcribe_audio_auto(str(amr), cfg)
+    assert r["ok"] is True
+    assert r["text"] == "hello from amr"
+    assert transcode_calls == [str(amr)]
+    # 转写用的是转出来的 mp3，不是原始 amr
+    assert seen == [str(converted)]
+
+
+def test_non_native_container_without_ffmpeg_is_refused(tmp_path, monkeypatch):
+    amr = tmp_path / "voice.amr"
+    amr.write_bytes(b"#!AMR\n fake")
+    cfg = GovernedMemoryConfig()
+    monkeypatch.setattr(_ingest, "_ffmpeg_tool", lambda name: None)
+
+    def _boom(*a, **k):
+        raise AssertionError("ffmpeg 缺失时绝不能上传原文")
+
+    monkeypatch.setattr(_ingest, "transcribe_audio", _boom)
+
+    r = _ingest.transcribe_audio_auto(str(amr), cfg)
+    assert r["ok"] is False
+    assert ".amr" in r["error"]
+    assert "ffmpeg" in r["error"].lower()
+
+
+def test_non_native_container_that_ffmpeg_cannot_decode_is_refused(tmp_path, monkeypatch):
+    """这正是一个 .silk 的结果：结构化错误，绝不是裸 HTTP 400 或静默成功。"""
+    silk = tmp_path / "voice.silk"
+    silk.write_bytes(b"\x02#!SILK_V3 fake")
+    cfg = GovernedMemoryConfig()
+    monkeypatch.setattr(_ingest, "_ffmpeg_tool", lambda name: "ffmpeg")
+
+    def _fake_transcode(src, out_dir):
+        raise RuntimeError("ffmpeg failed transcoding voice.silk: Invalid data found")
+
+    monkeypatch.setattr(_ingest, "_transcode_to_mp3", _fake_transcode)
+
+    def _boom(*a, **k):
+        raise AssertionError("无法解码时绝不能上传原文")
+
+    monkeypatch.setattr(_ingest, "transcribe_audio", _boom)
+
+    r = _ingest.transcribe_audio_auto(str(silk), cfg)
+    assert r["ok"] is False
+    assert ".silk" in r["error"]
+    assert r["error"].strip()
 
 
 # ---------------------------------------------------------------------------

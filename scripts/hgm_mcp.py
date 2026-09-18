@@ -169,8 +169,10 @@ TOOLS = [
         "description": (
             "Transcribe a local audio file (a meeting recording or voice memo) to "
             "text. Long files are split automatically, so an hour-long recording "
-            "works, and formats ffmpeg can decode (.amr/.silk included) are "
-            "normalised first. Returns the raw transcript and stores nothing — "
+            "works, and any container outside the accepted audio list (e.g. .amr) "
+            "is transcoded to mp3 first when ffmpeg is available — except .silk, "
+            "which this ffmpeg build cannot decode and which is therefore "
+            "unsupported. Returns the raw transcript and stores nothing — "
             "summarise it yourself and persist the distilled notes with "
             "hgm_kb_add."),
         "inputSchema": _schema(

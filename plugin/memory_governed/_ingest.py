@@ -406,8 +406,9 @@ def split_audio(path: str, chunk_seconds: float, out_dir: Any) -> List[Path]:
     """把音频切成 ``chunk_seconds`` 秒的 mp3 片段，返回播放顺序的路径列表。
 
     每段都用 ffmpeg **重新编码为 mp3**（``-c:a libmp3lame -b:a 64k``）。这一步
-    是刻意的、承重的：它把任何 ffmpeg 能解码的输入归一化成 ASR 端点接受的格式，
-    顺带覆盖当前不在 :data:`_AUDIO_MIME` 里的 ``.amr`` / ``.silk`` 录音。
+    是刻意的、承重的：它把任何 ffmpeg 能解码的输入归一化成 ASR 端点接受的格式。
+    （``.silk`` 不在其列 —— 本机 ffmpeg 既无 silk demuxer 也无 silk 解码器，无法
+    支持；不受支持的容器在 :func:`transcribe_audio_auto` 里显式报错，绝不上传原文。）
 
     仅当 ffmpeg 本身失败时抛 ``RuntimeError``（调用方会转成 error 信封）。
     """
@@ -451,6 +452,44 @@ def split_audio(path: str, chunk_seconds: float, out_dir: Any) -> List[Path]:
     return chunks
 
 
+def _transcode_to_mp3(src: Any, out_dir: Any) -> Path:
+    """把任意 ffmpeg 可解码的输入**整体**转成一个 mp3。
+
+    用于把 :data:`_AUDIO_MIME` 之外的容器（如 ``.amr``）归一化成 ASR 端点接受的
+    格式。之所以必须做：端点**根本没有 amr 解码器** —— 原文上传（不论
+    ``audio/amr`` / ``audio/amr-nb`` / ``application/octet-stream``）一律 HTTP 400。
+    归一化与长度无关，所以短录音同样要走这里（旧的实现只在拆段时才归一化，于是
+    几秒钟的微信/QQ 语音反而必失败）。
+
+    仅当 ffmpeg 缺失或失败时抛 ``RuntimeError``。
+    """
+    ffmpeg = _ffmpeg_tool("ffmpeg")
+    if not ffmpeg:
+        raise RuntimeError(
+            "ffmpeg not found: required to normalise this container "
+            "(install ffmpeg or set HGM_FFMPEG)")
+
+    source = Path(str(src))
+    out = Path(out_dir)
+    out.mkdir(parents=True, exist_ok=True)
+    dst = out / (source.stem + ".mp3")
+    try:
+        proc = subprocess.run(
+            [ffmpeg, "-hide_banner", "-loglevel", "error", "-nostdin",
+             "-i", str(source), "-vn",
+             "-c:a", "libmp3lame", "-b:a", "64k", "-y", str(dst)],
+            capture_output=True, text=True, timeout=600,
+        )
+    except Exception as e:  # noqa: BLE001
+        raise RuntimeError(f"ffmpeg could not run: {e}") from e
+    if proc.returncode != 0 or not dst.exists():
+        detail = (proc.stderr or "").strip().splitlines()
+        tail = detail[-1] if detail else "unknown error"
+        raise RuntimeError(
+            f"ffmpeg failed transcoding {source.name}: {tail[:200]}")
+    return dst
+
+
 def _positive_float(value: Any, default: float) -> float:
     """转成正浮点，否则退回 ``default``；绝不抛异常。"""
     try:
@@ -463,50 +502,102 @@ def _positive_float(value: Any, default: float) -> float:
 
 
 def transcribe_audio_auto(path: str, config: Any) -> Dict[str, Any]:
-    """音频 → 转写文本，**长录音自动拆段**。所有工具面的统一入口。
+    """音频 → 转写文本，**容器归一化 + 长录音自动拆段**。所有工具面的统一入口。
 
-    时长在 ``config.asr.chunk_minutes`` 分钟以内（或探测不到时长）时，行为与
-    :func:`transcribe_audio` 完全一致 —— 单次请求，原样返回。
+    两步，顺序固定：
 
-    更长时切成 ``ceil(duration / (chunk_minutes*60))`` 段 mp3，逐段转写后按
-    顺序用 ``"\\n\\n"`` 拼接，最后过一遍 :func:`_truncate`。
+    1. **容器归一化**：``_AUDIO_MIME`` 之外的容器（如 ``.amr``）无论长短都先整体
+       转成 mp3 —— ASR 端点根本无法解码它们，原文上传只会 HTTP 400。短录音同样
+       要归一化（微信/QQ 语音就是几秒的 amr，那才是最常见、也是过去唯一必失败
+       的情形）。ffmpeg 缺失或无法解码该容器时返回结构化错误，绝不上传原文。
+    2. **单次 or 拆段**：时长在 ``config.asr.chunk_minutes`` 分钟以内（或探测不到）
+       时单次请求；更长时切成 ``ceil(duration / (chunk_minutes*60))`` 段 mp3，
+       逐段转写后按顺序用 ``"\\n\\n"`` 拼接，最后过一遍 :func:`_truncate`。
 
-    全部成功才返回 ``ok: True``（附带 ``chunks`` / ``duration_seconds``）。任一段
-    失败则 **绝不报成功**：返回 ``ok: False`` + ``partial: True`` +
-    ``chunks_failed``，并**保留已拿到的文本** —— 因为第 4 段碰到 502 就丢掉整场
-    50 分钟的会议是不可接受的，而假装成功更糟。
+    全部成功**且确实产出了文本**才返回 ``ok: True``。任一段失败则绝不报成功：返回
+    ``ok: False`` + ``partial: True`` + ``chunks_failed``（**1-based**），并保留已
+    拿到的文本 —— 因为第 4 段碰到 502 就丢掉整场 50 分钟的会议是不可接受的，而假装
+    成功更糟。
     """
     asr = getattr(config, "asr", None)
     timeout = _positive_float(getattr(asr, "timeout_seconds", None), 600.0)
     chunk_minutes = _positive_float(getattr(asr, "chunk_minutes", None), 10.0)
     threshold = chunk_minutes * 60.0
 
-    try:
-        duration = probe_audio_duration(path)
-    except Exception as e:  # noqa: BLE001 — 探测绝不该变成一次失败
-        logger.debug("duration probe raised for %s: %s", path, e)
-        duration = None
+    # 空路径：明确报错，而不是退化成对空串的存在性/权限错误
+    raw_path = (path or "").strip()
+    if not raw_path:
+        return {"ok": False, "error": "no path given"}
 
-    # 时长未知或足够短：单次请求，原样返回（保持历史行为）
-    if duration is None or duration <= threshold:
-        return transcribe_audio(path, config, timeout=timeout)
+    src = Path(raw_path)
+    suffix = src.suffix.lower()
 
-    # 长录音：必须有 ffmpeg 才能拆 —— 缺了就说清楚缺什么，而不是等到超时
-    if _ffmpeg_tool("ffmpeg") is None:
-        return {
-            "ok": False,
-            "error": (
-                f"audio is {duration:.0f}s but the split threshold is "
-                f"{threshold:.0f}s and ffmpeg is unavailable to split it; "
-                f"install ffmpeg or set HGM_FFMPEG"),
-        }
-
+    # 临时目录从一开始就建，finally 里每次都清 —— 归一化和拆段共用它，任何提前
+    # 返回（包括错误分支）都不会漏掉清理。
     tmp_dir = tempfile.mkdtemp(prefix="hgm_asr_")
     try:
+        work_path = raw_path
+        if suffix not in _AUDIO_MIME:
+            # 端点解不了的容器：先整体归一化成 mp3（与长度无关）
+            if _ffmpeg_tool("ffmpeg") is None:
+                return {
+                    "ok": False,
+                    "path": str(src),
+                    "error": (
+                        f"unsupported audio container '{suffix or '(none)'}' and "
+                        f"ffmpeg is unavailable to normalise it; install ffmpeg or "
+                        f"set HGM_FFMPEG. Accepted containers: "
+                        f"{', '.join(sorted(_AUDIO_MIME))}"),
+                }
+            try:
+                work_path = str(_transcode_to_mp3(src, tmp_dir))
+            except Exception as e:  # noqa: BLE001
+                return {
+                    "ok": False,
+                    "path": str(src),
+                    "error": (
+                        f"cannot decode '{suffix or '(none)'}' audio "
+                        f"(unsupported by this ffmpeg build?): {e}"),
+                }
+
         try:
-            chunks = split_audio(path, threshold, tmp_dir)
+            duration = probe_audio_duration(work_path)
+        except Exception as e:  # noqa: BLE001 — 探测绝不该变成一次失败
+            logger.debug("duration probe raised for %s: %s", work_path, e)
+            duration = None
+
+        # 时长未知或足够短：单次请求，原样返回（保持历史行为）
+        if duration is None or duration <= threshold:
+            return transcribe_audio(work_path, config, timeout=timeout)
+
+        # 长录音：必须有 ffmpeg 才能拆 —— 缺了就说清楚缺什么，而不是等到超时
+        if _ffmpeg_tool("ffmpeg") is None:
+            return {
+                "ok": False,
+                "path": str(src),
+                "error": (
+                    f"audio is {duration:.0f}s but the split threshold is "
+                    f"{threshold:.0f}s and ffmpeg is unavailable to split it; "
+                    f"install ffmpeg or set HGM_FFMPEG"),
+            }
+
+        try:
+            chunks = split_audio(work_path, threshold, tmp_dir)
         except Exception as e:  # noqa: BLE001
-            return {"ok": False, "error": f"audio split failed: {e}"}
+            return {"ok": False, "path": str(src),
+                    "error": f"audio split failed: {e}"}
+
+        # 拆段却一个片段都没有：绝不报成功（一个没有内容的成功报告正是本项目
+        # 反复被坑的那类静默失败）
+        if not chunks:
+            return {
+                "ok": False,
+                "path": str(src),
+                "text": "",
+                "chunks": 0,
+                "duration_seconds": round(duration, 1),
+                "error": "audio split produced no chunks",
+            }
 
         texts: List[str] = []
         failed: List[tuple] = []
@@ -521,8 +612,9 @@ def transcribe_audio_auto(path: str, config: Any) -> Dict[str, Any]:
 
         text, truncated = _truncate("\n\n".join(texts))
         result: Dict[str, Any] = {
-            "ok": not failed,
-            "path": str(Path((path or "").strip())),
+            # 成功必须同时满足：没有失败段，且确实拿到了文本
+            "ok": (not failed) and bool(texts),
+            "path": str(src),
             "text": text,
             "model": str(getattr(asr, "model", "") or ""),
             "truncated": truncated,
@@ -530,10 +622,13 @@ def transcribe_audio_auto(path: str, config: Any) -> Dict[str, Any]:
             "duration_seconds": round(duration, 1),
         }
         if failed:
+            total = len(chunks)
             result["partial"] = True
-            result["chunks_failed"] = [i for i, _ in failed]
+            # 1-based：chunks_failed:[3] 挨着 chunks:7 会被读成「七个里的第三个」，
+            # 而它其实是第 4 个；字段只给人和读错误的 agent 看，必须人类可读。
+            result["chunks_failed"] = [i + 1 for i, _ in failed]
             result["error"] = "; ".join(
-                f"chunk {i} failed: {err}" for i, err in failed)
+                f"chunk {i + 1}/{total} failed: {err}" for i, err in failed)
         return result
     finally:
         shutil.rmtree(tmp_dir, ignore_errors=True)

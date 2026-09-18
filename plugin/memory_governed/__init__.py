@@ -215,8 +215,10 @@ KB_TRANSCRIBE_SCHEMA = {
     "description": (
         "Transcribe an audio file to text via the configured ASR service "
         "(e.g. SiliconFlow XingChenASR). Long recordings are split automatically "
-        "and transcribed chunk by chunk, so an hour-long meeting works; recordings "
-        "ffmpeg can decode (.amr/.silk included) are normalised to mp3 first. "
+        "and transcribed chunk by chunk, so an hour-long meeting works; any "
+        "container outside the accepted audio list (e.g. .amr) is transcoded to "
+        "mp3 first when ffmpeg is available, except .silk, which this ffmpeg "
+        "build cannot decode and which is therefore unsupported. "
         "Returns the transcript; you (the agent) should then summarize it and "
         "persist via governed_kb_add. Use for meeting recordings or voice memos."
     ),
