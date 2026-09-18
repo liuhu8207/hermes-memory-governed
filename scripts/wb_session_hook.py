@@ -43,7 +43,7 @@ import time
 from pathlib import Path
 
 # Do this before anything can write, or the first line may already be mis-encoded.
-for _stream in (sys.stdout, sys.stderr):
+for _stream in (sys.stdin, sys.stdout, sys.stderr):
     if hasattr(_stream, "reconfigure"):
         try:
             _stream.reconfigure(encoding="utf-8")
