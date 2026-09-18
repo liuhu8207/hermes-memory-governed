@@ -196,10 +196,12 @@ Same shape as a document, and the same three stages — the store owns the first
 - **The endpoint is OpenAI-compatible `/audio/transcriptions`**, configured under
   `asr` in `governed_memory.json` (SiliconFlow `XingChenAGI/XingChenASR-V3.2-Ultra`
   in this deployment).
-- **Natively accepted suffixes** are `.flac .m4a .mp3 .mp4 .ogg .wav .webm`. The
-  WeChat / QQ voice exports (`.amr` / `.silk`) are **not** on that list — yet they
-  work, because each chunk is re-encoded to mp3 through ffmpeg, which normalises
-  any ffmpeg-decodable input into a suffix the endpoint accepts.
+- **Accepted as-is**: `.flac .m4a .mp3 .mp4 .ogg .wav .webm`. **Any other container
+  is transcoded to mp3 first, whenever ffmpeg is available — short files
+  included** — so a WeChat / QQ `.amr` voice note works. **`.silk` is the one
+  exception and is unsupported**: this ffmpeg build has no silk decoder or
+  demuxer, so a `.silk` call returns a structured `ok: false` naming the format.
+  Check `ok` rather than assuming a recording came through.
 - **Long recordings split automatically.** Anything longer than `asr.chunk_minutes`
   (default 10) is cut into chunks and the chunk transcripts are joined in order;
   each request is bounded by `asr.timeout_seconds` (default 600). Both default
