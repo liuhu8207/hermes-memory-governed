@@ -7,6 +7,24 @@ plugin.
 
 > This page uses **placeholder values** on purpose — see the note at the end.
 
+## The usual entry point is a skill, not this file
+
+Most agents on this machine do not find this repository first. They load a
+**skill** — `hgm-shared-memory` — which carries the same contract in a form their
+host knows how to discover. That is measured, not assumed: an agent attaching on
+2026-09-18 read the skill, followed it, and never mentioned this repository.
+
+Two consequences worth knowing:
+
+- **There are two copies of the contract, and both are read.** If you change the
+  contract, change both, or a reader of the copy you missed keeps the old rules.
+  This exact gap is why a doc fix here went unexercised: the agent had already
+  followed the skill before this page was consulted.
+- **The skill is shared by every agent on the machine.** Its own text says so —
+  *"Nothing here is specific to one agent"*. So **never put a per-agent value in
+  it**: an agent name hardcoded there becomes every reader's name, and they will
+  write under it. Per-agent values belong in that agent's own config.
+
 ## The three ways to attach
 
 Pick by what the host supports. They are not alternatives to each other: a single
@@ -90,6 +108,26 @@ unrecognised agent is recorded as `external` — never guessed.** A wrong name i
 worse than a vague one: it puts one agent's facts under another's name, and
 provenance is the only way to tell them apart later.
 
+### Where to declare your name — and where not to
+
+Prefer, in this order:
+
+1. **Your own client config** — an MCP server's `env`, a launch profile, a tool
+   config. This is the right home: the name travels with the client it belongs to.
+2. `--agent <you>` on each call. Correct, just repetitive.
+
+**Not** the shared shell profile (`~/.bashrc`, `~/.zshrc`, a system-wide
+environment variable). Measured hesitation about this is a real signal — an
+agent asked on 2026-09-18 whether to add `export HGM_AGENT=<itself>` to
+`~/.bashrc`. The answer is no, for two reasons:
+
+- **It poisons provenance.** Every process launched from that shell inherits the
+  name — including other agents' processes. The one property the store relies on
+  is that the attribution is *true*.
+- **It often does not apply anyway.** A shell profile is read by interactive
+  shells; a host that spawns a tool without one gets nothing, and the failure is
+  silent — writes land as `external`.
+
 ## What an attaching agent may and may not write
 
 - **L2 facts and KB notes: yes.** `remember` passes a gate that looks at how many
@@ -103,15 +141,35 @@ provenance is the only way to tell them apart later.
 
 ## Verify the attachment
 
+Steps 1–3 prove you can reach the store. **They do not prove the thing you
+actually attached for.** Do 4 as well.
+
 1. `python memory_cli.py health` → `"ok": true`
 2. `python memory_cli.py agents` → your agent name appears (or `external`, if the
    host has no marker)
 3. Write something and read it back:
    `remember "<a fact with a concrete identifier>"` then `recall "<part of it>"`
-4. If hooks are wired: start a fresh session and confirm the injection arrived
-5. If MCP is wired: confirm the host lists the five tools, then confirm a call
+4. **Read something *another agent* wrote, and check the signature comes back.**
+   Pick a topic only the shared store knows — something you have no way to answer
+   from your own context — then look at which agent the hit is attributed to:
+
+   ```bash
+   python memory_cli.py recall "<a topic from another agent's work>" --top-k 5
+   ```
+
+   ⚠️ **A hit with `agent=None` proves nothing about sharing.** Those are legacy
+   rows nobody claimed; finding one only shows you can see the store, which step
+   3 already showed. You are looking for a hit **signed with another agent's
+   name**. Measured: an agent reported "proves cross-agent visibility" from two
+   `agent=None` rows — the check looked passed and had tested nothing.
+5. If hooks are wired: start a fresh session and confirm the injection arrived
+6. If MCP is wired: confirm the host lists the five tools, then confirm a call
    actually happens — a tool that is *listed* and never *called* is the common
    failure, and it is invisible without a log
+
+If step 4 cannot find an attributed fact from anyone else, that is worth saying
+plainly: either nobody else has written anything you would find, or the two of
+you are not actually sharing a store.
 
 ## Note on placeholders
 
