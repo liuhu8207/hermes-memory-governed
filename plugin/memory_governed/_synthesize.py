@@ -17,9 +17,10 @@ from __future__ import annotations
 
 import json
 import logging
-import os
 import re
 from typing import Any, Dict, List
+
+from ._config import env_secret
 
 logger = logging.getLogger(__name__)
 
@@ -193,7 +194,7 @@ def synthesize_notes(
         return []
 
     api_key_env = str(getattr(syn, "api_key_env", "") or "")
-    api_key = os.environ.get(api_key_env, "") if api_key_env else ""
+    api_key = env_secret(api_key_env)
     if not api_key:
         logger.warning("synthesis api key env not set: %s; skipping", api_key_env)
         return []

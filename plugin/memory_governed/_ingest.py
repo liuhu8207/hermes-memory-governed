@@ -38,6 +38,8 @@ import tempfile
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
+from ._config import env_secret
+
 logger = logging.getLogger(__name__)
 
 #: 摄入内容的最大字符数（超长截断，避免爆 agent context；归纳用原文更优，
@@ -287,7 +289,7 @@ def transcribe_audio(path: str, config: Any, timeout: float = 180.0) -> Dict[str
         return {"ok": False, "error": "ASR not configured (asr.base_url / asr.model)"}
 
     api_key_env = str(getattr(asr, "api_key_env", "") or "")
-    api_key = os.environ.get(api_key_env, "") if api_key_env else ""
+    api_key = env_secret(api_key_env)
     if not api_key:
         return {"ok": False, "error": f"ASR api key env not set: {api_key_env}"}
 
@@ -361,7 +363,7 @@ def _transcribe_chat_audio(path: str, config: Any, timeout: float) -> Dict[str, 
         return {"ok": False, "error": "ASR not configured (asr.base_url / asr.model)"}
 
     api_key_env = str(getattr(asr, "api_key_env", "") or "")
-    api_key = os.environ.get(api_key_env, "") if api_key_env else ""
+    api_key = env_secret(api_key_env)
     if not api_key:
         return {"ok": False, "error": f"ASR api key env not set: {api_key_env}"}
 

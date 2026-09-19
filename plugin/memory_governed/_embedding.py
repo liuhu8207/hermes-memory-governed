@@ -27,10 +27,10 @@ keeps existing vectors usable. Switching to a DIFFERENT model requires
 from __future__ import annotations
 
 import logging
-import os
 import threading
 from typing import TYPE_CHECKING, Any, List, Optional, Protocol
 
+from ._config import env_secret
 from ._text import sanitize_utf8
 
 if TYPE_CHECKING:  # pragma: no cover - 仅供类型检查，避免运行时循环导入
@@ -346,7 +346,7 @@ class EmbeddingService:
         provider = str(getattr(embedding, "provider", "") or "")
         base_url = str(getattr(embedding, "base_url", "") or "")
         api_key_env = str(getattr(embedding, "api_key_env", "") or "")
-        api_key = os.environ.get(api_key_env, "") if api_key_env else ""
+        api_key = env_secret(api_key_env)
         if provider and base_url and api_key:
             self._api_base_url = base_url.rstrip("/")
             self._api_key = api_key
@@ -512,7 +512,7 @@ class EmbeddingService:
             str(getattr(embedding, "base_url", "") or ""),
             str(getattr(embedding, "model", "") or ""),
             api_key_env,
-            os.environ.get(api_key_env, "") if api_key_env else "",
+            env_secret(api_key_env),
         )
 
     @staticmethod
