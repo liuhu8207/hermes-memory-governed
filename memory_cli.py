@@ -875,7 +875,7 @@ def _l2_semantic_hits(query: str, top_k: int, project: str = "",
                                 "vector column, so no row can be matched by "
                                 "meaning")
         limit = max(int(top_k or 0), 1)
-        search = table.search(vector).metric("cosine")
+        search = table.search(vector, vector_column_name="vector").metric("cosine")
         prefiltered = False
         if project:
             try:

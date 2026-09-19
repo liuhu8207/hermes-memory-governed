@@ -398,7 +398,7 @@ class RecallEngine:
         """
         try:
             query_vec = self._embed_fn(query)
-            search = (self._l2_store.search(query_vec)
+            search = (self._l2_store.search(query_vec, vector_column_name="vector")
                       .metric("cosine"))
             limit = int(self._config.recall.l2_max_results)
             prefilt = None

@@ -177,7 +177,9 @@ class _FakeL2Store:
         self._allow_prefilter = allow_prefilter
         self.last_search: Optional[_FakeSearch] = None
 
-    def search(self, _vec) -> _FakeSearch:
+    def search(self, _vec, vector_column_name=None) -> _FakeSearch:
+        # 桩必须跟真 LanceDB 的签名一致：生产代码会显式传 vector_column_name
+        # 来指定向量列（不传时真后端会抛错，而那个错会被降级逻辑吞掉成空结果）。
         self.last_search = _FakeSearch(self._rows, allow_prefilter=self._allow_prefilter)
         return self.last_search
 

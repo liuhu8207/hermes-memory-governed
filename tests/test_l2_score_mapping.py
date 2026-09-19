@@ -77,7 +77,9 @@ class _FakeLanceTable:
         self._rows = list(rows)
         self.calls: List[tuple] = []
 
-    def search(self, vector: Any) -> _FakeQueryBuilder:
+    def search(self, vector: Any, vector_column_name: str | None = None) -> _FakeQueryBuilder:
+        # 同 test_project_scope：桩要接受生产代码显式传的 vector_column_name，
+        # 否则抛出的 TypeError 会被降级逻辑吞成"空结果"，测试就变成假失败。
         self.calls.append(("search", vector))
         return _FakeQueryBuilder(self._rows, self.calls)
 
