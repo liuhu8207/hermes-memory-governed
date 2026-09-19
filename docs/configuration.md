@@ -214,7 +214,24 @@ Format and normalisation:
 | GOVERNED_L2_DB_PATH | Override LanceDB path |
 | GOVERNED_L3_DB_PATH | Override SQLite path |
 | GOVERNED_L4_PERSONA_PATH | Override persona.md path |
+| GOVERNED_L4_META_PATH | Override persona_meta.json path |
+| GOVERNED_BRIDGE_DIR | Override Scope Recall bridge output dir |
 | GOVERNED_TENCENT_ENABLED | Enable Tencent extraction |
 | LLM_API_KEY | LLM API key for extraction |
 | LLM_BASE_URL | LLM base URL |
 | LLM_MODEL | LLM model name |
+
+## Remaining Config Sections — Field Inventory
+
+This is a field inventory awaiting a proper write-up: names and defaults are
+taken mechanically from `_config.py`, with no behavioural interpretation, and
+`—` marks a value with no default visible in code.
+
+| Section | Fields (`name = default`) |
+|---------|---------------------------|
+| `kb` | `top_k=10`, `min_score=0.0`, `semantic_enabled=True`, `keyword_enabled=True`, `confidence_threshold=0.7`, `autolink_related=True`, `recall_hint_enabled=True`, `recall_min_score=0.0`, `recall_min_kw_score=0.0`, `recall_max_notes=3` |
+| `reranking` | `provider=""`, `api_key_env=""`, `base_url=""`, `model=""`, `top_n=10` |
+| `synthesis` | `enabled=False`, `provider=""`, `base_url=""`, `api_key_env=""`, `model=""`, `max_candidates=5`, `require_durable_signal=True` |
+| `tencent_extract` | `enabled=False`, `confidence_threshold=0.5`, `max_candidates_per_turn=5`, `llm_api_key=""`, `llm_base_url=""`, `llm_model=""` |
+| `persona` | `incremental=True`, `full_refresh_cron="0 9 * * *"`, `incremental_interval_minutes=30` |
+| `mermaid_compress` | `enabled=False`, `canvas_max_tokens=500` |
