@@ -47,6 +47,17 @@ Location: `$HERMES_HOME/governed_memory.json`
     "base_url": "",
     "api_key_env": "",
     "model": ""
+  },
+  "asr": {
+    "provider": "siliconflow",
+    "api_key_env": "SILICONFLOW_API_KEY",
+    "base_url": "https://api.siliconflow.cn/v1",
+    "model": "XingChenAGI/XingChenASR-V3.2-Ultra",
+    "language": "",
+    "api_style": "transcriptions",
+    "timeout_seconds": 600,
+    "chunk_minutes": 10,
+    "max_encoded_bytes": 10000000
   }
 }
 ```
@@ -138,6 +149,59 @@ L2 语义检索需要一个 embedding 后端。系统按以下优先级选择，
   `vector_dim_mismatch` 告警。覆盖目标与后端一致：API 场景覆盖 `embedding.dimensions`，
   本地场景覆盖 `vector.dim`。建表始终用实际探测维度，因此 API 场景下 `vector.dim`
   （本地默认 512）不会被 API 的实际维度污染。
+
+## ASR Config
+
+Audio ingestion calls a speech-to-text endpoint; everything lives under `asr`. The
+two API shapes are selected by `api_style`.
+
+```json
+"asr": {
+  "provider": "siliconflow",
+  "api_key_env": "SILICONFLOW_API_KEY",
+  "base_url": "https://api.siliconflow.cn/v1",
+  "model": "XingChenAGI/XingChenASR-V3.2-Ultra",
+  "language": "",
+  "api_style": "transcriptions",
+  "timeout_seconds": 600,
+  "chunk_minutes": 10,
+  "max_encoded_bytes": 10000000
+}
+```
+
+| Key | Default | Description |
+|-----|---------|-------------|
+| provider | "" | **Label only** — nothing dispatches on it. Adding a provider is a config change (`base_url` / `model` / `api_key_env` / `api_style`), never a code change. |
+| api_key_env | "" | **Name** of the environment variable that holds the key (not the key itself). It is read with `os.environ.get`, so the value must be in the **process environment** of whatever runs the tool — a key that lives only in a dotenv file is not visible to every caller. |
+| base_url | "" | Service root that holds the audio / chat endpoint. |
+| model | "XingChenAGI/XingChenASR-V3.2-Ultra" | ASR model name. |
+| language | "" | Empty = auto-detect. An explicit code such as `"zh"` can improve Chinese transcription. |
+| api_style | "transcriptions" | `transcriptions` or `chat_audio` — see below. An unknown or empty value falls back to `transcriptions` with a warning; it never raises. |
+| timeout_seconds | 600 | Per-request ceiling for a single transcription call. Applies to both shapes. |
+| chunk_minutes | 10 | A recording longer than this is split into chunks; the chunk transcripts are joined in order. Applies to both shapes. |
+| max_encoded_bytes | 10000000 | Cap on the base64 payload, `chat_audio` only. Going over returns an error that names the limit and tells you to lower `chunk_minutes` — it does **not** truncate silently and does **not** shrink the chunks for you. |
+
+### API styles
+
+| `api_style` | Endpoint | Transcript |
+|-------------|----------|------------|
+| `transcriptions` (default) | `POST {base_url}/audio/transcriptions` (multipart upload) | top-level `text` |
+| `chat_audio` | `POST {base_url}/chat/completions`, audio inline as a base64 **data URL** | `choices[0].message.content` (there is no top-level `text`) |
+
+`chat_audio` is for a chat-completions endpoint that is "OpenAI-SDK compatible" but
+has **no** audio endpoint. For that shape `language` goes in a top-level
+`asr_options` object.
+
+Format and normalisation:
+
+- `chat_audio` **always** transcodes the source to mp3 first, whatever the input
+  format, so any ffmpeg-decodable input works there.
+- For `transcriptions`, a container outside the accepted list
+  (`.flac .m4a .mp3 .mp4 .ogg .wav .webm`) is transcoded to mp3 first when ffmpeg is
+  available — **except `.silk`, which this ffmpeg build cannot decode and which is
+  therefore unsupported**.
+- **A partial result is not a success:** if some chunks fail you get `ok: false`
+  plus the text that was obtained. Check `ok`.
 
 ## Environment Variables
 
