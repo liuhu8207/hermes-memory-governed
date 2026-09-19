@@ -184,14 +184,22 @@ class KnowledgeConfig:
 class AsrConfig:
     """Speech-to-text (ASR) config for audio ingestion.
 
-    OpenAI 兼容的 ``/audio/transcriptions`` 端点（默认硅基流动
-    XingChenAGI/XingChenASR-V3.2-Ultra，多语言含中文）。
+    支持两种接口风格（``api_style``）：
+
+    * ``"transcriptions"``（默认）：OpenAI 兼容的 ``/audio/transcriptions``（默认
+      硅基流动 XingChenAGI/XingChenASR-V3.2-Ultra，多语言含中文）。
+    * ``"chat_audio"``：非 audio 兼容的 chat-completions 端点，音频以 base64 放进
+      ``input_audio`` 内容块（如小米 MiMo ``mimo-v2.5-asr``，其
+      ``/audio/transcriptions`` 返回 404）。见 ``_ingest._transcribe_chat_audio``。
     """
     provider: str = ""           # "siliconflow"（任意标识）
     api_key_env: str = ""        # 环境变量名（复用 SILICONFLOW_API_KEY）
     base_url: str = ""           # 如 https://api.siliconflow.cn/v1
     model: str = "XingChenAGI/XingChenASR-V3.2-Ultra"
     language: str = ""           # 空 = auto；显式 "zh" 可提升中文转写
+    #: 接口风格：``"transcriptions"`` | ``"chat_audio"``。未知/空值会退回
+    #: ``"transcriptions"``（告警，绝不抛异常，见 ``_validate_api_style``）。
+    api_style: str = "transcriptions"
     #: 单次转写请求的超时上限（秒）。实测该 ASR 端点约 6.7~8.3 秒/音频分钟，
     #: 旧的硬编码 180s 让约 25 分钟以上的录音必然超时；拆段（见
     #: ``_ingest.split_audio``）后每段都远低于此值。
@@ -199,6 +207,10 @@ class AsrConfig:
     #: 超过这个分钟数就自动拆段转写。0 或负数属于脏配置 —— 会退回默认值，
     #: 绝不因此抛异常（见 ``_validate_positive_asr_fields``）。
     chunk_minutes: float = 10.0
+    #: ``chat_audio`` 风格下 base64 载荷的字节上限（MiMo 的上限是 10 MB）。
+    #: 超限时显式报错并要求调低 ``chunk_minutes``，绝不静默截断。正整数校验，
+    #: 脏值退回默认、绝不抛异常。
+    max_encoded_bytes: int = 10_000_000
 
 
 @dataclass
@@ -288,6 +300,7 @@ def load_governed_config(hermes_home: str | Path) -> GovernedMemoryConfig:
 
     _validate_numeric_fields(config)
     _validate_positive_fields(config)
+    _validate_api_style(config)
 
     # Env var overrides (backward compat)
     _apply_env_overrides(config)
@@ -370,15 +383,34 @@ _NUMERIC_FIELDS = {
     "embedding": ["dimensions"],
     "kb": ["top_k", "min_score", "recall_min_score", "recall_min_kw_score",
            "recall_max_notes"],
-    "asr": ["timeout_seconds", "chunk_minutes"],
+    "asr": ["timeout_seconds", "chunk_minutes", "max_encoded_bytes"],
 }
 
-#: 必须为正的数值字段（超时 / 拆段阈值）。0 或负数不是「关闭功能」而是脏配置：
-#: 0 会让拆段永不触发（回到会超时的老路），或让单次请求没有上限。按本文件一贯
-#: 做法 —— 告警并回落默认值，绝不抛异常。
+#: 必须为正的数值字段（超时 / 拆段阈值 / base64 上限）。0 或负数不是「关闭功能」
+#: 而是脏配置：0 会让拆段永不触发（回到会超时的老路），或让单次请求没有上限，
+#: 或让 base64 上限为 0 从而永远拒绝任何请求。按本文件一贯做法 —— 告警并回落
+#: 默认值，绝不抛异常。
 _POSITIVE_FIELDS = {
-    "asr": ["timeout_seconds", "chunk_minutes"],
+    "asr": ["timeout_seconds", "chunk_minutes", "max_encoded_bytes"],
 }
+
+#: ``asr.api_style`` 的合法取值。未知/空值退回 ``"transcriptions"``。
+_ASR_API_STYLES = ("transcriptions", "chat_audio")
+
+
+def _validate_api_style(config: GovernedMemoryConfig) -> None:
+    """Reset an unknown/empty ``asr.api_style`` to ``"transcriptions"`` (never raises)."""
+    asr = getattr(config, "asr", None)
+    if asr is None:
+        return
+    style = getattr(asr, "api_style", None)
+    if style in _ASR_API_STYLES:
+        return
+    logger.warning(
+        "Config asr.api_style = %r is not one of %s — reset to 'transcriptions'",
+        style, ", ".join(_ASR_API_STYLES),
+    )
+    asr.api_style = "transcriptions"
 
 
 def _validate_positive_fields(config: GovernedMemoryConfig) -> None:

@@ -15,14 +15,18 @@
 - ``read_file``: 本地文件 → 文本（txt/md/pdf/docx；pdf/docx 依赖可选）
 - ``transcribe_audio``: 音频 → 转写文本（ASR API，OpenAI 兼容
   ``/audio/transcriptions``，默认硅基流动 XingChenASR）
+- ``_transcribe_chat_audio``: 另一种风格的兄弟原语 —— chat-completions 端点，音频
+  以 base64 ``input_audio`` 传入（如小米 MiMo）；由 ``config.asr.api_style`` 选择
 - ``transcribe_audio_auto``: 上面的封装，**长录音自动拆段**再逐段转写并拼接，
-  结果按段合并（部分失败时保留已拿到的文本）—— 所有工具面都调它。
+  结果按段合并（部分失败时保留已拿到的文本）—— 所有工具面都调它。它通过
+  ``_transcribe_one`` 按 ``asr.api_style`` 分派，故两种风格共享拆段/归一化机制。
 
 统一返回结构 ``{ok: bool, ..., error?: str}``，方便工具层直接透传。
 """
 
 from __future__ import annotations
 
+import base64
 import html as _html
 import logging
 import math
@@ -332,6 +336,150 @@ def transcribe_audio(path: str, config: Any, timeout: float = 180.0) -> Dict[str
     }
 
 
+def _transcribe_chat_audio(path: str, config: Any, timeout: float) -> Dict[str, Any]:
+    """音频 → 转写文本（chat-completions + ``input_audio``，如小米 MiMo）。
+
+    与 :func:`transcribe_audio` 的关键差别：这类端点**不是** OpenAI audio 兼容的，
+    ``/audio/transcriptions`` 直接 404。转写走 ``/chat/completions``，音频以 base64
+    **data URL** 放进 user 消息的 ``input_audio`` 内容块，文本在
+    ``choices[0].message.content``（没有顶层 ``text``）。language 放在**顶层**
+    ``asr_options``，留空表示自动识别。
+
+    任何输入都**先整体转成 mp3**（无条件，复用 :func:`_transcode_to_mp3`）：mp3 是
+    端点接受的两种格式之一，且 64 kbps 约 8 KB/s，base64 后远低于
+    ``asr.max_encoded_bytes`` —— 3 分钟 wav 原始 5.6MB → base64 7.5MB，会顶到 10MB
+    上限。这也让任何 ffmpeg 能解码的输入都能用这个风格。
+    """
+    p = Path((path or "").strip())
+    if not p.exists():
+        return {"ok": False, "error": f"file not found: {path}"}
+
+    asr = getattr(config, "asr", None)
+    base_url = str(getattr(asr, "base_url", "") or "").strip()
+    model = str(getattr(asr, "model", "") or "").strip()
+    if not base_url or not model:
+        return {"ok": False, "error": "ASR not configured (asr.base_url / asr.model)"}
+
+    api_key_env = str(getattr(asr, "api_key_env", "") or "")
+    api_key = os.environ.get(api_key_env, "") if api_key_env else ""
+    if not api_key:
+        return {"ok": False, "error": f"ASR api key env not set: {api_key_env}"}
+
+    try:
+        import httpx  # type: ignore
+    except ImportError:
+        return {"ok": False, "error": "transcription requires httpx: pip install httpx"}
+
+    tmp_dir = tempfile.mkdtemp(prefix="hgm_chat_")
+    try:
+        # 无条件转 mp3（端点的两种可接受格式之一，且体积可控）
+        try:
+            mp3_path = _transcode_to_mp3(p, tmp_dir)
+        except Exception as e:  # noqa: BLE001
+            return {
+                "ok": False,
+                "error": (
+                    f"cannot decode '{p.suffix or '(none)'}' audio "
+                    f"(unsupported by this ffmpeg build?): {e}"),
+            }
+
+        try:
+            encoded = base64.b64encode(mp3_path.read_bytes())
+        except OSError as e:
+            return {"ok": False, "error": f"read failed: {e}"}
+
+        max_bytes = _positive_int(getattr(asr, "max_encoded_bytes", None), 10_000_000)
+        if len(encoded) > max_bytes:
+            # 显式报错，不静默截断、不自动改 chunk —— 这个项目要的是明确拒绝
+            return {
+                "ok": False,
+                "error": (
+                    f"encoded audio is {len(encoded)} bytes, over the "
+                    f"asr.max_encoded_bytes limit of {max_bytes} bytes; "
+                    f"lower asr.chunk_minutes to split it into smaller pieces"),
+            }
+
+        body: Dict[str, Any] = {
+            "model": model,
+            "messages": [{
+                "role": "user",
+                "content": [{
+                    "type": "input_audio",
+                    "input_audio": {"data": "data:audio/mpeg;base64," + encoded.decode("ascii")},
+                }],
+            }],
+        }
+        language = str(getattr(asr, "language", "") or "").strip()
+        if language:
+            # 只在校验非空时给 asr_options —— 空值即自动识别，且不是每个
+            # chat-completions 后端都能容忍未知的顶层键
+            body["asr_options"] = {"language": language}
+
+        endpoint = base_url.rstrip("/") + "/chat/completions"
+        try:
+            r = httpx.post(
+                endpoint,
+                headers={"Authorization": f"Bearer {api_key}",
+                         "Content-Type": "application/json"},
+                json=body,
+                timeout=timeout,
+            )
+        except Exception as e:  # noqa: BLE001
+            return {"ok": False, "error": f"transcription request failed: {e}"}
+
+        if r.status_code >= 400:
+            return {"ok": False, "error": f"ASR HTTP {r.status_code}: {r.text[:300]}"}
+        try:
+            payload = r.json()
+        except Exception:  # noqa: BLE001
+            return {"ok": False, "error": "ASR returned non-JSON response"}
+
+        choices = payload.get("choices") or []
+        if not choices:
+            return {
+                "ok": False,
+                "error": ("ASR returned no choices (top-level keys: "
+                          f"{sorted(payload.keys())})"),
+            }
+        message = choices[0].get("message") or {}
+        text = str(message.get("content") or "")
+        if not text.strip():
+            # 兜底：某些实现把文本放在 choices[0].text
+            text = str(choices[0].get("text") or "")
+        if not text.strip():
+            # 报出**实际看到的形状**，而不是笼统的「no text」
+            shape = (sorted(choices[0].keys()) if isinstance(choices[0], dict)
+                     else repr(choices[0])[:120])
+            return {
+                "ok": False,
+                "error": f"ASR returned empty transcript (choices[0] keys: {shape})",
+            }
+
+        text, truncated = _truncate(text)
+        return {
+            "ok": True,
+            "path": str(p),
+            "text": text,
+            "model": model,
+            "truncated": truncated,
+        }
+    finally:
+        shutil.rmtree(tmp_dir, ignore_errors=True)
+
+
+def _transcribe_one(path: str, config: Any, timeout: float) -> Dict[str, Any]:
+    """按 ``config.asr.api_style`` 把一次转写分派到对应的原语。
+
+    唯一的风格分派点：``transcribe_audio_auto`` 的单次分支和逐段循环都走这里，
+    于是拆段 / 归一化 / 部分失败这些机制对两种风格是共享的，而不是各写一份。
+    """
+    asr = getattr(config, "asr", None)
+    style = str(getattr(asr, "api_style", "") or "").strip()
+    if style == "chat_audio":
+        return _transcribe_chat_audio(path, config, timeout)
+    return transcribe_audio(path, config, timeout=timeout)
+
+
 # ---------------------------------------------------------------------------
 # 摄入：音频转写（长录音自动拆段）
 # ---------------------------------------------------------------------------
@@ -501,6 +649,17 @@ def _positive_float(value: Any, default: float) -> float:
     return num
 
 
+def _positive_int(value: Any, default: int) -> int:
+    """转成正整数，否则退回 ``default``；绝不抛异常。"""
+    try:
+        num = int(value)
+    except (TypeError, ValueError):
+        return default
+    if num <= 0:
+        return default
+    return num
+
+
 def transcribe_audio_auto(path: str, config: Any) -> Dict[str, Any]:
     """音频 → 转写文本，**容器归一化 + 长录音自动拆段**。所有工具面的统一入口。
 
@@ -568,7 +727,7 @@ def transcribe_audio_auto(path: str, config: Any) -> Dict[str, Any]:
 
         # 时长未知或足够短：单次请求，原样返回（保持历史行为）
         if duration is None or duration <= threshold:
-            result = transcribe_audio(work_path, config, timeout=timeout)
+            result = _transcribe_one(work_path, config, timeout)
             # 归一化时转写的是临时 mp3，而那个临时目录马上就会在 finally 里被删。
             # 把它的路径当作 path 返回，对一个要落库/回读的 agent 毫无意义 —— 信封里
             # 的 path 永远指调用方传入的那个文件（长录音分支也是这么做的）。
@@ -608,7 +767,7 @@ def transcribe_audio_auto(path: str, config: Any) -> Dict[str, Any]:
         texts: List[str] = []
         failed: List[tuple] = []
         for idx, chunk in enumerate(chunks):
-            r = transcribe_audio(str(chunk), config, timeout=timeout)
+            r = _transcribe_one(str(chunk), config, timeout)
             if r.get("ok"):
                 piece = str(r.get("text") or "").strip()
                 if piece:
