@@ -28,7 +28,7 @@
 与端点**，不依赖正在对话的 agent。
 
 - hermes agent 对话模型（`config.yaml` 的 `model` 段）：
-  `provider=xiaomi`、`base_url=https://token-plan-cn.xiaomimimo.com/v1`、
+  `provider=xiaomi`、`base_url=<provider-base-url>`、
   `model=mimo-v2.5`、`api_key_env=XIAOMI_API_KEY`。
 - 归纳配置 `synthesis` 段与之对齐（同模型、同端点、同 key）。
 
@@ -123,7 +123,7 @@ review 门（governed_kb_review: list → approve 进 notes / reject 进 archive
   "synthesis": {
     "enabled": true,
     "provider": "xiaomi",
-    "base_url": "https://token-plan-cn.xiaomimimo.com/v1",
+    "base_url": "<provider-base-url>",
     "api_key_env": "XIAOMI_API_KEY",
     "model": "mimo-v2.5",
     "max_candidates": 5

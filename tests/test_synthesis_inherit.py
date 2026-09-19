@@ -23,14 +23,14 @@ class TestLoadAgentModelConfig:
     def test_parses_model_section(self, tmp_path):
         _write_config_yaml(tmp_path, (
             "model:\n"
-            "  base_url: https://token-plan-cn.xiaomimimo.com/v1\n"
+            "  base_url: https://api.example.com/v1\n"
             "  default: mimo-v2.5\n"
             "  provider: xiaomi\n"
             "database:\n"
             "  journal_mode: wal\n"
         ))
         assert _load_agent_model_config(tmp_path) == {
-            "base_url": "https://token-plan-cn.xiaomimimo.com/v1",
+            "base_url": "https://api.example.com/v1",
             "default": "mimo-v2.5",
             "provider": "xiaomi",
         }
