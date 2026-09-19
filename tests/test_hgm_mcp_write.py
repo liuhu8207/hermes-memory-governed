@@ -42,11 +42,21 @@ class Sandbox:
         self.vault = root / "vault"
         (self.home / "memory").mkdir(parents=True, exist_ok=True)
         (self.vault / "notes").mkdir(parents=True, exist_ok=True)
-        # Start from the real config (so the embedding backend works) but point
-        # the vault at the sandbox — kb-add must have somewhere harmless to write.
+        # Start from the real config but point the vault at the sandbox —
+        # kb-add must have somewhere harmless to write.
         cfg = {}
         if REAL_CONFIG.exists():
             cfg = json.loads(REAL_CONFIG.read_text(encoding="utf-8"))
+        # …and drop its **remote** embedding backend. The deployed config names a
+        # live embeddings API (provider + base_url + an env-var key), and
+        # inheriting it made this module depend on a third-party service: when
+        # that endpoint timed out, the first ``remember`` came back
+        # ``ok:false`` / ``embedding_failed`` — and because no L2 table was ever
+        # created, every later assertion in the module cascaded
+        # (``cold_start`` rows, facts that were never there). Without the
+        # section the server falls back to the local, offline embedder, so the
+        # write path is still exercised end to end but nothing touches a network.
+        cfg.pop("embedding", None)
         cfg["wiki_dir"] = str(self.vault)
         (self.home / "governed_memory.json").write_text(
             json.dumps(cfg, ensure_ascii=False), encoding="utf-8")
