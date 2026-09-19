@@ -107,6 +107,42 @@ def test_dotenv_used_when_env_absent(dotenv_home, monkeypatch):
     assert env_secret("K_FALLBACK") == "from_file"
 
 
+def test_blank_env_does_not_shadow_dotenv(dotenv_home, monkeypatch):
+    """存在但为空的 env 必须回退 .env（宿主插值表达式常求值成空串）。"""
+    _write_env(dotenv_home, "K_BLANK=from_file\n")
+    monkeypatch.setenv("K_BLANK", "")
+    assert env_secret("K_BLANK") == "from_file"
+
+
+def test_whitespace_env_does_not_shadow_dotenv(dotenv_home, monkeypatch):
+    _write_env(dotenv_home, "K_WS=from_file\n")
+    monkeypatch.setenv("K_WS", "   ")
+    assert env_secret("K_WS") == "from_file"
+
+
+def test_blank_env_without_dotenv_key_is_empty(dotenv_home, monkeypatch):
+    monkeypatch.setenv("K_BLANK_ABSENT", "")
+    _write_env(dotenv_home, "SOMETHING_ELSE=x\n")
+    assert env_secret("K_BLANK_ABSENT") == ""
+
+
+def test_blank_env_equals_unset_env(dotenv_home, monkeypatch):
+    """空值与「未设置」在 helper 上必须完全同构。"""
+    _write_env(dotenv_home, "K_SAME=from_file\n")
+    monkeypatch.setenv("K_SAME", "")
+    blank_result = env_secret("K_SAME")
+    monkeypatch.delenv("K_SAME", raising=False)
+    unset_result = env_secret("K_SAME")
+    assert blank_result == unset_result == "from_file"
+
+
+def test_nonempty_env_still_wins_over_dotenv(dotenv_home, monkeypatch):
+    """非空进程值依旧压过 .env —— 守住既有优先级。"""
+    _write_env(dotenv_home, "K_WINS=from_file\n")
+    monkeypatch.setenv("K_WINS", "from_env")
+    assert env_secret("K_WINS") == "from_env"
+
+
 def test_missing_everywhere_is_empty(dotenv_home, monkeypatch):
     monkeypatch.delenv("K_ABSENT", raising=False)
     _write_env(dotenv_home, "SOMETHING_ELSE=x\n")
@@ -211,6 +247,33 @@ def test_transcribe_audio_missing_key_keeps_original_error(dotenv_home, tmp_path
     assert r["error"] == "ASR api key env not set: ASR_DOTENV_MISSING"
 
 
+def test_transcribe_audio_blank_env_falls_back_to_dotenv(dotenv_home, tmp_path, monkeypatch):
+    """空 env 必须在 ASR 调用点上等价于未设置 —— 用 .env 里的键。"""
+    _write_env(dotenv_home, "ASR_BLANK_KEY=sk-blank-dotenv\n")
+    monkeypatch.setenv("ASR_BLANK_KEY", "")
+    audio = tmp_path / "clip.mp3"
+    audio.write_bytes(b"fake")
+
+    captured: dict = {}
+    _install_httpx_post(monkeypatch, captured, _TextResp())
+
+    r = _ingest.transcribe_audio(str(audio), _asr_cfg("ASR_BLANK_KEY"))
+    assert r["ok"] is True
+    assert captured["headers"]["Authorization"] == "Bearer sk-blank-dotenv"
+
+
+def test_transcribe_audio_blank_env_without_dotenv_key_keeps_error(dotenv_home, tmp_path, monkeypatch):
+    """空 env 且 .env 也没有 → 仍是原有报错文案。"""
+    monkeypatch.setenv("ASR_BLANK_ABSENT", "")
+    _write_env(dotenv_home, "UNRELATED=1\n")
+    audio = tmp_path / "clip.mp3"
+    audio.write_bytes(b"fake")
+
+    r = _ingest.transcribe_audio(str(audio), _asr_cfg("ASR_BLANK_ABSENT"))
+    assert r["ok"] is False
+    assert r["error"] == "ASR api key env not set: ASR_BLANK_ABSENT"
+
+
 # ---------------------------------------------------------------------------
 # 调用点：ASR（chat_audio 风格）
 # ---------------------------------------------------------------------------
@@ -255,6 +318,34 @@ def test_chat_audio_missing_key_keeps_original_error(dotenv_home, tmp_path, monk
     assert r["error"] == "ASR api key env not set: MIMO_DOTENV_MISSING"
 
 
+def test_chat_audio_blank_env_falls_back_to_dotenv(dotenv_home, tmp_path, monkeypatch):
+    """chat_audio 原语同样：空 env 回退 .env。"""
+    _write_env(dotenv_home, "MIMO_BLANK_KEY=sk-chat-blank\n")
+    monkeypatch.setenv("MIMO_BLANK_KEY", "")
+    audio = tmp_path / "clip.wav"
+    audio.write_bytes(b"fake")
+
+    def fake_transcode(src, out_dir):
+        d = Path(out_dir)
+        d.mkdir(parents=True, exist_ok=True)
+        p = d / "c.mp3"
+        p.write_bytes(b"mp3")
+        return p
+
+    monkeypatch.setattr(_ingest, "_transcode_to_mp3", fake_transcode)
+
+    captured: dict = {}
+    _install_httpx_post(monkeypatch, captured, _ChatResp())
+
+    cfg = _asr_cfg("MIMO_BLANK_KEY")
+    cfg.asr.api_style = "chat_audio"
+    cfg.asr.model = "mimo-v2.5-asr"
+
+    r = _ingest._transcribe_chat_audio(str(audio), cfg, 30.0)
+    assert r["ok"] is True
+    assert captured["headers"]["Authorization"] == "Bearer sk-chat-blank"
+
+
 # ---------------------------------------------------------------------------
 # 调用点：embedding
 # ---------------------------------------------------------------------------
@@ -295,6 +386,41 @@ def test_embedding_api_probe_uses_dotenv_key(dotenv_home, monkeypatch):
         service = _embedding.EmbeddingService.get(cfg)
         assert service.available is True
         assert captured["headers"]["Authorization"] == "Bearer sk-emb-dotenv"
+    finally:
+        _embedding.EmbeddingService.reset()
+
+
+def test_embedding_api_probe_blank_env_falls_back_to_dotenv(dotenv_home, monkeypatch):
+    """embedding 探测路径：空 env 必须等价于未设置（否则语义通道仍会掉线）。"""
+    _write_env(dotenv_home, "EMB_BLANK_PROBE=sk-emb-blank\n")
+    monkeypatch.setenv("EMB_BLANK_PROBE", "")
+    _embedding.EmbeddingService.reset()
+
+    captured: dict = {}
+
+    def fake_post(url, json=None, headers=None, timeout=None):
+        captured["headers"] = headers
+        texts = json["input"]
+        texts = texts if isinstance(texts, list) else [texts]
+        return _EmbedResp({
+            "data": [{"index": i, "embedding": [0.25] * 1024}
+                     for i in range(len(texts))],
+        })
+
+    monkeypatch.setattr("httpx.post", fake_post)
+
+    cfg = GovernedMemoryConfig()
+    cfg.embedding.provider = "openai"
+    cfg.embedding.base_url = "https://api.example.com/v1"
+    cfg.embedding.model = "text-embedding-3-small"
+    cfg.embedding.api_key_env = "EMB_BLANK_PROBE"
+
+    try:
+        service = _embedding.EmbeddingService.get(cfg)
+        assert service.available is True
+        assert captured["headers"]["Authorization"] == "Bearer sk-emb-blank"
+        # 指纹也读到了同一个值（配置变化时才会重建单例）
+        assert "sk-emb-blank" in _embedding.EmbeddingService._build_signature(cfg)
     finally:
         _embedding.EmbeddingService.reset()
 

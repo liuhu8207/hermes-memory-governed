@@ -317,9 +317,20 @@ def _read_dotenv_values(path: Path) -> Dict[str, str]:
 def env_secret(name: str) -> str:
     """Look up a secret by env var name: process environment first, ``.env`` fallback.
 
-    优先级是刻意的：进程环境里导出的值永远胜出，运维可以在单次调用里覆盖磁盘上的
-    ``.env``；只有在环境里**不存在**这个名字时才去读文件。名字为空、或两处都没有
-    时返回 ``""`` —— 调用方沿用原有的「env not set」文案，值本身绝不进入日志或错误。
+    优先级是刻意的：进程环境里导出的**非空**值永远胜出，运维可以在单次调用里覆盖
+    磁盘上的 ``.env``；只有在环境里**不存在或为空**时才去读文件。名字为空、或两处
+    都没有时返回 ``""`` —— 调用方沿用原有的「env not set」文案，值本身绝不进入日志
+    或错误。
+
+    **为什么「存在但为空」必须回退**（不要简化回 ``if name in os.environ``）：宿主
+    常把密钥当作插值表达式传下来（如 dsh 的 ``cordis.patch.yml`` 里
+    ``!!js process.env.SILICONFLOW_API_KEY``）；当父值缺失时它往往求值成**空字符串**
+    而不是把变量整个省略。若空值也算「存在」，它就会盖住磁盘上的真值 —— 正是本函数
+    要消除的那个故障。
+
+    有人会设想用 ``KEY=""`` 来**故意关闭**某个后端：本系统关闭后端的既定旋钮是
+    **按名字**（令 ``api_key_env`` 指向一个不存在的变量），而「空串=关闭」的约定与
+    「宿主配错」在现象上无法区分 —— 所以空白即回退是更安全的读法。
 
     刻意不做进程内缓存：文件很小、这些读取不是热路径，而按粗糙 mtime 缓存在密钥
     轮换后可能返回陈旧值（正确性优先于微优化）。
@@ -327,8 +338,9 @@ def env_secret(name: str) -> str:
     name = str(name or "").strip()
     if not name:
         return ""
-    if name in os.environ:
-        return os.environ[name]
+    value = os.environ.get(name)
+    if value is not None and value.strip():
+        return value
     return _read_dotenv_values(_hermes_home_path() / ".env").get(name, "")
 
 
