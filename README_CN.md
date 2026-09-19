@@ -284,7 +284,7 @@ python scripts/memory_pipeline.py health
 | `embedding` | 远程 embedding API（OpenAI 兼容 `/embeddings`） |
 | `reranking` | 可选重排器（SiliconFlow bge-reranker） |
 | `kb` | KB top-k、阈值、语义/关键词开关、自动链接 |
-| `asr` | 音频转写（XingChenASR）——`timeout_seconds`（默认 600：单次请求上限）与 `chunk_minutes`（默认 10：超过此长度的录音自动拆段并按顺序拼接转写结果）。两者均有默认值，无需修改配置。 |
+| `asr` | 音频转写（XingChenASR）——`api_style`（默认 `transcriptions`；chat-completions 风格的音频端点用 `chat_audio`）、`timeout_seconds`（默认 600：单次请求上限）、`chunk_minutes`（默认 10：超过此长度的录音自动拆段并按顺序拼接转写结果）与 `max_encoded_bytes`（默认 10000000：`chat_audio` 下 base64 载荷上限）。均有默认值，无需修改配置。 |
 | `synthesis` | 会话蒸馏（provider/model/key、启用开关） |
 
 > ⚠️ **维度一致性**：同一套 L2 表只能有一种向量维度。切换后端（API ↔ 本地）或换模型会导致维度变化，必须重建 L2：`python scripts/l2_rebuild.py`。

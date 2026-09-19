@@ -193,9 +193,28 @@ Same shape as a document, and the same three stages — the store owns the first
   Prefer the MCP tool — it is one of the six above and answers from the resident
   process instead of paying the CLI's per-call start-up (see *Why MCP is worth
   preferring*). The CLI is the fallback for a host without MCP.
-- **The endpoint is OpenAI-compatible `/audio/transcriptions`**, configured under
-  `asr` in `governed_memory.json` (SiliconFlow `XingChenAGI/XingChenASR-V3.2-Ultra`
-  in this deployment).
+- **Two API shapes, selected by `asr.api_style`.** The default, `transcriptions`,
+  POSTs multipart to an OpenAI-compatible `/audio/transcriptions` and reads the
+  transcript from the top-level `text` (the deployment here uses SiliconFlow
+  `XingChenAGI/XingChenASR-V3.2-Ultra`). `chat_audio` is for a chat-completions
+  endpoint that is "OpenAI-SDK compatible" but has **no** audio endpoint — its
+  `/audio/transcriptions` 404s. That shape POSTs to `/chat/completions` with the
+  audio inline as a base64 **data URL**; the transcript comes back at
+  **`choices[0].message.content`** (there is no top-level `text`), and `language`
+  goes in a top-level `asr_options` object. An unknown or empty `api_style` falls
+  back to `transcriptions` with a warning — it never raises.
+- **`chat_audio` always transcodes the source to mp3 first**, whatever the input
+  format — such endpoints typically accept only wav / mp3, and mp3 keeps the
+  encoded payload small. So under `chat_audio` **any ffmpeg-decodable input
+  works**, not just the formats in the accepted list below.
+- **`asr.max_encoded_bytes` (default 10000000) is the ceiling on that base64
+  payload.** Going over returns an error that names the limit and tells you to
+  lower `chunk_minutes`; it does **not** truncate silently and does **not** shrink
+  the chunks for you. Failing loudly is the contract.
+- **Use the base URL your key was actually issued for.** Some providers issue keys
+  for a token-plan host whose base URL differs from the one in their public docs;
+  calling the documented host returns `401`, which looks identical to an expired
+  key. If you get a `401`, check the host before concluding the key is dead.
 - **Accepted as-is**: `.flac .m4a .mp3 .mp4 .ogg .wav .webm`. **Any other container
   is transcoded to mp3 first, whenever ffmpeg is available — short files
   included** — so a WeChat / QQ `.amr` voice note works. **`.silk` is the one
