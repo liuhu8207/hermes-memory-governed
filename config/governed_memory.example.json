@@ -58,8 +58,10 @@
     "base_url": "https://api.siliconflow.cn/v1",
     "model": "XingChenAGI/XingChenASR-V3.2-Ultra",
     "language": "",
+    "api_style": "transcriptions",
     "timeout_seconds": 600,
-    "chunk_minutes": 10
+    "chunk_minutes": 10,
+    "max_encoded_bytes": 10000000
   },
   "synthesis": {
     "enabled": false,
