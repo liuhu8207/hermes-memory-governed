@@ -172,7 +172,7 @@ two API shapes are selected by `api_style`.
 | Key | Default | Description |
 |-----|---------|-------------|
 | provider | "" | **Label only** — nothing dispatches on it. Adding a provider is a config change (`base_url` / `model` / `api_key_env` / `api_style`), never a code change. |
-| api_key_env | "" | **Name** of the environment variable that holds the key (not the key itself). It is read with `os.environ.get`, so the value must be in the **process environment** of whatever runs the tool — a key that lives only in a dotenv file is not visible to every caller. |
+| api_key_env | "" | **Name** of the environment variable that holds the key (not the key itself). Lookup is name-first: a non-empty value in the **process environment** wins, and when that variable is missing or blank the same name is read from **`$HERMES_HOME/.env`** — so a key kept only in that file is usable, as long as the process can resolve `HERMES_HOME` (its env var, or the platform default). The value is never logged. |
 | base_url | "" | Service root that holds the audio / chat endpoint. |
 | model | "XingChenAGI/XingChenASR-V3.2-Ultra" | ASR model name. |
 | language | "" | Empty = auto-detect. An explicit code such as `"zh"` can improve Chinese transcription. |

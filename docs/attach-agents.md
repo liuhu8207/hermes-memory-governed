@@ -211,6 +211,15 @@ Same shape as a document, and the same three stages — the store owns the first
   payload.** Going over returns an error that names the limit and tells you to
   lower `chunk_minutes`; it does **not** truncate silently and does **not** shrink
   the chunks for you. Failing loudly is the contract.
+- **Where the key comes from.** `asr.api_key_env` names an environment variable; it
+  is read **process-environment-first**, and when that variable is missing or blank
+  it falls back to the same name in **`$HERMES_HOME/.env`**. An operator's explicit
+  export still wins for one run. This needs `HERMES_HOME` to be resolvable (its env
+  var, or the platform default): a host that passes the child **neither the key nor
+  a resolvable `HERMES_HOME`** still comes up empty and the call fails with the same
+  "key not set" error. The value is never logged. **Prefer keeping the secret in the
+  store's `.env`** rather than copying it into each agent's own MCP config, and never
+  write a literal key into a config file.
 - **Use the base URL your key was actually issued for.** Some providers issue keys
   for a token-plan host whose base URL differs from the one in their public docs;
   calling the documented host returns `401`, which looks identical to an expired
