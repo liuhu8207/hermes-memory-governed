@@ -285,6 +285,23 @@ def _fuse_l2_channels(vec: List["RecallResult"],
     return out
 
 
+def _l2_admitted(r, l2_floor: float) -> bool:
+    """L2 单条准入：融合命中按**原生分**，未融合的按 ``score``。
+
+    ``recall.l2_fusion`` 开启后 L2 的 ``score`` 是 RRF 排名量纲，拿余弦标尺
+    （部署值 0.76）去量它会把整层砍空 —— 所以带 ``native_score`` 的融合命中
+    按原生分（向量=余弦 / 词法=子串）过门槛，排序仍按融合分：
+    **排序用融合分、准入看原生分**。未融合的历史命中没有 ``native_score``，
+    仍按 ``score``，行为不变。
+
+    **只有这一份实现**：``format_recall``（实际注入）与 ``admitted_l2``
+    （评测门）都调它 —— 门槛一旦有两份，评测门与实际召回就会给出两个答案。
+    """
+    native = (r.metadata or {}).get("native_score")
+    effective = float(native) if native is not None else r.score
+    return effective >= l2_floor
+
+
 @dataclass
 class RecallResult:
     """A single recalled memory item."""
@@ -1213,19 +1230,9 @@ class RecallEngine:
         l3_floor = layer_score_floor("l3", recall_cfg)
 
         def _passes_floor(r: RecallResult) -> bool:
-            """逐层准入：L3 按 FTS 分；L2 融合命中按**原生分**。
-
-            ``recall.l2_fusion`` 开启后 L2 的 ``score`` 是 RRF 排名量纲，
-            拿余弦标尺（0.76）去量它会把整层砍空 —— 所以带 ``native_score``
-            的融合命中按原生分（向量=余弦 / 词法=子串）过门槛，排序仍按
-            融合分：**排序用融合分，准入看原生分**。未融合的历史命中没有
-            ``native_score``，仍按 ``score`` —— 行为不变。
-            """
             if r.layer == "l3":
                 return r.score >= l3_floor
-            native = (r.metadata or {}).get("native_score")
-            effective = float(native) if native is not None else r.score
-            return effective >= l2_floor
+            return _l2_admitted(r, l2_floor)
 
         l23_items = [
             r for r in results
@@ -1274,6 +1281,30 @@ class RecallEngine:
                 parts.append("\n".join(lines))
 
         return "\n\n".join(parts)
+
+    def admitted_l2(self, query: str, top_k: int = 5) -> List[RecallResult]:
+        """L2 命中，**按本引擎的准入规则**返回（评测门用）。
+
+        为什么不让调用方自己筛：``format_recall`` 把准入、去重、预算与排版揉
+        在一起、返回的是注入文本；调用方若重算一遍门槛，就成了"一个存储两个
+        答案"。这里只做「检索 → 准入 → 按 content 去重（留最高分）→ top_k」，
+        不含预算裁剪，且与 ``format_recall`` 共用 ``_l2_admitted`` 同一份实现。
+        """
+        try:
+            results = self.parallel_recall(query)
+        except Exception:  # noqa: BLE001 — 评测门不该因单条查询崩掉
+            return []
+        recall_cfg = getattr(self._config, "recall", None)
+        floor = layer_score_floor("l2", recall_cfg)
+        best: Dict[str, RecallResult] = {}
+        for r in results:
+            if r.layer != "l2" or not _l2_admitted(r, floor):
+                continue
+            cur = best.get(r.content)
+            if cur is None or r.score > cur.score:
+                best[r.content] = r
+        ranked = sorted(best.values(), key=lambda r: r.score, reverse=True)
+        return ranked[:max(1, int(top_k or 1))]
 
     def shutdown(self) -> None:
         """Mark as shut down so parallel_recall falls back to sequential."""

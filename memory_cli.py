@@ -68,6 +68,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import random
 import re
 import subprocess
 import sys
@@ -1345,7 +1346,9 @@ def _eval_hit(got: str, expect: str) -> bool:
     return g in e or e in g
 
 
-def cmd_eval(config: dict, qa_file: str = "", top_k: int = 5) -> dict:
+def cmd_eval(config: dict, qa_file: str = "", top_k: int = 5,
+             min_hit: float = 0.0, seed: int = 0,
+             engine_kind: str = "cli") -> dict:
     """检索评测：QA 集跑 ``recall_l2``，出 hit@k（Phase 4 验收门）。
 
     两种集：
@@ -1387,8 +1390,14 @@ def cmd_eval(config: dict, qa_file: str = "", top_k: int = 5) -> dict:
             return {"ok": True, "basis": "self-snapshot", "evaluated": 0,
                     "hit_at_k": None, "top_k": top_k, "misses": [],
                     "note": "no facts to evaluate"}
-        stride = max(1, len(facts) // EVAL_MAX_QUERIES)
-        samples = facts[::stride][:EVAL_MAX_QUERIES]
+        # **随机（固定种子）抽样**，不是等距切片：快照是"最新优先且可能被截断"
+        # 的，等距取 20 条永远落在同一批上、且永远取不到最旧/最衰减的事实 ——
+        # 那样的门既不可复现也不代表全库。固定种子 = 可复现的随机。
+        pool = sorted(set(facts))
+        samples = (random.Random(seed).sample(pool, EVAL_MAX_QUERIES)
+                   if len(pool) > EVAL_MAX_QUERIES else pool)
+        sampled_from = len(pool)
+        snapshot_truncated = bool(data.get("truncated"))
         qa = [{"q": s, "expect": s} for s in samples]
         basis = "self-snapshot"
     qa = [item for item in qa if item["q"]]
@@ -1398,9 +1407,27 @@ def cmd_eval(config: dict, qa_file: str = "", top_k: int = 5) -> dict:
     hits = 0
     misses = []
     degraded: list = []
+    # 引擎选择：默认 ``cli`` 是兼容路径（**看不见 ``recall.l2_fusion``**），
+    # ``--engine plugin`` 才走与实际召回同源的引擎（融合命中按 native_score
+    # 过门槛）。无论用哪条，报告里都写明 —— 上个版本的门对本次交付全盲、
+    # 却自称是它的验收门，就是因为"用哪条路"从来没被写出来过。
+    engine = None
+    engine_name = "cli-recall_l2"
+    if str(engine_kind).lower() == "plugin":
+        try:
+            engine = plugin_module("_recall").RecallEngine(plugin_config())
+            engine_name = "plugin-recall"
+        except Exception as e:  # noqa: BLE001 — 要报出来，不能静默换引擎
+            return _refusal(f"plugin engine unavailable: {type(e).__name__}: {e}",
+                            hint="omit --engine plugin to use the CLI path")
+
     for item in qa:
-        result = recall_l2(item["q"], top_k, degraded)
-        got = [str(h.get("content") or "") for h in result.get("hits", [])]
+        if engine is not None:
+            got = [str(getattr(r, "content", "") or "")
+                   for r in engine.admitted_l2(item["q"], top_k)]
+        else:
+            result = recall_l2(item["q"], top_k, degraded)
+            got = [str(h.get("content") or "") for h in result.get("hits", [])]
         if any(_eval_hit(g, item["expect"]) for g in got):
             hits += 1
         else:
@@ -1408,9 +1435,22 @@ def cmd_eval(config: dict, qa_file: str = "", top_k: int = 5) -> dict:
                            "expect": item["expect"][:80]})
     out = {"ok": True, "basis": basis, "evaluated": len(qa),
            "hit_at_k": round(hits / len(qa), 4) if qa else None,
-           "top_k": top_k, "hits": hits, "misses": misses}
+           "top_k": top_k, "hits": hits, "misses": misses,
+           "engine": engine_name}
+    if basis == "self-snapshot":
+        out["sampled_from"] = sampled_from
+        out["snapshot_truncated"] = snapshot_truncated
     if degraded:
         out["degraded"] = degraded
+    # 门槛判定：没有它，hit@k 只是个数字 —— 实测它在 floor∈[0.0,0.99] 全程恒为
+    # 1.0，只有 1.01 才掉下去，等于"永远通过"的橡皮章。有了下限，
+    # ``ok:false`` 会让 CLI 以非零退出，才配叫验收门。
+    if min_hit > 0.0:
+        out["min_hit_at_k"] = min_hit
+        if out["hit_at_k"] is None or out["hit_at_k"] < min_hit:
+            out["ok"] = False
+            out["error"] = (f"hit@{top_k} {out['hit_at_k']} below the required "
+                            f"{min_hit}（engine={engine_name}）")
     return out
 
 
@@ -2895,6 +2935,16 @@ def build_parser() -> argparse.ArgumentParser:
     ev.add_argument("--qa", default="",
                     help='Path to a JSON QA file [{"q": ..., "expect": ...}]')
     ev.add_argument("--top-k", type=int, default=5)
+    ev.add_argument("--min-hit", type=float, default=0.0,
+                    help="Fail (ok:false, non-zero exit) when hit@k is below "
+                         "this. Without a floor the number can never fail.")
+    ev.add_argument("--seed", type=int, default=0,
+                    help="Sampling seed for the self-QA draw (reproducible)")
+    ev.add_argument("--engine", default="cli", choices=("cli", "plugin"),
+                    help="Which retrieval path to measure. 'cli' = the CLI's "
+                         "own recall_l2 (compatibility path; it does NOT follow "
+                         "recall.l2_fusion). 'plugin' = the plugin engine the "
+                         "agent actually runs, which does.")
 
     cz = sub.add_parser("consolidate", parents=[common],
                         help="Merge near-duplicate L2 facts (default dry-run)")
@@ -3044,7 +3094,9 @@ def main():
     elif args.cmd == "consolidate":
         out = cmd_consolidate(config, apply=args.apply, agent=agent)
     elif args.cmd == "eval":
-        out = cmd_eval(config, args.qa, args.top_k)
+        out = cmd_eval(config, args.qa, args.top_k,
+                       min_hit=args.min_hit, seed=args.seed,
+                       engine_kind=args.engine)
     elif args.cmd == "transcribe":
         out = cmd_transcribe(config, args.path,
                              getattr(args, "timeout", None),

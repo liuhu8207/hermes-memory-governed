@@ -250,6 +250,32 @@ class TestEval:
         out = cli.cmd_eval({}, str(Path("does") / "not" / "exist.json"))
         assert out["ok"] is False
 
+    def test_min_hit_below_the_floor_fails(self, store, monkeypatch):
+        """没有下限时 hit@k 只是个数字 —— 实测它在 floor∈[0.0, 0.99] 全程恒为
+        1.0，只有 >1.0 才掉下去。有了下限才配叫验收门（``ok:false`` → 非零退出）。"""
+        pytest.importorskip("lancedb")
+        _install_fake_embedding(monkeypatch)
+        assert cli.cmd_remember({}, _FACT, "dsh")["ok"] is True
+
+        ok = cli.cmd_eval({}, "", min_hit=0.5)
+        assert ok["ok"] is True and ok["min_hit_at_k"] == 0.5
+
+        bad = cli.cmd_eval({}, "", min_hit=1.01)
+        assert bad["ok"] is False
+        assert "below the required" in bad["error"]
+
+    def test_report_names_the_engine_and_the_sample_pool(self, store, monkeypatch):
+        """上个版本的门对本次交付全盲、却自称是它的验收门 —— 现在必须写明用的是
+        哪条路、从多大的池子里抽的样（否则"这扇门测的是哪条路"又变成一个谜）。"""
+        pytest.importorskip("lancedb")
+        _install_fake_embedding(monkeypatch)
+        assert cli.cmd_remember({}, _FACT, "dsh")["ok"] is True
+
+        out = cli.cmd_eval({}, "")
+        assert out["engine"] == "cli-recall_l2", out
+        assert out["sampled_from"] >= 1
+        assert "snapshot_truncated" in out
+
 
 # ---------------------------------------------------------------------------
 # 4) enrich：默认关零调用；开启后摘要/自问进 frontmatter；失败不阻断
@@ -317,6 +343,21 @@ class TestEnvelopeAndExitCodes:
         assert code == 10
         assert out["ok"] is False and "--yes" in out["hint"]
         assert _FACT_B in _table_contents(store)
+
+    def test_eval_min_hit_below_the_floor_exits_nonzero(
+            self, store, monkeypatch, capsys):
+        """验收门必须**能失败**：低于下限 ⇒ ``ok:false`` ⇒ 非零退出。
+
+        改之前它连下限参数都没有，hit@k 恒为 1.0，等于一个永远通过的门。
+        """
+        pytest.importorskip("lancedb")
+        _install_fake_embedding(monkeypatch)
+        cli.cmd_remember({}, _FACT, "dsh")
+
+        code, out = self._run(monkeypatch, capsys,
+                              ["eval", "--min-hit", "1.01"])
+        assert code == 1, out
+        assert out["ok"] is False and "below the required" in out["error"]
 
     def test_retract_dry_run_needs_no_yes(self, store, monkeypatch, capsys):
         pytest.importorskip("lancedb")
