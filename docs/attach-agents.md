@@ -148,6 +148,39 @@ agent asked on 2026-09-18 whether to add `export HGM_AGENT=<itself>` to
   not a traceback — the caller is an agent, and a stack trace tells it nothing
   actionable. Do not retry a refusal unchanged; read the reason.
 
+## Destructive operations back up first — and refuse without a backup
+
+`retract`, `consolidate --apply` and capacity demotion all copy the L2 table
+directory aside **before** deleting anything, into
+`$HERMES_HOME/memory/l2_backups/<table>.<tag>.<timestamp>/`. It is a byte-level
+directory copy rather than a logical export on purpose: a corrupt table cannot be
+exported, and corruption is the case a backup exists for.
+
+**If the backup cannot be taken, the command refuses** — `{"ok": false, "error":
+"refused: ..."}` — and touches nothing. That refusal is intentional, not a bug;
+it is the same rule the rebuild script has always applied before dropping a
+table, and `--yes` does not override it.
+
+The archive file (`l2_archive.jsonl`) is an **audit log, not a restore point**:
+it keeps the text but not the vectors, so restoring from it means re-embedding.
+Restore from `l2_backups/` instead.
+
+Bulk edits to the vault follow the same rule: the frontmatter migration snapshots
+every note it will touch into `$HERMES_HOME/memory/vault_backups/<timestamp>/`
+before writing, and aborts if the snapshot fails.
+
+## Measuring retrieval changes
+
+`recall --eval` scores a QA set (by default, self-QA from the L2 snapshot). Two
+options decide whether the number means anything:
+
+- `--engine plugin` measures the path agents actually run — it follows
+  `recall.l2_fusion` and the `native_score` admission rule. The default
+  (`--engine cli`) measures the CLI's own compatibility path, which does **not**.
+  The report always names the engine that ran, so the two are never confused.
+- `--min-hit <floor>` makes the run **fail** — `ok: false` and a non-zero exit —
+  when `hit@k` falls below the floor. Without a floor the number can never fail.
+
 ## Bringing in a document — Word, Excel, PDF
 
 A document does **not** become searchable by being placed in the vault. Three
