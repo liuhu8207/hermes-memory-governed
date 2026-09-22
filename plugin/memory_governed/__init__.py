@@ -161,6 +161,28 @@ KB_REVIEW_SCHEMA = {
     },
 }
 
+KB_GOV_SCHEMA = {
+    "name": "governed_kb_govern",
+    "description": (
+        "Governance sweep over the knowledge base (run periodically). "
+        "Flags inbox notes recalled often enough (>= kb.promote_hits) as "
+        "promote_suggest for human approval via governed_kb_review, and "
+        "reports auto-zone notes (inbox/knowledge) idle past "
+        "kb.auto_archive_days. apply=false (default) only reports — nothing "
+        "is written. apply=true writes promote flags and moves idle notes to "
+        "archive (demotion, never deletion). The archive half needs usage "
+        "data (kb.affinity_enabled) and skips fail-closed without it."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "apply": {"type": "boolean",
+                      "description": "Actually write flags / archive (default false = report only)."},
+        },
+        "required": [],
+    },
+}
+
 KB_GET_SCHEMA = {
     "name": "governed_kb_get",
     "description": (
@@ -819,7 +841,7 @@ class GovernedMemoryProvider:
     def get_tool_schemas(self) -> List[Dict[str, Any]]:
         return [SEARCH_SCHEMA, AUDIT_SCHEMA, HEALTH_SCHEMA,
                 KB_SEARCH_SCHEMA, KB_ADD_SCHEMA, KB_GET_SCHEMA,
-                KB_REVIEW_SCHEMA,
+                KB_REVIEW_SCHEMA, KB_GOV_SCHEMA,
                 KB_FETCH_SCHEMA, KB_READ_FILE_SCHEMA, KB_TRANSCRIBE_SCHEMA]
 
     def handle_tool_call(self, tool_name: str, args: Dict[str, Any], **kwargs) -> str:
@@ -838,6 +860,8 @@ class GovernedMemoryProvider:
             return self._handle_kb_get(args)
         elif tool_name == "governed_kb_review":
             return self._handle_kb_review(args)
+        elif tool_name == "governed_kb_govern":
+            return self._handle_kb_govern(args)
         elif tool_name == "governed_kb_fetch":
             return self._handle_kb_fetch(args)
         elif tool_name == "governed_kb_read_file":
@@ -1043,6 +1067,17 @@ class GovernedMemoryProvider:
         except Exception as e:  # noqa: BLE001 — 工具绝不抛给 agent
             logger.warning("governed_kb_review failed: %s", e)
             return json.dumps({"error": f"Review failed: {e}"}, ensure_ascii=False)
+        return json.dumps(result, ensure_ascii=False)
+
+    def _handle_kb_govern(self, args: dict) -> str:
+        if not self._kb:
+            return json.dumps({"error": "Knowledge base not initialized"}, ensure_ascii=False)
+        try:
+            apply = bool(args.get("apply", False))
+            result = self._kb.governance(apply=apply)
+        except Exception as e:  # noqa: BLE001 — 工具绝不抛给 agent
+            logger.warning("governed_kb_govern failed: %s", e)
+            return json.dumps({"error": f"Governance sweep failed: {e}"}, ensure_ascii=False)
         return json.dumps(result, ensure_ascii=False)
 
     def _handle_kb_fetch(self, args: dict) -> str:

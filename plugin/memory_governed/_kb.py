@@ -23,8 +23,10 @@ from __future__ import annotations
 
 import json
 import logging
+import math
 import os
 import re
+import sqlite3
 import threading
 import time
 from pathlib import Path
@@ -33,6 +35,7 @@ from typing import Any, Dict, Iterator, List, Optional, Tuple
 from ._config import GovernedMemoryConfig
 from ._embedding import EmbeddingService
 from ._bridge import has_secret_like_text
+from ._llm import chat_completion
 from ._recall import row_to_score
 from . import _vault
 
@@ -67,6 +70,73 @@ _KEYWORD_SCORE_DENOM = 5.0
 #: 关键词为辅（精确术语命中依然是强证据）。
 _KB_KW_WEIGHT = 0.4
 _KB_SEM_WEIGHT = 0.6
+
+#: RRF 融合的衰减常数 k（``score += w/(k+rank)``，rank 从 1 起）。
+#:
+#: k=60 是 Reciprocal Rank Fusion 文献与 WeKnora 的通用取值：第 1 名与第 2
+#: 名的差距是 ``w/61`` vs ``w/62`` —— 足以让排名靠前者胜出，又不至于让
+#: 第 1 名垄断（第一名对总分的贡献被压到与相邻名次同一量级）。
+_RRF_K = 60
+
+#: 亲和度封顶系数：实际乘数 = ``1 + 0.15·log1p(hits)/log1p(8)`` ∈ [1, 1.15]。
+#:
+#: 上限刻意压在 ×1.15：这是「缓慢复利的微推」—— 只扰动相近名次的取舍，
+#: 不可能让一篇陈年旧文因为历史热度压过当前强相关的新命中。
+#: ⚠️ 它是**振幅系数**（hits 恰为 ``_AFFINITY_SATURATION`` 时取到 ``1 + 它``），
+#: 不是上限本身 —— 少了 ``_AFFINITY_MAX`` 的夹取，乘数会随 hits **无界增长**
+#: （hits=1000 → ×1.47），与上面这句承诺相反。
+_AFFINITY_CAP = 0.15
+
+#: 亲和度乘数的**硬上限**：``1 + _AFFINITY_CAP``，在 hits == ``_AFFINITY_SATURATION``
+#: 处取到，之后再涨就夹住。没有它，「封顶 ×1.15」只是注释里的一句话。
+_AFFINITY_MAX = 1.0 + _AFFINITY_CAP
+
+#: 亲和度的饱和参考命中数：``log1p(8)`` 归一化，命中 8 次即拿满封顶。
+_AFFINITY_SATURATION = 8
+
+#: MMR 候选池：``top_k * factor``，钳在 [min, max] 内（个人 vault 规模足够）。
+_MMR_POOL_FACTOR = 5
+_MMR_POOL_MIN = 20
+_MMR_POOL_MAX = 60
+
+
+def _rrf_fuse(kw_scores: Dict[str, float], sem_scores: Dict[str, float],
+              kw_weight: float, sem_weight: float) -> Dict[str, Dict[str, Any]]:
+    """加权 RRF：按**排名**（而非原始分）融合关键词/语义两路命中。
+
+    归一化分母取两路第一名的理论分 ``(w_kw + w_sem)/(k+1) = 1/(k+1)``
+    （启用通道的权重和恒为 1），于是：
+
+    * 单路上限 = 该路权重（关键词 0.4 / 语义 0.6）——与线性融合的天花板
+      完全一致，``recall_min_score`` / ``recall_min_kw_score`` 两条准入走廊
+      在两种模式下语义不变（纯关键词依然够不到 0.45，必须走关键词走廊）；
+    * 双路都排第 1 → 恰好 1.0。
+
+    Returns:
+        ``{rel_path: {"rrf": float, "kw_rank": int|None, "sem_rank": int|None}}``
+    """
+
+    def _ranks(scores: Dict[str, float]) -> Dict[str, int]:
+        # 分数降序；同分按路径字典序稳定排序，保证 trace 可复现。
+        ordered = sorted(scores.items(), key=lambda kv: (-kv[1], kv[0]))
+        return {rel: i + 1 for i, (rel, _s) in enumerate(ordered)}
+
+    kw_ranks = _ranks(kw_scores) if kw_weight > 0.0 else {}
+    sem_ranks = _ranks(sem_scores) if sem_weight > 0.0 else {}
+
+    out: Dict[str, Dict[str, Any]] = {}
+    for rel in set(kw_ranks) | set(sem_ranks):
+        raw = 0.0
+        if rel in kw_ranks:
+            raw += kw_weight / (_RRF_K + kw_ranks[rel])
+        if rel in sem_ranks:
+            raw += sem_weight / (_RRF_K + sem_ranks[rel])
+        out[rel] = {
+            "rrf": min(1.0, raw * (_RRF_K + 1)),
+            "kw_rank": kw_ranks.get(rel),
+            "sem_rank": sem_ranks.get(rel),
+        }
+    return out
 
 #: 删除旧笔记的重试参数（Windows 文件占用，见 :func:`_unlink_with_retry`）。
 #:
@@ -158,6 +228,73 @@ def _bigrams(s: str) -> set:
     """字符串的 2-gram 集合（中文连续查询的关键词兜底）。"""
     s = s.lower()
     return {s[i:i + 2] for i in range(len(s) - 1)}
+
+
+#: 双库分工的 frontmatter ``status`` 契约（Phase 2）：
+#:
+#: * 人工区（notes/projects/areas/resources/运维/根级笔记）→ ``curated``
+#: * 自动区（inbox/knowledge）→ ``draft``（inbox 的待审标记仍是既有
+#:   ``review_required`` 布尔，两个字段各管一件事）
+#: * archive → ``archived``
+#:
+#: ``memory_cli._status_for_section`` 是同一规则的 CLI 侧拷贝（CLI 不能依赖
+#: 插件加载）； ``tests/test_kb_governance.py`` 钉住两侧逐 section 一致 ——
+#: 这是本仓库「一个存储只能有一个答案」约定在状态字段上的落法。
+def _status_for_section(section: str) -> str:
+    if section in ("inbox", "knowledge"):
+        return "draft"
+    if section == "archive":
+        return "archived"
+    return "curated"
+
+
+#: 包含性查重的最小正文长度（归一化后）。低于它的正文（"好的""收到"）互相
+#: 包含是常态而不是重复 —— 门槛太低会把琐碎确认当重复拒掉。
+_DEDUP_MIN_CHARS = 120
+
+
+def _normalize_for_dedup(text: str) -> str:
+    """查重用的正文归一化：小写 + 折叠全部空白。"""
+    return re.sub(r"\s+", " ", (text or "").lower()).strip()
+
+
+def _enrich_note(title: str, body: str, config: Any) -> Dict[str, Any]:
+    """入库富化（``kb.enrich`` 开启时）：一行摘要 + 2~3 个自问。
+
+    产出存进 frontmatter（``summary`` / ``questions``）喂给关键词召回路 ——
+    纯向量对精确术语的漏召回由这些显式词补上（WeKnora 的 summary /
+    generated questions）。**尽力而为**：LLM 不可用 / 超时 / 坏 JSON 一律
+    返回 ``{}`` —— 富化是加分项，绝不阻断写入。
+    """
+    resp = chat_completion(
+        [
+            {"role": "system", "content": (
+                "You enrich one knowledge note. Output ONLY JSON (no markdown, "
+                "no prose): {\"summary\": string (<=120 chars, one line), "
+                "\"questions\": [string] (2-3 questions this note answers)}.")},
+            {"role": "user", "content": f"# {title}\n{body[:4000]}"},
+        ],
+        config, temperature=0.0, max_tokens=400, timeout=30.0,
+    )
+    if not resp:
+        return {}
+    try:
+        text = str(resp).strip()
+        if text.startswith("```"):
+            text = re.sub(r"^```(?:json)?|\```$", "", text).strip()
+        data = json.loads(text)
+        out: Dict[str, Any] = {}
+        summary = str(data.get("summary") or "").strip()
+        if summary:
+            out["summary"] = summary[:200]
+        questions = [str(q).strip()
+                     for q in (data.get("questions") or []) if str(q).strip()]
+        if questions:
+            out["questions"] = questions[:3]
+        return out
+    except Exception as e:  # noqa: BLE001 - 富化失败不阻断写入
+        logger.debug("kb enrich parse failed: %s", e)
+        return {}
 
 
 class _Note:
@@ -588,6 +725,94 @@ def iter_vault_notes(vault: Path, *,
                 errors.append(msg)
 
 
+class _UsageStore:
+    """命中使用度（亲和度数据源）：``rel_path → (hits, last_used)``。
+
+    SQLite 单表、每次操作独立连接 —— 召回跑在线程池里，短连接比持有跨线程
+    句柄简单且足够快（单行 upsert 亚毫秒）。**所有失败都降级为「本次没有
+    统计」**：使用度是排序的加分项，绝不允许它把读路径搞挂。
+    """
+
+    def __init__(self, db_path: Path):
+        self._db_path = Path(db_path)
+
+    def _connect(self) -> sqlite3.Connection:
+        self._db_path.parent.mkdir(parents=True, exist_ok=True)
+        conn = sqlite3.connect(str(self._db_path), timeout=1.0)
+        conn.execute(
+            "CREATE TABLE IF NOT EXISTS kb_usage ("
+            "path TEXT PRIMARY KEY,"
+            "hits INTEGER NOT NULL DEFAULT 0,"
+            "last_used REAL NOT NULL DEFAULT 0)"
+        )
+        return conn
+
+    def hits(self) -> Dict[str, int]:
+        """全量命中计数；失败返回空表（= 无亲和度加成）。"""
+        conn = None
+        try:
+            conn = self._connect()
+            rows = conn.execute("SELECT path, hits FROM kb_usage").fetchall()
+            return {str(p): int(h) for p, h in rows}
+        except Exception as e:  # noqa: BLE001 - 统计失败绝不影响检索
+            logger.debug("kb_usage read failed: %s", e)
+            return {}
+        finally:
+            if conn is not None:
+                try:
+                    conn.close()
+                except Exception:  # noqa: BLE001
+                    pass
+
+    def entries(self) -> Dict[str, Tuple[int, float]]:
+        """全量 ``{path: (hits, last_used)}``；失败返回空表。
+
+        供治理巡检算「闲置天数」—— ``hits`` 只能回答「被用过没有」，
+        回答不了「多久没被用」。
+        """
+        conn = None
+        try:
+            conn = self._connect()
+            rows = conn.execute(
+                "SELECT path, hits, last_used FROM kb_usage").fetchall()
+            return {str(p): (int(h), float(lu or 0.0))
+                    for p, h, lu in rows}
+        except Exception as e:  # noqa: BLE001
+            logger.debug("kb_usage read failed: %s", e)
+            return {}
+        finally:
+            if conn is not None:
+                try:
+                    conn.close()
+                except Exception:  # noqa: BLE001
+                    pass
+
+    def touch(self, rel_paths: List[str]) -> None:
+        """命中计数 +1 并刷新 ``last_used``；失败静默（下次再记）。"""
+        if not rel_paths:
+            return
+        conn = None
+        try:
+            conn = self._connect()
+            now = time.time()
+            for rel in rel_paths:
+                conn.execute(
+                    "INSERT INTO kb_usage(path, hits, last_used) VALUES(?, 1, ?)"
+                    " ON CONFLICT(path) DO UPDATE SET"
+                    " hits = hits + 1, last_used = excluded.last_used",
+                    (rel, now),
+                )
+            conn.commit()
+        except Exception as e:  # noqa: BLE001
+            logger.debug("kb_usage touch failed: %s", e)
+        finally:
+            if conn is not None:
+                try:
+                    conn.close()
+                except Exception:  # noqa: BLE001
+                    pass
+
+
 class KnowledgeBase:
     """知识库门面：vault 检索 + 写入 + 索引投影。"""
 
@@ -597,6 +822,10 @@ class KnowledgeBase:
         # 独立向量库目录（与 L2 记忆的 l2/ 分开）
         self._index_db = Path(config.l2_db_path).parent / "kb_index"
         self._index: Optional[KBIndex] = None
+        # 使用度表（亲和度数据源）。与 kb_index 同级目录，懒加载 ——
+        # affinity 关闭时这张表永远不会被创建（读路径零副作用）。
+        self._usage_db = Path(config.l2_db_path).parent / "kb_usage.db"
+        self._usage: Optional[_UsageStore] = None
         # 检索前的自愈同步互斥：并发检索（recall 线程池）不触发两遍增量同步
         self._sync_lock = threading.Lock()
         # 最近一次探测结论，供 :meth:`last_index_status` 读取
@@ -1114,6 +1343,15 @@ class KnowledgeBase:
         keyword_on = bool(getattr(kb_cfg, "keyword_enabled", True))
         semantic_on = bool(getattr(kb_cfg, "semantic_enabled", True))
 
+        # MMR 需要比 top_k 更深的候选池：语义通道按池深取数，否则 sem-only
+        # 语料下 池 == top_k，MMR 永远没有可挤的对象（每条查询仍只嵌一次，
+        # 代价只是索引多返回几行）。
+        lam = float(getattr(kb_cfg, "mmr_lambda", 0.0) or 0.0)
+        sem_fetch = top_k
+        if 0.0 < lam < 1.0:
+            sem_fetch = min(max(top_k * _MMR_POOL_FACTOR, _MMR_POOL_MIN),
+                            _MMR_POOL_MAX)
+
         # 两路各自的归一化分（缺一路时置 0，由权重归一化兜底）
         kw_norm: Dict[str, float] = {}
         if keyword_on:
@@ -1126,7 +1364,7 @@ class KnowledgeBase:
         sem_norm: Dict[str, float] = {}
         idx = self._index_get()
         if semantic_on and idx.available:
-            for r in idx.search(query, top_k):
+            for r in idx.search(query, sem_fetch):
                 sem_norm[r["path"]] = float(r.get("score", 0.0) or 0.0)
 
         # 权重按「实际启用的通道」重新归一化，避免关掉一路后总分整体缩水
@@ -1137,6 +1375,24 @@ class KnowledgeBase:
             return []
         active_kw /= total_w
         active_sem /= total_w
+
+        # 融合算法：默认 linear（历史行为）；"rrf" = 按排名融合（见 _rrf_fuse）。
+        fusion_mode = str(getattr(kb_cfg, "fusion", "linear") or "").strip().lower()
+        if fusion_mode != "rrf":
+            if fusion_mode not in ("linear", ""):
+                logger.warning("Config kb.fusion = %r unknown — using 'linear'",
+                               fusion_mode)
+            fusion_mode = "linear"
+        fused_meta = (
+            _rrf_fuse(kw_norm, sem_norm, active_kw, active_sem)
+            if fusion_mode == "rrf" else {}
+        )
+
+        # 亲和度：启用时读一次使用度表（失败 = 空表 = 无加成）。
+        affinity_on = bool(getattr(kb_cfg, "affinity_enabled", False))
+        usage_hits: Dict[str, int] = {}
+        if affinity_on:
+            usage_hits = self._usage_store().hits()
 
         note_by_rel: Dict[str, _Note] = {self._rel(n.path): n for n in notes}
 
@@ -1184,6 +1440,34 @@ class KnowledgeBase:
                 kind = "semantic"
             else:
                 kind = "keyword"
+            # 基础分：linear = 加权线性融合；rrf = _rrf_fuse 的排名归一分
+            # （天花板一致：纯关键词 ≤ 0.4 / 纯语义 ≤ 0.6 / 双路第 1 = 1.0）。
+            if fusion_mode == "rrf":
+                meta = fused_meta.get(rel, {})
+                base = float(meta.get("rrf", 0.0))
+                kw_rank, sem_rank = meta.get("kw_rank"), meta.get("sem_rank")
+            else:
+                base = active_kw * kw + active_sem * sem
+                kw_rank = sem_rank = None
+            # 亲和度乘数：hits=0 → 1.0（不加成）；hits ≥ 饱和点 → 夹在 _AFFINITY_MAX。
+            affinity = 1.0
+            if affinity_on:
+                hits_count = usage_hits.get(rel, 0)
+                if hits_count > 0:
+                    affinity = min(
+                        _AFFINITY_MAX,
+                        1.0 + _AFFINITY_CAP * math.log1p(hits_count)
+                        / math.log1p(_AFFINITY_SATURATION))
+            # ⚠️ **准入分与排序分必须分开**（P0，2026-09-22 修）：
+            # ``score`` 是「这条结果多相关」，KB 提示通道的准入门槛
+            # （``kb.recall_min_score``）判的正是它；使用度只该影响**排序**。
+            # 此前把乘数直接算进 ``score``，于是纯关键词命中（base=0.4）在
+            # hits≥6 时 0.4×1.13 = 0.45 就压过部署门槛 0.45 —— 把
+            # 「纯关键词够不到 0.45、必须走关键词走廊」这条不变量打开，
+            # 而 ``_config.py`` 的 ``recall_min_kw_score`` 整段推理正靠它成立。
+            # 同一模式在 L2 侧早已确立：**门槛量原生分、排序量融合分**
+            # （``_recall.py`` 的 ``native_score``）。
+            rank_key = min(1.0, base * affinity)
             # 注意缩进：这一句必须在 for 循环体内。曾经因为一次编辑把它
             # 顶格到循环外（只剩最后一轮迭代的值），结果 search() 对每条查询
             # 只返回一条结果 —— 而既有测试是全绿的假象要靠新测试才暴露。
@@ -1191,7 +1475,8 @@ class KnowledgeBase:
                 "title": title,
                 "path": rel,
                 "section": section_name,
-                "score": round(active_kw * kw + active_sem * sem, 4),
+                "score": round(base, 4),
+                "rank_key": round(rank_key, 4),
                 "kind": kind,
                 "keyword_score": round(kw, 4),
                 "semantic_score": round(sem, 4),
@@ -1199,17 +1484,37 @@ class KnowledgeBase:
                 "concepts": concepts,
                 "snippet": snippet,
                 "index_status": dict(snapshot),
+                # 排序诊断：这条为什么排这里 —— 融合模式 / 两路名次 /
+                # 亲和度乘数。「没命中」与「没跑」必须可区分（trace 常在）。
+                "trace": {
+                    "fusion": fusion_mode,
+                    "kw_rank": kw_rank,
+                    "sem_rank": sem_rank,
+                    "base": round(base, 4),
+                    "affinity": round(affinity, 4),
+                },
             }
 
-        ranked = sorted(scored.values(), key=lambda x: x["score"], reverse=True)
+        # 排序用 ``rank_key``（= base × 使用度加成）；``score`` 保持**不含使用度**
+        # 的原生相关分，专供下面的准入门槛判定 —— 即「排序看加成后的分、
+        # 准入看原生分」。两者分开，使用度就只是排序微调，不会抬门槛。
+        ranked = sorted(scored.values(), key=lambda x: x["rank_key"], reverse=True)
 
         # ``kb.min_score`` 过滤。归一化后该阈值是**统一量纲**（[0,1]），
         # 不再像旧版那样受关键词 0~12 分制影响。默认 0.0 时完全不过滤。
+        # ⚠️ 判 ``score``（原生），**不是** ``rank_key`` —— 否则使用度会抬门槛。
         min_score = float(getattr(kb_cfg, "min_score", 0.0) or 0.0)
         if min_score > 0.0:
             ranked = [item for item in ranked if item["score"] >= min_score]
 
-        ranked = ranked[:top_k]
+        # MMR 去冗余（``mmr_lambda ∈ (0,1)`` 时）：从候选池贪心选 top_k，
+        # 近似重复项被后来的多样性项挤掉；关闭时保持历史截断行为。
+        if 0.0 < lam < 1.0 and len(ranked) > top_k:
+            ranked = self._mmr_select(ranked, top_k, lam)
+            for item in ranked:
+                item.setdefault("trace", {})["mmr"] = True
+        else:
+            ranked = ranked[:top_k]
 
         # 反链统计（只对 top_k 结果补充，避免全库扫描放大）
         backlink_cache: Dict[str, List[str]] = {}
@@ -1219,6 +1524,74 @@ class KnowledgeBase:
                 backlink_cache[title] = self.links(title)
             item["backlinks"] = backlink_cache[title]
         return ranked
+
+    # -- 使用度（亲和度数据源）与 MMR ----------------------------------
+
+    def _usage_store(self) -> _UsageStore:
+        """使用度表句柄（懒建目录/表；失败在 _UsageStore 内部降级）。"""
+        if self._usage is None:
+            self._usage = _UsageStore(self._usage_db)
+        return self._usage
+
+    def touch(self, rel_paths: List[str]) -> None:
+        """记录命中使用度（亲和度数据源，也是 Phase 2 晋升/归档的依据）。
+
+        仅在 ``kb.affinity_enabled`` 开启时落表 —— 默认关闭，读路径零副作用。
+        调用方是召回提示通道（命中 = 注入了提示），不是搜索本身：搜索不等于
+        消费，计数只记真正被用上的条目。统计失败绝不影响召回。
+        """
+        rel_paths = [p for p in (rel_paths or []) if p]
+        if not rel_paths:
+            return
+        if not bool(getattr(self._config.kb, "affinity_enabled", False)):
+            return
+        try:
+            self._usage_store().touch(rel_paths)
+        except Exception as e:  # noqa: BLE001 - 统计失败绝不影响召回
+            logger.debug("kb touch failed: %s", e)
+
+    @staticmethod
+    def _mmr_select(ranked: List[Dict[str, Any]], top_k: int,
+                    lam: float) -> List[Dict[str, Any]]:
+        """MMR 贪心选 top_k：``λ·融合分 − (1−λ)·与已选项的最大相似度``。
+
+        相似度取 title+snippet 的 bigram Jaccard（零依赖，中文直接可用）。
+        候选池按融合分截取（``top_k*5``，钳 [20, 60]）：池外的结果本来就排
+        在池内所有项之后，没有被选中的资格。相似度为 0 时退化为纯融合分
+        排序 —— MMR 只挤掉近似重复项，不搅动本来就不相似的结果。
+        """
+        if len(ranked) <= top_k:
+            return ranked
+        pool_size = min(len(ranked),
+                        max(top_k * _MMR_POOL_FACTOR, _MMR_POOL_MIN),
+                        _MMR_POOL_MAX)
+        pool = ranked[:max(pool_size, top_k)]
+
+        grams = [_bigrams((it.get("title") or "") + " " + (it.get("snippet") or ""))
+                 for it in pool]
+        remaining = list(range(len(pool)))
+        selected: List[int] = []
+        while remaining and len(selected) < top_k:
+            best_i, best_val = remaining[0], float("-inf")
+            for i in remaining:
+                sim = 0.0
+                if selected:
+                    gi = grams[i]
+                    sim = max(
+                        (len(gi & grams[j]) / len(gi | grams[j])
+                         if (gi | grams[j]) else 0.0)
+                        for j in selected
+                    )
+                # 相关性用 ``rank_key``（= 相关分 × 使用度加成）—— 与排序口径一致。
+                # 用 ``score`` 会让使用度在 MMR 内部被忽略，出现「排序认它、
+                # 选池不认它」的半套行为。准入仍只看 ``score``（见 search()）。
+                _rel = float(pool[i].get("rank_key", pool[i].get("score", 0.0)) or 0.0)
+                val = lam * _rel - (1.0 - lam) * sim
+                if val > best_val:
+                    best_i, best_val = i, val
+            selected.append(best_i)
+            remaining.remove(best_i)
+        return [pool[i] for i in selected]
 
     # -- 写入 --------------------------------------------------------
 
@@ -1369,16 +1742,45 @@ class KnowledgeBase:
         filename = _vault.slugify_filename(title)
         path = self._vault / section / f"{filename}.md"
 
+        # 包含性查重（跨标题、跨区）：新正文与既有笔记互相包含且都不琐碎 →
+        # 返回既有路径而非静默新建第二份。同一篇的更新（同路径）不算重复。
+        # 这是 WeKnora 写路径「duplicate resolution」的廉价可解释版：线性扫描
+        # 一次（个人 vault 毫秒级），比引入相似度索引简单且无假阴性惊喜。
+        norm_new = _normalize_for_dedup(body)
+        if len(norm_new) >= _DEDUP_MIN_CHARS:
+            for existing in self._iter_notes():
+                if existing.path == path:
+                    continue
+                norm_old = _normalize_for_dedup(existing.body)
+                if len(norm_old) < _DEDUP_MIN_CHARS:
+                    continue
+                if norm_new in norm_old or norm_old in norm_new:
+                    return {
+                        "ok": False,
+                        "duplicate": True,
+                        "error": (f"body duplicates existing note "
+                                  f"'{existing.title}'"),
+                        "path": self._rel(existing.path),
+                        "section": existing.section,
+                        "hint": ("update the existing note instead (same "
+                                 "title), or rewrite to add new information"),
+                    }
+
         now = time_str()
         meta: Dict[str, Any] = {
             "title": title,
             "type": section,
+            "status": _status_for_section(section),
             "tags": tags,
             "concepts": concepts,
             "source": source or "",
             "created": now,
             "updated": now,
         }
+        # 入库富化（kb.enrich 开启时）：一次 LLM 调用换 summary/questions
+        # 进 frontmatter；失败返回 {}，写入照常 —— 富化绝不阻断落库。
+        if bool(getattr(self._config.kb, "enrich", False)):
+            meta.update(_enrich_note(title, body, self._config))
         if confidence is not None:
             meta["confidence"] = float(confidence)
         if review_required:
@@ -1488,10 +1890,17 @@ class KnowledgeBase:
         title: str,
         target_section: str,
         extra_meta: Optional[Dict[str, Any]] = None,
+        from_sections: Tuple[str, ...] = ("inbox",),
     ) -> Dict[str, Any]:
-        """把 inbox 笔记移到 target_section（改 frontmatter + 移文件 + 更新索引）。
+        """把待审/自动区笔记移到 target_section（改 frontmatter + 移文件 + 更新索引）。
 
-        仅允许从 ``inbox`` 移出；目标已存在同名文件时拒绝（不覆盖）。
+        默认仅允许从 ``inbox`` 移出（approve/reject 的语义不变）；治理巡检
+        归档 ``knowledge/`` 时传 ``from_sections=("inbox", "knowledge")``。
+        目标已存在同名文件时拒绝（不覆盖）。
+
+        ``status`` 随目标区更新（notes→curated / archive→archived，见
+        :func:`_status_for_section`）—— 移动了位置却不改状态，双库分工契约
+        就会在第一次晋升后失效。
 
         旧笔记删不掉时返回 ``ok=False``（详见 :meth:`_relocation_blocked`）。
         历史上这一步只 ``logger.warning`` 然后照常 ``ok=True`` —— 于是 Windows
@@ -1503,10 +1912,12 @@ class KnowledgeBase:
         for note in self._iter_notes():
             if note.title != title and note.path.stem != title:
                 continue
-            if note.section != "inbox":
+            if note.section not in from_sections:
                 return {
                     "ok": False,
-                    "error": f"Note '{title}' is not in inbox (section={note.section})",
+                    "error": (f"Note '{title}' is not in "
+                              f"{'/'.join(from_sections)} "
+                              f"(section={note.section})"),
                 }
             new_path = self._vault / target_section / note.path.name
             if new_path != note.path and new_path.exists():
@@ -1517,8 +1928,10 @@ class KnowledgeBase:
 
             meta = dict(note.meta)
             meta["type"] = target_section
+            meta["status"] = _status_for_section(target_section)
             meta["updated"] = time_str()
             meta.pop("review_required", None)
+            meta.pop("promote_suggest", None)
             if extra_meta:
                 meta.update(extra_meta)
 
@@ -1570,6 +1983,108 @@ class KnowledgeBase:
     def reject(self, title: str) -> Dict[str, Any]:
         """拒绝 inbox 待审笔记 → 移入 archive（标 review_rejected）。"""
         return self._relocate(title, "archive", {"review_rejected": True})
+
+    def governance(self, apply: bool = False) -> Dict[str, Any]:
+        """晋升建议 + 自动归档巡检（双库分工的淘汰闭环，Phase 2）。
+
+        * **晋升建议**：inbox 中命中 ≥ ``kb.promote_hits`` 且未被拒过的笔记
+          标 ``promote_suggest: true``。晋升本身仍由人通过
+          ``governed_kb_review approve`` 确认 —— 阈值触发的是**建议**，
+          不是自动晋升（对应 WeKnora 的 interest_threshold：慢信号过阈值
+          才进入长期区，否则 inbox 会变成第二个正库）。
+        * **自动归档**：自动区（inbox/knowledge）中**闲置超过
+          ``kb.auto_archive_days`` 天**的笔记 → 移入 ``archive/``
+          （降级不删除）。闲置 = 有命中记录看 ``last_used``；从未命中则按
+          文件 mtime 算（出生即未用的时钟）。
+
+        **fail-closed**：没有任何使用度数据（``kb.affinity_enabled`` 关或表
+        空）时**跳过归档**并给出 reason —— 「没数据」≠「没被用过」，否则
+        affinity 关闭期间的第一次巡检会按 mtime 把整个自动区误清。
+
+        ``apply=False``（默认）只报告不写盘 —— 批量操作先报 scope。
+        Returns:
+            ``{ok, applied, promote_suggest, archivable, flagged, archived,
+            errors, usage_data, reason}``。
+        """
+        cfg = self._config.kb
+        promote_hits = int(getattr(cfg, "promote_hits", 3) or 3)
+        archive_days = int(getattr(cfg, "auto_archive_days", 45) or 45)
+        # fail-closed 的**两半**：开关关**或表空**都算「没有使用度数据」。
+        # 只判开关会让「affinity 开着、表里还一行没有」时按 mtime 把整个自动区
+        # 误清 —— 本方法 docstring 早已承诺「关**或表空**」，此前只实现了前一半。
+        # 今日半径碰巧为 0（自动区为空 + mtime 全是新的），但 `add()` 落低置信
+        # 笔记进 ``inbox/`` 是常规路径，两个条件都**不是保证**。
+        affinity_on = bool(getattr(cfg, "affinity_enabled", False))
+        entries: Dict[str, Tuple[int, float]] = (
+            self._usage_store().entries() if affinity_on else {})
+        usage_available = affinity_on and bool(entries)
+
+        now = time.time()
+        promote: List[Dict[str, Any]] = []
+        archivable: List[Dict[str, Any]] = []
+        flagged: List[str] = []
+        moved: List[str] = []
+        errors: List[str] = []
+
+        for note in list(self._iter_notes()):
+            rel = self._rel(note.path)
+            hits, last_used = entries.get(rel, (0, 0.0))
+
+            if (note.section == "inbox"
+                    and not note.meta.get("review_rejected")
+                    and not note.meta.get("promote_suggest")
+                    and hits >= promote_hits > 0):
+                promote.append({"title": note.title, "path": rel, "hits": hits})
+                if apply:
+                    try:
+                        meta = dict(note.meta)
+                        meta["promote_suggest"] = True
+                        _vault.write_note(note.path, meta, note.body)
+                        self._index_get().upsert(
+                            rel,
+                            _Note(note.path, note.title, meta,
+                                  note.body).full_text,
+                            mtime=_file_mtime(note.path))
+                        flagged.append(rel)
+                    except OSError as e:
+                        errors.append(f"flag failed: {rel}: {e}")
+
+            if note.section not in ("inbox", "knowledge") or not usage_available:
+                continue
+            if hits > 0:
+                idle_days = (now - last_used) / 86400.0 if last_used > 0 else 0.0
+            else:
+                mtime = _file_mtime(note.path)
+                idle_days = ((now - mtime) / 86400.0) if mtime > 0 else 0.0
+            if idle_days <= archive_days:
+                continue
+            archivable.append({"title": note.title, "path": rel,
+                               "section": note.section,
+                               "idle_days": round(idle_days, 1)})
+            if apply:
+                r = self._relocate(
+                    note.title, "archive",
+                    {"archived_reason": "auto-unused"},
+                    from_sections=("inbox", "knowledge"))
+                if r.get("ok"):
+                    moved.append(str(r.get("path", rel)))
+                else:
+                    errors.append(f"archive failed: {rel}: "
+                                  f"{r.get('error', 'unknown')}")
+
+        return {
+            "ok": True,
+            "applied": bool(apply),
+            "promote_suggest": promote,
+            "archivable": archivable,
+            "flagged": flagged,
+            "archived": moved,
+            "errors": errors,
+            "usage_data": usage_available,
+            "reason": ("" if usage_available else
+                       "no usage data (kb.affinity_enabled off?) — "
+                       "archive evaluation skipped (fail-closed)"),
+        }
 
     def stats(self) -> Dict[str, Any]:
         """知识库统计（供 health 面板）。"""

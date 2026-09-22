@@ -903,6 +903,7 @@ def _l2_semantic_hits(query: str, top_k: int, project: str = "",
             hits.append(hit)
         hits.sort(key=lambda h: h["score"], reverse=True)
         kept = hits[:max(int(top_k or 0), 0)]
+        _touch_l2_usage([h.get("content", "") for h in kept])
         out.update({"available": True, "hits": kept, "filtered_out": filtered,
                     "truncated": len(hits) - len(kept),
                     "backend": getattr(embedding, "backend_name", "") or ""})
@@ -910,6 +911,448 @@ def _l2_semantic_hits(query: str, top_k: int, project: str = "",
     except Exception as e:  # noqa: BLE001
         return _unavailable("semantic unavailable: vector search failed "
                             f"({type(e).__name__}: {e})")
+
+
+def _touch_l2_usage(contents: list) -> None:
+    """召回命中即计数（容量淘汰的受害者选择依据，Phase 3）。
+
+    仅在 ``sync.l2_max_items > 0``（容量开启）时落表 —— 默认关闭 = 读路径
+    零副作用，与 ``kb.affinity_enabled`` 同一约定。失败静默：统计绝不影响
+    召回。语义/词法两条通道的 kept 结果都过这里。
+    """
+    try:
+        cfg = plugin_config()
+        if int(getattr(cfg.sync, "l2_max_items", 0) or 0) <= 0:
+            return
+        life = plugin_module("_lifecycle")
+        mem_dir = life.resolve_memory_dir(cfg)
+        if mem_dir is not None:
+            life.usage_touch(mem_dir, [str(c or "") for c in contents])
+    except Exception:  # noqa: BLE001 — 统计失败绝不影响召回
+        pass
+
+
+def _l2_enforce_capacity(table, cfg, agent: str, cap: int) -> list:
+    """同 agent 行数将超 ``cap`` 时，把**最少使用**的事实降级归档。
+
+    受害者排序：``last_used`` 升序（无记录 = 0，从未被召回的最先走）；
+    平手按 ``timestamp`` 升序（写入越早越先）。归档**先于**删除 —— 归档
+    失败顶多是下一次重试时重复一行归档记录，而删除先于归档失败就是数据
+    丢失；两种失败模式里可接受的是前者。
+
+    不写墓碑：容量淘汰的事实没有做错什么，重新写入是合法操作（与 retract
+    的 supersede 语义刻意区分）。
+
+    Returns:
+        被归档的内容前缀列表（空 = 不需要淘汰）。
+    """
+    life = plugin_module("_lifecycle")
+    mem_dir = life.resolve_memory_dir(cfg)
+    if mem_dir is None:
+        return []
+    arr = table.to_arrow()
+    names = arr.column_names
+    if "content" not in names:
+        return []
+    contents = arr["content"].to_pylist()
+    agents = arr["agent"].to_pylist() if "agent" in names else [None] * len(contents)
+    stamps = (arr["timestamp"].to_pylist() if "timestamp" in names
+              else [None] * len(contents))
+    mine = [(c, s) for c, a, s in zip(contents, agents, stamps)
+            if c and str(a or "") == agent]
+    over = len(mine) - cap + 1  # 插入后总数必须 ≤ cap
+    if over <= 0:
+        return []
+    usage = life.usage_last_used(mem_dir)
+
+    def _victim_key(item):
+        content, stamp = item
+        return (usage.get(life.content_fp(content), 0.0), str(stamp or ""))
+
+    victims = sorted(mine, key=_victim_key)[:over]
+    now = time.strftime("%Y-%m-%dT%H:%M:%S", time.localtime())
+    demoted = []
+    for content, stamp in victims:
+        life.archive_append(mem_dir, {
+            "state": "archived", "reason": "capacity-demoted",
+            "ts": now, "content": content, "agent": agent,
+            "timestamp": stamp, "cap": cap})
+        table.delete("content = " + life.sql_quote(content))
+        demoted.append(content[:200])
+    return demoted
+
+
+def cmd_retract(config: dict, match: str, reason: str = "",
+                agent: str = DEFAULT_AGENT, dry_run: bool = False) -> dict:
+    """撤回 L2 事实（supersede）：移入归档 + 写墓碑，防止被重新抽取复活。
+
+    ``match`` 是内容子串（大小写不敏感）；命中多条时全部处理。流程：
+
+    1. 只读打开表（不创建）；无表 → 明确 refusal；
+    2. ``--dry-run`` 列出命中不动数据（批量删除前必须先看 scope）；
+    3. 每条命中：归档 JSONL（``state=superseded`` + reason）→ 写内容指纹
+       墓碑 → 从表中删除。**归档先于删除**（同容量淘汰：宁可重复归档，
+       不可丢失）；
+    4. 刷新离线快照，让 ``snapshot`` 与表保持一致。
+
+    Returns:
+        ``{ok, retracted, tombstones, contents, errors, dry_run?}``。
+    """
+    match = (match or "").strip()
+    if not match:
+        return _refusal("empty match",
+                        hint="pass a substring of the fact to retract")
+
+    cfg = plugin_config()
+    life = plugin_module("_lifecycle")
+    mem_dir = life.resolve_memory_dir(cfg)
+    if mem_dir is None:
+        return _refusal("l2_db_path not configured",
+                        detail="cannot locate the memory dir for archive/tombstones")
+
+    open_errors: list = []
+    try:
+        table = open_l2_table(cfg, errors=open_errors)
+    except Exception as exc:  # noqa: BLE001 — 调用方拿 JSON，不拿堆栈
+        table = None
+        open_errors.append(f"{type(exc).__name__}: {exc}")
+    if table is None:
+        detail = str(open_errors[0])[:300] if open_errors else "no 'memories' table"
+        return _refusal("l2_open_failed", detail=detail)
+
+    try:
+        arr = table.to_arrow()
+        names = arr.column_names
+        contents = arr["content"].to_pylist() if "content" in names else []
+        agents = arr["agent"].to_pylist() if "agent" in names else [None] * len(contents)
+        stamps = (arr["timestamp"].to_pylist() if "timestamp" in names
+                  else [None] * len(contents))
+        cats = arr["category"].to_pylist() if "category" in names else [None] * len(contents)
+        projects = arr["project"].to_pylist() if "project" in names else [None] * len(contents)
+    except Exception as e:  # noqa: BLE001
+        return _refusal("l2_read_failed", detail=str(e)[:300])
+
+    needle = match.lower()
+    matched = [(c, a, s, cat, pj) for c, a, s, cat, pj
+               in zip(contents, agents, stamps, cats, projects)
+               if c and needle in str(c).lower()]
+
+    base = {"match": match, "retracted": 0, "tombstones": 0,
+            "contents": [str(c)[:200] for c, *_ in matched],
+            "errors": []}
+    if not matched:
+        base.update({"ok": True, "note": "no fact matched"})
+        return base
+    if dry_run:
+        base.update({"ok": True, "dry_run": True, "matched": len(matched)})
+        return base
+
+    now = time.strftime("%Y-%m-%dT%H:%M:%S", time.localtime())
+    seen = set()
+    for content, src_agent, stamp, cat, pj in matched:
+        if content in seen:
+            continue
+        seen.add(content)
+        life.archive_append(mem_dir, {
+            "state": "superseded", "reason": reason or "user-retracted",
+            "retracted_by": agent, "ts": now, "content": content,
+            "agent": src_agent, "category": cat, "project": pj,
+            "timestamp": stamp})
+        life.add_tombstone(mem_dir, life.content_fp(content), {
+            "content_prefix": content[:80],
+            "reason": reason or "user-retracted",
+            "retracted_by": agent, "ts": now})
+        try:
+            table.delete("content = " + life.sql_quote(content))
+            base["retracted"] += 1
+            base["tombstones"] += 1
+        except Exception as e:  # noqa: BLE001 — 已归档 + 已立碑，行还在：如实上报
+            base["errors"].append(f"delete failed for {content[:60]}: {e}")
+
+    snap = cmd_snapshot(config)
+    if not snap.get("ok"):
+        base["snapshot_error"] = snap.get("error")
+    base["ok"] = not base["errors"]
+    return base
+
+
+# -- 巩固（consolidate）与评测（eval），Phase 4 / WeKnora 借鉴 ---------------
+
+#: 巩固候选门槛：Jaccard（bigram）≥ 0.55 **且** 余弦 ≥ 0.86。
+#:
+#: 双条件缺一不可（WeKnora 数值）：词法像 + 向量像才可能是同一件事的两次
+#: 表述；只靠词法会把「同话题的不同事实」、只靠向量会把「换了说法的另一件事」
+#: 误合并。合并是一次有损操作，误合并比漏合并昂贵得多。
+CONS_JACCARD_MIN = 0.55
+CONS_COSINE_MIN = 0.86
+
+#: 自评 QA 集的样本上限（snapshot 可能上千条，评测抽样固定 20 条保廉价）。
+EVAL_MAX_QUERIES = 20
+
+
+def _cons_bigrams(text: str) -> set:
+    t = re.sub(r"\s+", " ", (text or "").lower()).strip()
+    return {t[i:i + 2] for i in range(max(0, len(t) - 1))}
+
+
+def _cons_jaccard(a: set, b: set) -> float:
+    if not a or not b:
+        return 0.0
+    return len(a & b) / len(a | b)
+
+
+def _cons_cosine(va, vb) -> float:
+    try:
+        fax = [float(x) for x in (va or [])]
+        fby = [float(y) for y in (vb or [])]
+        dot = sum(x * y for x, y in zip(fax, fby))
+        na = sum(x * x for x in fax) ** 0.5
+        nb = sum(y * y for y in fby) ** 0.5
+    except (TypeError, ValueError):
+        return 0.0
+    if na <= 0.0 or nb <= 0.0:
+        return 0.0
+    return dot / (na * nb)
+
+
+def _cons_clusters(rows: list) -> list:
+    """同类 + 双门槛的合并候选聚簇（并查集）。
+
+    Args:
+        rows: ``[{content, category, vector}]``。
+
+    Returns:
+        下标组列表，每组 ≥ 2 行（单行不成簇）。
+    """
+    n = len(rows)
+    parent = list(range(n))
+
+    def _find(x: int) -> int:
+        while parent[x] != x:
+            parent[x] = parent[parent[x]]
+            x = parent[x]
+        return x
+
+    grams = [_cons_bigrams(str(r.get("content") or "")) for r in rows]
+    for i in range(n):
+        cat_i = str(rows[i].get("category") or "")
+        for j in range(i + 1, n):
+            if cat_i != str(rows[j].get("category") or ""):
+                continue
+            if _cons_jaccard(grams[i], grams[j]) < CONS_JACCARD_MIN:
+                continue
+            if _cons_cosine(rows[i].get("vector"),
+                            rows[j].get("vector")) < CONS_COSINE_MIN:
+                continue
+            parent[_find(j)] = _find(i)
+
+    groups: dict = {}
+    for i in range(n):
+        groups.setdefault(_find(i), []).append(i)
+    return [sorted(idx) for idx in groups.values() if len(idx) > 1]
+
+
+def cmd_consolidate(config: dict, apply: bool = False,
+                    agent: str = DEFAULT_AGENT) -> dict:
+    """巩固：近重复事实聚簇 → LLM 合并（WeKnora consolidation 的 CLI 落地）。
+
+    候选 = 同类（category）+ Jaccard≥0.55 + 余弦≥0.86（见 ``CONS_*``）。
+    默认 dry-run 只报候选 —— 批量操作先报 scope。
+
+    ``--apply`` 时每个簇：LLM 合并（temp=0；**空输出 = 模型拒绝合并**，
+    原条目原样保留；LLM 不可用 → 该簇 skipped）→ 原条目归档
+    （state=superseded, reason=consolidated）+ 内容指纹墓碑（防旧表述
+    被重新抽取复活）→ 插入合并后的单条。任何一步失败都保留原条目并如实
+    记录 —— 合并宁可不发生，不可发生一半。
+
+    ``demoted``/``expired`` 不在本命令里：降级归容量（``l2_max_items``）、
+    过期归时间衰减（L3），各管各的管道，不在此重复报告。
+    """
+    cfg = plugin_config()
+    life = plugin_module("_lifecycle")
+    mem_dir = life.resolve_memory_dir(cfg)
+    if mem_dir is None:
+        return _refusal("l2_db_path not configured",
+                        detail="cannot locate the memory dir")
+    open_errors: list = []
+    try:
+        table = open_l2_table(cfg, errors=open_errors)
+    except Exception as exc:  # noqa: BLE001
+        table = None
+        open_errors.append(f"{type(exc).__name__}: {exc}")
+    if table is None:
+        detail = str(open_errors[0])[:300] if open_errors else "no 'memories' table"
+        return _refusal("l2_open_failed", detail=detail)
+    try:
+        rows = table.to_arrow().to_pylist()
+    except Exception as e:  # noqa: BLE001
+        return _refusal("l2_read_failed", detail=str(e)[:300])
+
+    clusters = _cons_clusters(rows)
+    base = {"ok": True, "applied": False, "clusters": len(clusters),
+            "candidates": [[str(rows[i].get("content") or "")[:80]
+                            for i in c] for c in clusters],
+            "merged": [], "skipped": [], "errors": []}
+    if not apply:
+        return base
+    if not clusters:
+        base["note"] = "no merge candidates"
+        return base
+
+    # --apply：先验前置条件，缺了就整个合并阶段不动任何数据（abort，
+    # 与 WeKnora「model unavailable = abort round」同一语义）。
+    embedding = plugin_module("_embedding").EmbeddingService.get(cfg)
+    if not embedding.available:
+        base.update(_refusal(
+            "embedding_unavailable",
+            detail=embedding.last_error or "cannot embed the merged fact",
+            hint="nothing was changed; fix the embedding backend and retry"))
+        base["applied"] = False
+        return base
+    llm = plugin_module("_llm")
+    now = time.strftime("%Y-%m-%dT%H:%M:%S", time.localtime())
+
+    for cidx, members in enumerate(clusters):
+        items = [rows[i] for i in members]
+        prompt_lines = "\n".join(
+            f"{n + 1}. {str(it.get('content') or '')}"
+            for n, it in enumerate(items))
+        resp = llm.chat_completion(
+            [
+                {"role": "system", "content": (
+                    "Merge near-duplicate facts into ONE fact sentence that "
+                    "keeps every unique detail. Output ONLY the merged fact "
+                    "(plain text, no list, no quotes). If they should NOT be "
+                    "merged, output NOTHING at all.")},
+                {"role": "user", "content": f"Facts:\n{prompt_lines}"},
+            ],
+            cfg, temperature=0.0, max_tokens=300, timeout=60.0)
+        if resp is None:
+            base["skipped"].append({"cluster": cidx, "reason": "llm_unavailable"})
+            continue
+        merged_text = str(resp).strip().strip("`\"'")
+        if not merged_text:
+            # 空输出 = 模型拒绝合并，不是错误：原条目保留，原因说出来。
+            base["skipped"].append({"cluster": cidx, "reason": "declined"})
+            continue
+        vec = embedding.embed_one(merged_text)
+        if vec is None:
+            base["skipped"].append({"cluster": cidx, "reason": "embedding_failed"})
+            continue
+        originals = [str(it.get("content") or "") for it in items]
+        merged_fp = life.content_fp(merged_text)
+        try:
+            # 归档 + 墓碑先于删除（宁可重复归档，不可丢失）。
+            for it in items:
+                content = str(it.get("content") or "")
+                life.archive_append(mem_dir, {
+                    "state": "superseded", "reason": "consolidated",
+                    "ts": now, "content": content,
+                    "agent": it.get("agent"), "category": it.get("category"),
+                    "timestamp": it.get("timestamp"), "merged_into": merged_fp})
+                life.add_tombstone(mem_dir, life.content_fp(content), {
+                    "content_prefix": content[:80],
+                    "reason": "consolidated", "retracted_by": agent, "ts": now})
+            for content in originals:
+                table.delete("content = " + life.sql_quote(content))
+            table.add([{
+                "content": merged_text,
+                "category": str(items[0].get("category") or "other"),
+                "source": "consolidate", "timestamp": now, "vector": vec,
+                "source_rowid": None, "role": "agent", "agent": agent,
+                "project": items[0].get("project"),
+            }])
+            base["merged"].append({"into": merged_text[:200],
+                                   "from": [o[:80] for o in originals]})
+        except Exception as e:  # noqa: BLE001 — 部分失败如实上报
+            base["errors"].append(f"cluster {cidx}: {str(e)[:160]}")
+
+    if base["merged"]:
+        snap = cmd_snapshot(config)
+        if not snap.get("ok"):
+            base["snapshot_error"] = snap.get("error")
+    base["applied"] = True
+    base["ok"] = not base["errors"]
+    return base
+
+
+def _eval_hit(got: str, expect: str) -> bool:
+    """命中判定：归一化后互相包含即算 —— 评测要抓的是「找没找到」，
+    不是措辞是否逐字相同。"""
+    g = _normalize_for_dedup(got)
+    e = _normalize_for_dedup(expect)
+    if not g or not e:
+        return False
+    return g in e or e in g
+
+
+def cmd_eval(config: dict, qa_file: str = "", top_k: int = 5) -> dict:
+    """检索评测：QA 集跑 ``recall_l2``，出 hit@k（Phase 4 验收门）。
+
+    两种集：
+
+    * 默认 ``self-snapshot`` —— 从 L2 快照抽最多 ``EVAL_MAX_QUERIES`` 条
+      事实，问句 = 事实本身，期望 = 找回自己。这不是智力题，是**通道健康
+      检查**：任何 P0（分数换算错误、门槛错层、通道二选一退化）都会让它
+      掉下去 —— 每个阶段开关切换前后各跑一次，就是本方案的验收门。
+    * ``--qa file.json`` —— ``[{"q": ..., "expect": ...}, ...]``。
+
+    Returns:
+        ``{ok, basis, evaluated, hit_at_k, top_k, misses, degraded?}``。
+    """
+    if qa_file:
+        try:
+            raw = json.loads(Path(qa_file).read_text(encoding="utf-8"))
+        except (OSError, ValueError) as e:
+            return _refusal(f"qa file unreadable: {e}")
+        if not isinstance(raw, list):
+            return _refusal("qa file must be a JSON list of {q, expect}")
+        qa = [{"q": str(it.get("q") or ""), "expect": str(it.get("expect") or "")}
+              for it in raw if isinstance(it, dict)]
+        basis = "file"
+    else:
+        # cmd_snapshot 的返回值只带计数（facts 落在文件里）—— 先刷新快照，
+        # 再从快照文件读事实。两条路径（写文件 / 返回计数）本就分工如此。
+        snap = cmd_snapshot(config)
+        if not snap.get("ok"):
+            return _refusal(f"snapshot unavailable: {snap.get('error')}")
+        try:
+            data = json.loads(Path(snapshot_path()).read_text(
+                encoding="utf-8"))
+        except (OSError, ValueError) as e:
+            return _refusal(f"snapshot unreadable: {e}")
+        facts = [str(f.get("content") or "")
+                 for f in (data.get("facts") or [])
+                 if isinstance(f, dict) and str(f.get("content") or "").strip()]
+        if not facts:
+            return {"ok": True, "basis": "self-snapshot", "evaluated": 0,
+                    "hit_at_k": None, "top_k": top_k, "misses": [],
+                    "note": "no facts to evaluate"}
+        stride = max(1, len(facts) // EVAL_MAX_QUERIES)
+        samples = facts[::stride][:EVAL_MAX_QUERIES]
+        qa = [{"q": s, "expect": s} for s in samples]
+        basis = "self-snapshot"
+    qa = [item for item in qa if item["q"]]
+    if not qa:
+        return _refusal("no usable queries (all q fields empty)")
+
+    hits = 0
+    misses = []
+    degraded: list = []
+    for item in qa:
+        result = recall_l2(item["q"], top_k, degraded)
+        got = [str(h.get("content") or "") for h in result.get("hits", [])]
+        if any(_eval_hit(g, item["expect"]) for g in got):
+            hits += 1
+        else:
+            misses.append({"q": item["q"][:80],
+                           "expect": item["expect"][:80]})
+    out = {"ok": True, "basis": basis, "evaluated": len(qa),
+           "hit_at_k": round(hits / len(qa), 4) if qa else None,
+           "top_k": top_k, "hits": hits, "misses": misses}
+    if degraded:
+        out["degraded"] = degraded
+    return out
 
 
 def recall_l2(query: str, top_k: int, errors: list = None,
@@ -1052,6 +1495,7 @@ def recall_l2(query: str, top_k: int, errors: list = None,
         # and never said it had dropped anything.
         hits.sort(key=lambda h: h["score"], reverse=True)
         kept = hits[:max(int(top_k or 0), 0)]
+        _touch_l2_usage([h.get("content", "") for h in kept])
         return {"hits": kept,
                 "ranking": _l2_ranking(True, floor, floor_source, filtered,
                                        len(hits) - len(kept),
@@ -1252,12 +1696,41 @@ def cmd_remember(config: dict, text: str, agent: str,
     # than a copy of it: LanceDB stores Arrow strings, which demand strict
     # UTF-8, so a lone surrogate makes the row unwritable. See _text.py.
     cleaned = plugin_module("_text").sanitize_utf8(cleaned)
-    admitted, reason = sync.external_write_verdict(cleaned)
     resolved_project = (infer_project() if project is None
                         else normalize_project(project))
 
-    base = {"agent": agent, "category": category, "admitted": admitted,
-            "project": resolved_project}
+    base = {"agent": agent, "category": category, "project": resolved_project}
+
+    # 凭据 fail-closed（净化漏斗第 2 步）：与 kb-add 同一闸门。凭据**拒绝**
+    # 而不是脱敏后写入 —— 脱敏后的句子通常已无信息量，而凭据策略要求它
+    # 根本不落盘。
+    for pat in SECRET_PATTERNS:
+        if pat.search(cleaned):
+            base.update(_refusal(
+                "fact looks like it contains a secret",
+                hint=("strip the credential and keep only the non-secret part, "
+                      "e.g. 'SecretStore holds the TLS material'")))
+            return base
+
+    cfg = plugin_config()
+
+    # 墓碑门禁（防复活，净化漏斗第 3 步）：被 retract 撤回过的事实，重新
+    # 抽取/写入一律拒绝并点名最初的 reason —— 「删了又长回来」到此为止。
+    life = plugin_module("_lifecycle")
+    mem_dir = life.resolve_memory_dir(cfg)
+    if mem_dir is not None:
+        tomb = life.load_tombstones(mem_dir).get(life.content_fp(cleaned))
+        if tomb is not None:
+            base.update(_refusal(
+                "tombstoned",
+                detail=(f"retracted at {tomb.get('ts', '?')} "
+                        f"(reason: {tomb.get('reason', 'n/a')})"),
+                hint=("this fact was explicitly retracted; write a NEW fact "
+                      "if the world has since changed")))
+            return base
+
+    admitted, reason = sync.external_write_verdict(cleaned)
+    base["admitted"] = admitted
     if not admitted:
         base.update(_refusal(
             reason,
@@ -1270,7 +1743,6 @@ def cmd_remember(config: dict, text: str, agent: str,
                      "content": cleaned[:600], "would_write": "l2"})
         return base
 
-    cfg = plugin_config()
     embedding = plugin_module("_embedding").EmbeddingService.get(cfg)
     if not embedding.available:
         # Refusing loudly beats writing a row nothing can ever recall.
@@ -1327,9 +1799,33 @@ def cmd_remember(config: dict, text: str, agent: str,
             f"rebuilt, or writes fail with a dimension mismatch."
         )
 
-    if cleaned in _l2_existing_contents(table):
+    existing = _l2_existing_contents(table)
+    if cleaned in existing:
         base.update({"ok": True, "duplicate": True, "content": cleaned[:600]})
         return base
+    # 长事实的包含性查重（净化漏斗第 4 步）：短句互相包含是常态，只有超过
+    # 与 KB 查重同一门槛的长句才做包含判断，避免琐碎误杀。
+    if len(cleaned) >= _DEDUP_MIN_CHARS:
+        for other in existing:
+            if len(other) < _DEDUP_MIN_CHARS:
+                continue
+            if cleaned in other or other in cleaned:
+                base.update({"ok": True, "duplicate": True,
+                             "content": cleaned[:600],
+                             "duplicate_of": other[:300]})
+                return base
+
+    # 容量淘汰（净化漏斗第 5 步，``sync.l2_max_items > 0`` 时）：写入前把
+    # **最少使用**的同 agent 事实降级归档（不写墓碑 —— 被挤掉的可以再写回
+    # 来）。淘汰失败不阻断写入：容量是治理，不是准入闸门。
+    cap = int(getattr(cfg.sync, "l2_max_items", 0) or 0)
+    if cap > 0:
+        try:
+            demoted = _l2_enforce_capacity(table, cfg, agent, cap)
+            if demoted:
+                base["demoted"] = demoted
+        except Exception as e:  # noqa: BLE001
+            base["demote_error"] = str(e)[:200]
 
     dim = len(vector)
     row = {
@@ -1914,6 +2410,27 @@ def cmd_kb_get(config: dict, title: str):
     return {"ok": False, "error": f"note not found: {title}"}
 
 
+#: 与 ``plugin._kb._status_for_section`` 同一规则的 CLI 拷贝（CLI 不能依赖
+#: 插件加载，插件也不能反向 import CLI）。``tests/test_kb_governance.py``
+#: 钉住两侧逐 section 一致 —— 状态字段的「一个存储一个答案」。
+def _status_for_section(section: str) -> str:
+    if section in ("inbox", "knowledge"):
+        return "draft"
+    if section == "archive":
+        return "archived"
+    return "curated"
+
+
+#: 包含性查重的最小正文长度（归一化后）。与 ``plugin._kb._DEDUP_MIN_CHARS``
+#: 同值；低于它的正文（"好的""收到"）互相包含是常态而不是重复。
+_DEDUP_MIN_CHARS = 120
+
+
+def _normalize_for_dedup(text: str) -> str:
+    """查重用的正文归一化：小写 + 折叠全部空白（与插件侧同实现）。"""
+    return re.sub(r"\s+", " ", (text or "").lower()).strip()
+
+
 def cmd_kb_add(config: dict, title: str, body: str, section: str,
                tags: list, concepts: list, confidence: float,
                agent: str = DEFAULT_AGENT, overwrite: bool = False):
@@ -1986,6 +2503,30 @@ def cmd_kb_add(config: dict, title: str, body: str, section: str,
                 hint="choose a different title, or pass --overwrite to take it over")
         created = existing_meta.get("created") or now
 
+    # 包含性查重（跨标题、跨区）：新正文与既有笔记互相包含且都不琐碎 →
+    # 拒绝并给出既有路径，而不是静默新建第二份。同一篇（同路径）不算重复。
+    # 语义与插件侧 KnowledgeBase.add 一致（tests/test_kb_governance.py 钉住）。
+    norm_new = _normalize_for_dedup(body)
+    if len(norm_new) >= _DEDUP_MIN_CHARS:
+        for other in iter_notes(config):
+            if other == path:
+                continue
+            try:
+                other_meta, other_body = parse_frontmatter(
+                    other.read_text(encoding="utf-8", errors="replace"))
+            except OSError:
+                continue
+            norm_old = _normalize_for_dedup(other_body)
+            if len(norm_old) < _DEDUP_MIN_CHARS:
+                continue
+            if norm_new in norm_old or norm_old in norm_new:
+                return _refusal(
+                    "body duplicates existing note "
+                    f"'{other_meta.get('title') or other.stem}'",
+                    path=str(other),
+                    hint=("update the existing note instead (same title), "
+                          "or rewrite to add new information"))
+
     # Auto-link concepts, once per concept, without duplicating an existing line.
     missing = [c for c in (concepts or [])
                if c and f"[[{c}]]" not in body]
@@ -1995,7 +2536,8 @@ def cmd_kb_add(config: dict, title: str, body: str, section: str,
     # `agent` is the writer; `source` describes how the note got here. Keeping
     # them separate is what makes the legacy vault values ("l3", "wiki-backup")
     # interpretable instead of being mistaken for authors.
-    meta = {"title": title.strip(), "type": "note", "tags": tags,
+    meta = {"title": title.strip(), "type": "note",
+            "status": _status_for_section(section), "tags": tags,
             "concepts": concepts, "agent": agent, "source": "agent-write",
             "created": created, "updated": now}
     text = dump_frontmatter(meta) + "\n\n" + body.rstrip() + "\n"
@@ -2039,6 +2581,37 @@ def cmd_kb_add(config: dict, title: str, body: str, section: str,
 #: "two entry points, two answers" in its quietest form, where nothing fails and
 #: the same question just gets different hits depending on who asked.
 _L2_THRESHOLD_DRIFT_TOLERANCE = 0.05
+
+
+def cmd_kb_govern(config: dict, apply: bool = False) -> dict:
+    """KB 治理巡检：晋升建议 + 自动归档（双库分工的淘汰闭环）。
+
+    默认 dry-run —— 批量移动笔记之前必须先看到 scope（Runtime Safety：
+    batch 操作先报数量）。``--apply`` 才落盘。
+
+    配置从 CLI 的原始 dict 桥接到插件 dataclass（同一份
+    ``governed_memory.json``，两个入口不能给出两种答案）。失败回 JSON
+    verdict 而不是 traceback：调用方是 agent/脚本，裸堆栈不是它能处理的。
+    """
+    try:
+        cfg_mod = plugin_module("_config")
+        kb_mod = plugin_module("_kb")
+        cfg = cfg_mod.GovernedMemoryConfig()
+        cfg_mod._apply_dict_to_config(cfg, config or {})
+        # ``l2_db_path`` 必须与插件同口径（``load_governed_config`` 会把它派生成
+        # ``$HERMES_HOME/memory/l2``，KB 使用度库就落在它旁边）。手工构造 dataclass
+        # 时该键为空 ⇒ ``Path("").parent`` == ``"."`` ⇒ usage 库解析到**进程 CWD**：
+        # CLI 因此永远读到空表（``promote_hits`` 永不触发），还会在仓库根留下
+        # 一个 0 行的 kb_usage.db。只在**为空**时补默认 —— 调用方（含沙箱测试）
+        # 显式给的路径仍然优先。
+        if not str(getattr(cfg, "l2_db_path", "") or "").strip():
+            cfg.l2_db_path = str(Path(hermes_home()) / "memory" / "l2")
+        return kb_mod.KnowledgeBase(cfg).governance(apply=bool(apply))
+    except Exception as e:  # noqa: BLE001 — CLI 必须回 verdict，不能抛栈
+        return _refusal(f"kb-govern failed: {type(e).__name__}: {e}",
+                        hint="check the vault path (wiki_dir) and that the "
+                             "plugin imports cleanly (runtime command shows "
+                             "the environment)")
 
 
 def _l2_threshold_drift() -> dict:
@@ -2104,6 +2677,24 @@ def cmd_health(config: dict):
     l3 = Path(h) / "memory" / "l3" / "l3.db"
     l1 = cmd_l1()
     count_notes = len(iter_notes(config))
+    # L2 生命周期计数（Phase 3）：active/superseded/archived 三个状态各自
+    # 有多少必须一眼可见 —— 「被撤回的会不会复活」「容量淘汰了多少」不该
+    # 靠翻文件回答。文件计数离线可得；active 需要读表，失败时如实标 unknown。
+    lifecycle: dict = {}
+    try:
+        life = plugin_module("_lifecycle")
+        lifecycle = life.lifecycle_counts(Path(h) / "memory")
+        lifecycle["active"] = "unknown"
+        try:
+            cfgp = plugin_config()
+            lifecycle["max_items"] = int(getattr(cfgp.sync, "l2_max_items", 0) or 0)
+            tbl = open_l2_table(cfgp)
+            if tbl is not None:
+                lifecycle["active"] = int(tbl.to_arrow().num_rows)
+        except Exception:  # noqa: BLE001 — 表读不到就保持 unknown，不编数字
+            pass
+    except Exception as e:  # noqa: BLE001
+        lifecycle = {"error": f"{type(e).__name__}: {e}"[:200]}
     out = {
         "hermes_home": h,
         "l1_memory_md": bool(l1["memory_rules_md"]),
@@ -2111,6 +2702,7 @@ def cmd_health(config: dict):
         "l4_persona_md": bool(l1["persona_md"]),
         "l2_dir_exists": l2.exists(),
         "l3_db_exists": l3.exists(),
+        "l2_lifecycle": lifecycle,
         "wiki_dir": str(wiki_dir(config)),
         "vault_note_count": count_notes,
         "ok": bool(l1["memory_rules_md"] or l1["user_profile_md"]),
@@ -2145,7 +2737,8 @@ def cmd_transcribe(config: dict, path: str, timeout: "float | None" = None,
 #: Commands whose answer depends on L2, and therefore on LanceDB being
 #: importable. Only these pay the cost of a possible interpreter re-exec; the
 #: read-only Markdown commands stay fast on a bare interpreter.
-_L2_COMMANDS = {"recall", "remember", "agents", "health", "runtime", "snapshot"}
+_L2_COMMANDS = {"recall", "remember", "agents", "health", "runtime", "snapshot",
+                "kb-govern", "retract", "eval"}
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -2159,6 +2752,10 @@ def build_parser() -> argparse.ArgumentParser:
         "--agent", default="",
         help=f"Agent name to attribute this call to "
              f"(default: ${AGENT_ENV_VAR} or auto-detection, else '{DEFAULT_AGENT}')")
+    common.add_argument(
+        "--envelope", action="store_true",
+        help="Wrap stdout as {ok, data, meta} — the machine contract for "
+             "agent/script callers (exit codes unchanged)")
 
     p = sub.add_parser("recall", parents=[common], help="Search L1+L2+L3+L4 + KB")
     p.add_argument("query")
@@ -2191,6 +2788,15 @@ def build_parser() -> argparse.ArgumentParser:
     ka.add_argument("--overwrite", action="store_true",
                     help="Take over a note currently owned by another agent")
 
+    kgo = sub.add_parser("kb-govern", parents=[common],
+                         help="KB 治理巡检：晋升建议 + 自动归档（默认 dry-run）")
+    kgo.add_argument("--apply", action="store_true",
+                     help="Actually flag promote_suggest / move to archive "
+                          "(default: report only — batch moves must show "
+                          "scope first)")
+    kgo.add_argument("--yes", action="store_true",
+                     help="Confirm the destructive --apply (exit 10 without it)")
+
     tr = sub.add_parser("transcribe", parents=[common],
                         help="Transcribe a local audio file to text "
                              "(long recordings are split automatically)")
@@ -2213,6 +2819,32 @@ def build_parser() -> argparse.ArgumentParser:
                          "the current directory, or pass '' for a fact that "
                          "holds everywhere")
 
+    rt = sub.add_parser("retract", parents=[common],
+                        help="Retract L2 facts (supersede): archive + tombstone")
+    rt.add_argument("match", help="Substring of the fact(s) to retract "
+                                  "(case-insensitive)")
+    rt.add_argument("--reason", default="",
+                    help="Why it is retracted (recorded in the archive)")
+    rt.add_argument("--dry-run", action="store_true",
+                    help="List matches without archiving or deleting anything")
+    rt.add_argument("--yes", action="store_true",
+                    help="Confirm the destructive retract (exit 10 without it)")
+
+    ev = sub.add_parser("eval", parents=[common],
+                        help="Retrieval eval: hit@k over a QA set "
+                             "(default: self-QA from the L2 snapshot)")
+    ev.add_argument("--qa", default="",
+                    help='Path to a JSON QA file [{"q": ..., "expect": ...}]')
+    ev.add_argument("--top-k", type=int, default=5)
+
+    cz = sub.add_parser("consolidate", parents=[common],
+                        help="Merge near-duplicate L2 facts (default dry-run)")
+    cz.add_argument("--apply", action="store_true",
+                    help="Actually merge clusters: archive originals "
+                         "(reason=consolidated) + tombstone + insert merged fact")
+    cz.add_argument("--yes", action="store_true",
+                    help="Confirm the destructive --apply (exit 10 without it)")
+
     sub.add_parser("l1", parents=[common], help="Print the standing L1 rules + L4 persona")
     sub.add_parser("agents", parents=[common], help="Who has written what (provenance)")
     sn = sub.add_parser(
@@ -2230,6 +2862,26 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
+def _emit(args, out, agent: str) -> str:
+    """序列化一条命令的输出。
+
+    默认 = 历史形状（各命令自己的 JSON）。``--envelope`` 时包一层
+    ``{ok, data, meta}`` —— 机器契约：``ok`` 由 ``data`` 的 ok/refused
+    推导，``meta`` 带 cmd/agent/ts。退出码语义不变，信封只是形状。
+    """
+    payload = out
+    if getattr(args, "envelope", False):
+        ok = not (isinstance(out, dict)
+                  and (out.get("ok") is False or out.get("refused")))
+        payload = {
+            "ok": ok,
+            "data": out,
+            "meta": {"cmd": getattr(args, "cmd", ""), "agent": agent,
+                     "ts": time.strftime("%Y-%m-%dT%H:%M:%S", time.localtime())},
+        }
+    return json.dumps(payload, ensure_ascii=False, indent=2)
+
+
 def main():
     parser = build_parser()
     args = parser.parse_args()
@@ -2244,24 +2896,38 @@ def main():
     config = load_config()
     agent = resolve_agent(getattr(args, "agent", ""))
 
+    # 破坏性操作的确认闸（exit 10 = awaiting --yes，WeKnora 退出码矩阵）：
+    # retract 的真正执行与 kb-govern --apply 的批量移动，都必须显式确认 ——
+    # --dry-run 预览过的 scope 与实际执行之间，需要一个不会滑过去的动作。
+    destructive = ((args.cmd == "retract" and not args.dry_run)
+                   or (args.cmd == "kb-govern" and getattr(args, "apply", False))
+                   or (args.cmd == "consolidate"
+                       and getattr(args, "apply", False)))
+    if destructive and not getattr(args, "yes", False):
+        out = {"ok": False,
+               "error": "refusing a destructive action without --yes",
+               "hint": "preview with --dry-run, then re-run with --yes"}
+        print(_emit(args, out, agent))
+        return 10
+
     if args.cmd == "l1":
-        print(json.dumps(cmd_l1(), ensure_ascii=False, indent=2))
+        print(_emit(args, cmd_l1(), agent))
         return 0
     if args.cmd == "runtime":
-        print(json.dumps(runtime_report(), ensure_ascii=False, indent=2))
+        print(_emit(args, runtime_report(), agent))
         return 0
     if args.cmd == "health":
         out = cmd_health(config)
         out["runtime"] = runtime_report()
-        print(json.dumps(out, ensure_ascii=False, indent=2))
+        print(_emit(args, out, agent))
         return 0
     if args.cmd == "agents":
-        print(json.dumps(cmd_agents(config), ensure_ascii=False, indent=2))
+        print(_emit(args, cmd_agents(config), agent))
         return 0
     if args.cmd == "snapshot":
         out = cmd_snapshot(config, getattr(args, "out", ""),
                            getattr(args, "max_facts", 0))
-        print(json.dumps(out, ensure_ascii=False, indent=2))
+        print(_emit(args, out, agent))
         return 0 if out.get("ok") else 1
 
     if args.cmd == "recall":
@@ -2307,10 +2973,19 @@ def main():
         out = cmd_kb_add(config, args.title, args.body, args.section,
                          args.tags, args.concepts, args.confidence,
                          agent=agent, overwrite=args.overwrite)
+    elif args.cmd == "kb-govern":
+        out = cmd_kb_govern(config, apply=args.apply)
     elif args.cmd == "remember":
         out = cmd_remember(config, args.fact, agent,
                            category=args.category, dry_run=args.dry_run,
                            project=args.project)
+    elif args.cmd == "retract":
+        out = cmd_retract(config, args.match, reason=args.reason,
+                          agent=agent, dry_run=args.dry_run)
+    elif args.cmd == "consolidate":
+        out = cmd_consolidate(config, apply=args.apply, agent=agent)
+    elif args.cmd == "eval":
+        out = cmd_eval(config, args.qa, args.top_k)
     elif args.cmd == "transcribe":
         out = cmd_transcribe(config, args.path,
                              getattr(args, "timeout", None),
@@ -2319,7 +2994,7 @@ def main():
         parser.print_help()
         return 2
 
-    print(json.dumps(out, ensure_ascii=False, indent=2))
+    print(_emit(args, out, agent))
     # A refused write is a failure the caller must act on, not a soft result.
     if isinstance(out, dict) and out.get("ok") is False:
         return 1

@@ -1459,6 +1459,29 @@ class WriteQueue:
 
             self._attach_vectors(facts)
 
+            # Dimension consistency check: verify vector dimensions match
+            # the table schema. This prevents writing 512-dim vectors from
+            # a local backend into a 1024-dim table (API backend) or vice versa.
+            expected_dim = self._expected_vector_dim()
+            if expected_dim > 0:
+                dim_mismatch_count = 0
+                for fact in facts:
+                    vector = fact.get("vector")
+                    if vector is not None and len(vector) != expected_dim:
+                        dim_mismatch_count += 1
+                        # Remove mismatched vector, keep the fact (text-only)
+                        del fact["vector"]
+                if dim_mismatch_count > 0:
+                    log_data_loss(
+                        "l2_write",
+                        "vector_dim_mismatch",
+                        detail=(
+                            f"{dim_mismatch_count} facts had vectors with wrong "
+                            f"dimension (expected {expected_dim}). "
+                            "Vectors removed, facts stored as text-only."
+                        ),
+                    )
+
             # Project onto the table's real columns. `facts` also carries
             # internal keys (`_signals`), and `agent` is absent on a table that
             # predates the provenance column — filtering here makes the write
@@ -1469,6 +1492,32 @@ class WriteQueue:
             self._l2_store.add(facts)
         except Exception as e:  # noqa: BLE001 - L2 failure must not kill the turn
             log_degraded("l2_write", "index_failed", exc=e)
+
+    def _expected_vector_dim(self) -> int:
+        """Return the expected vector dimension from the L2 table schema.
+
+        Returns 0 if the table has no vector column or cannot be inspected.
+        This is used to prevent dimension mismatches when the embedding backend
+        changes (e.g., API 1024-dim → local 512-dim fallback).
+        """
+        store = self._l2_store
+        if store is None:
+            return 0
+        try:
+            for field in store.schema:
+                if field.name == "vector":
+                    # field.type is fixed_size_list<item: float>[N]
+                    # Extract N from the type string
+                    type_str = str(field.type)
+                    if "fixed_size_list" in type_str:
+                        # Parse "fixed_size_list<item: float>[1024]"
+                        import re
+                        match = re.search(r'\[(\d+)\]', type_str)
+                        if match:
+                            return int(match.group(1))
+            return 0
+        except Exception:
+            return 0
 
     def _existing_contents(self) -> set:
         """Return the set of ``content`` values already present in L2.

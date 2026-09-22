@@ -61,6 +61,19 @@ class RecallConfig:
     #: 自己抽出来的事实全是全局的 —— 作用域能挡住别的项目经 CLI 写入的事实，
     #: 但挡不住别的项目会话里抽出的事实。
     project_scope: Optional[str] = None
+    #: L2 是否启用**双路 RRF 融合**（向量 + 词法都跑、按排名融合）。
+    #:
+    #: ``False``（默认）= 历史行为：向量可用则只跑向量，向量不可用才退词法
+    #: （二选一链路）。``True`` 时两路都跑：精确子串命中的事实不再因为向量
+    #: 通道可用而被整体跳过，双通道确认的事实按 RRF 排名升到前面。
+    #:
+    #: 分数语义：融合后 ``score`` 是**排名量纲**（RRF 归一化到 (0,1]），
+    #: 每条命中另存 ``metadata["native_score"]``（向量=余弦分 / 词法=子串分）；
+    #: ``recall.l2_min_score`` 门槛对原生分生效（余弦标尺不量排名）——见
+    #: :func:`_recall._fuse_l2_channels` 与 ``format_recall``。
+    #:
+    #: **默认 False = 现行为**：与本文件其它新行为同一约定，部署侧显式开启。
+    l2_fusion: bool = False
 
 
 @dataclass
@@ -77,6 +90,14 @@ class SyncConfig:
     extract_async: bool = True
     write_queue_maxsize: int = 100
     l2_max_facts_per_turn: int = 15   # write-path cap; independent of recall.l2_max_results
+    #: 每个 agent 的 L2 容量上限。**0 = 关闭（默认 = 现行为：永不淘汰）**。
+    #:
+    #: 开启（建议 200）后每次 ``remember`` 写入前检查：将超限时把**最少
+    #: 使用**（last_used 升序，平手按写入时间）的同 agent 事实降级归档到
+    #: ``l2_archive.jsonl``（可恢复，不写墓碑 —— 被挤掉的可以再写回来）。
+    #: 容量是唯一的自动遗忘，且遗忘只降级不删除（WeKnora demote-not-delete）。
+    #: 开启同时启用召回命中的 ``l2_usage`` 计数 —— 淘汰的受害者选择需要它。
+    l2_max_items: int = 0
     # 2026-09-16: 50 → 15。`_index_l2` 每次收到的是**整段会话历史**，靠去重兜底，
     # 上限偏大时一次 turn 会灌进几十条（实测 09:58:17 一秒写入 36 条）。
 
@@ -178,6 +199,46 @@ class KnowledgeConfig:
     recall_min_kw_score: float = 0.0
     #: 一次提示最多列出几篇笔记。
     recall_max_notes: int = 3
+
+    #: 融合算法：``"linear"``（默认，历史行为）或 ``"rrf"``（加权 RRF）。
+    #:
+    #: RRF 按**排名**融合关键词/语义两路（``w/(k+rank)``，k=60），而不是按
+    #: 原始分加权 —— 两路量纲不同（关键词归一化分 vs 余弦分），线性加权会被
+    #: 单路极值主导。归一化后分数天花板与线性模式一致（纯关键词 ≤ 0.4 /
+    #: 纯语义 ≤ 0.6 / 双路第一名 = 1.0），所以 ``recall_min_score`` /
+    #: ``recall_min_kw_score`` 两条准入走廊在两种模式下语义不变。
+    #: 未知值一律按 ``"linear"`` 处理（告警不抛错，读路径绝不因脏配置挂掉）。
+    fusion: str = "linear"
+    #: MMR 去冗余的 λ（0 = 关闭，保持历史排序；建议 0.7）。
+    #:
+    #: 选 top_k 时用 ``λ·融合分 − (1−λ)·与已选项的最大相似度``，相似度取
+    #: title+snippet 的 bigram Jaccard（零依赖）。相似度为 0 的条目完全按
+    #: 融合分排序 —— MMR 只挤掉近似重复项，不搅动本来就不相似的结果。
+    mmr_lambda: float = 0.0
+    #: 是否启用**使用度亲和度**（含命中计数落表）。
+    #:
+    #: ``False``（默认）= 零副作用：不读不写使用度表，排序与历史一致。
+    #: ``True`` 时排序乘 ``1 + 0.15·log1p(hits)/log1p(8)``（封顶 ×1.15）：
+    #: 缓慢复利的微推，不是正反馈回路 —— 被反复召回的笔记略微上浮，
+    #: 但永远不会因为「曾经热过」而霸榜。命中计数由召回提示通道写入
+    #: （见 ``KnowledgeBase.touch``），也是晋升/归档（Phase 2）的数据源。
+    affinity_enabled: bool = False
+
+    #: 晋升门槛：inbox 笔记被召回命中 ≥ N 次后标 ``promote_suggest``，
+    #: 由 ``governed_kb_review approve`` 确认晋升进 ``notes/``。
+    #: 阈值才晋升（对应 WeKnora interest_threshold=3）—— 命中是慢信号，
+    #: 第一次被用上就晋升会把 inbox 变成第二个正库。
+    promote_hits: int = 3
+    #: 自动归档天数：自动区（inbox/knowledge）笔记命中数为 0 且超过 N 天
+    #: 未更新 → 治理巡检建议移入 ``archive/``（降级不删除）。
+    #: **无使用度数据时巡检跳过归档**（fail-closed：「没数据」≠「没被用过」）。
+    auto_archive_days: int = 45
+    #: 入库富化（Phase 4）：``add`` 时用 LLM 生成一行 ``summary`` + 2~3 个
+    #: ``questions`` 存进 frontmatter，喂给关键词召回路 —— 纯向量对精确
+    #: 术语的漏召回由这些显式词补上（WeKnora 的 summary / generated
+    #: questions）。**默认 False = 现行为**；LLM 调用走 ``config.synthesis``
+    #: 端点，写入时一次（非查询时），失败不阻断写入。
+    enrich: bool = False
 
 
 @dataclass
@@ -453,7 +514,7 @@ _NUMERIC_FIELDS = {
     "vector": ["dim"],
     "embedding": ["dimensions"],
     "kb": ["top_k", "min_score", "recall_min_score", "recall_min_kw_score",
-           "recall_max_notes"],
+           "recall_max_notes", "mmr_lambda"],
     "asr": ["timeout_seconds", "chunk_minutes", "max_encoded_bytes"],
 }
 

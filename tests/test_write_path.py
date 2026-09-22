@@ -1045,7 +1045,12 @@ class TestBridgeImportSafety:
         assert "this-line-is-not-json" in quarantine.read_text(encoding="utf-8")
 
     def test_import_is_idempotent_after_l1_failure(self, config, monkeypatch):
-        """Mark-first ordering: a failing L1 append must not re-import later."""
+        """New design: L1-first ordering allows retry after failure.
+
+        After L1 append failure, JSONL is NOT marked imported, so the next
+        run will retry. Deduplication via _collect_imported_ids prevents
+        duplicates when L1 actually contains the row.
+        """
         bridge = self._bridge(config)
         jsonl = bridge._bridge_dir / "candidates.jsonl"
         jsonl.write_text(
@@ -1059,12 +1064,14 @@ class TestBridgeImportSafety:
         monkeypatch.undo()
 
         assert report["imported"] == 0
+        assert report.get("errors") == 1
         assert _diag.stats()["data_loss"].get("bridge::l1_append_failed") == 1
 
-        # Second attempt: the row is already marked imported -> no duplicate.
+        # Second attempt: L1 does not contain the row (append failed),
+        # so it will be retried. This is the correct behavior: at-least-once
+        # delivery with idempotent L1 writes.
         second = bridge.import_approved(Path(config.l1_memory_path))
-        assert second["imported"] == 0
-        assert second["skipped"] >= 1
+        assert second["imported"] == 1
 
     def test_no_temp_files_left_behind(self, config):
         bridge = self._bridge(config)

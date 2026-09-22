@@ -34,8 +34,13 @@ from typing import Any, Dict, List, Optional, Tuple
 
 logger = logging.getLogger(__name__)
 
-#: vault 的标准子目录（PARA + inbox + notes）
-VAULT_SUBDIRS = ["inbox", "notes", "projects", "areas", "resources", "archive"]
+#: vault 的标准子目录（PARA + inbox + notes + knowledge 自动区）
+#:
+#: ``knowledge`` 是自动沉淀区（knowledge_collector/processor 的落点）。加入
+#: 白名单只影响 ``kb-add`` 的 section 归属判定与 backlinks 范围 —— 检索侧
+#: （``_kb.iter_vault_notes``）本来就全库扫描，不受此表影响。
+VAULT_SUBDIRS = ["inbox", "notes", "projects", "areas", "resources", "archive",
+                 "knowledge"]
 
 #: Windows / 通用文件系统非法字符（文件名用）
 _ILLEGAL_FS = re.compile(r'[<>:"/\\|?*\x00-\x1f]')

@@ -355,7 +355,11 @@ def test_embedding_signature_reads_key_from_dotenv(dotenv_home, monkeypatch):
     _write_env(dotenv_home, "EMB_DOTENV_SIG=emb-from-dotenv\n")
     cfg = GovernedMemoryConfig()
     cfg.embedding.api_key_env = "EMB_DOTENV_SIG"
-    assert "emb-from-dotenv" in _embedding.EmbeddingService._build_signature(cfg)
+    # 签名现在包含密钥的 SHA-256 哈希（前16字符），而非明文
+    import hashlib
+    expected_hash = hashlib.sha256(b"emb-from-dotenv").hexdigest()[:16]
+    sig = _embedding.EmbeddingService._build_signature(cfg)
+    assert expected_hash in sig
 
 
 def test_embedding_api_probe_uses_dotenv_key(dotenv_home, monkeypatch):
@@ -420,7 +424,11 @@ def test_embedding_api_probe_blank_env_falls_back_to_dotenv(dotenv_home, monkeyp
         assert service.available is True
         assert captured["headers"]["Authorization"] == "Bearer sk-emb-blank"
         # 指纹也读到了同一个值（配置变化时才会重建单例）
-        assert "sk-emb-blank" in _embedding.EmbeddingService._build_signature(cfg)
+        # 签名现在包含密钥的 SHA-256 哈希（前16字符），而非明文
+        import hashlib
+        expected_hash = hashlib.sha256(b"sk-emb-blank").hexdigest()[:16]
+        sig = _embedding.EmbeddingService._build_signature(cfg)
+        assert expected_hash in sig
     finally:
         _embedding.EmbeddingService.reset()
 

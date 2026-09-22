@@ -448,10 +448,11 @@ class BridgeExporter:
 
         Already-imported rows (imported=true) are skipped.
 
-        Ordering (crash-safety): rows are marked imported and written back
-        ATOMICALLY (temp file + os.replace) BEFORE anything is appended to L1.
-        A failure during the L1 append can therefore only lose an import
-        (reported as data loss), never duplicate one.
+        Ordering (crash-safety): L1 append happens BEFORE JSONL marking.
+        If L1 append fails, JSONL is NOT marked, so the next run will retry.
+        To prevent duplicates, L1 content is checked for existing bridge IDs
+        before appending. This ensures at-least-once delivery with idempotent
+        L1 writes (never exactly-once, but never lose data).
 
         Unparsable lines are never deleted: they are kept verbatim in
         candidates.jsonl and copied to candidates.corrupt.jsonl for triage.
@@ -544,14 +545,26 @@ class BridgeExporter:
                     "blocked_secrets": blocked_secrets,
                     "blocked_content": blocked_content}
 
-        # 1) Mark imported + atomic rewrite FIRST (no duplicate imports).
-        if not self._mark_imported(jsonl_path, rows, {r.get("id") for r in to_import}):
+        # Deduplicate: check which IDs are already in L1 to prevent duplicates
+        # on retry after a previous partial failure.
+        already_imported = self._collect_imported_ids(l1_file)
+        to_import_deduped = [
+            row for row in to_import
+            if row.get("id") not in already_imported
+        ]
+        skipped += len(to_import) - len(to_import_deduped)
+        to_import = to_import_deduped
+
+        if not to_import:
+            # All candidates already in L1 — just mark JSONL and return.
+            self._mark_imported(jsonl_path, rows, set())
             return {"imported": 0, "skipped": skipped,
                     "corrupt_lines": len(corrupt_lines),
                     "blocked_secrets": blocked_secrets,
-                    "blocked_content": blocked_content, "errors": 1}
+                    "blocked_content": blocked_content}
 
-        # 2) Then land them in L1 (a failure here only loses an import).
+        # 1) Land them in L1 FIRST — if this fails, JSONL is NOT marked,
+        #    so the next run will retry (with deduplication above).
         try:
             l1_file.parent.mkdir(parents=True, exist_ok=True)
             with open(l1_file, "a", encoding="utf-8") as f:
@@ -560,7 +573,8 @@ class BridgeExporter:
                     if not content:
                         continue
                     source = row.get("source", "bridge")
-                    f.write(f"\n\n<!-- bridge:imported source={source} date={datetime.now().date()} -->\n")
+                    row_id = row.get("id", "")
+                    f.write(f"\n\n<!-- bridge:imported id={row_id} source={source} date={datetime.now().date()} -->\n")
                     f.write(f"- {content}\n")
                     imported += 1
         except Exception as e:  # noqa: BLE001 - must be reported, not swallowed
@@ -572,6 +586,21 @@ class BridgeExporter:
                 exc=e,
             )
             skipped += len(to_import) - imported
+            # Do NOT mark JSONL — next run will retry with deduplication.
+            return {"imported": imported, "skipped": skipped,
+                    "corrupt_lines": len(corrupt_lines),
+                    "blocked_secrets": blocked_secrets,
+                    "blocked_content": blocked_content, "errors": 1}
+
+        # 2) Mark JSONL as imported ONLY after L1 append succeeds.
+        imported_ids = {r.get("id") for r in to_import[:imported]}
+        if not self._mark_imported(jsonl_path, rows, imported_ids):
+            log_data_loss(
+                "bridge",
+                "jsonl_mark_failed",
+                detail=f"L1 append succeeded ({imported} rows) but JSONL marking failed; "
+                       "next run may duplicate imports (L1 dedup will prevent)",
+            )
 
         logger.info(
             "Bridge import_approved: %d imported, %d skipped, %d corrupt, "
@@ -582,6 +611,26 @@ class BridgeExporter:
                 "corrupt_lines": len(corrupt_lines),
                 "blocked_secrets": blocked_secrets,
                 "blocked_content": blocked_content}
+
+    @staticmethod
+    def _collect_imported_ids(l1_path: Path) -> set:
+        """Collect bridge candidate IDs already present in L1.
+
+        Scans L1 for ``<!-- bridge:imported id=... -->`` comments to enable
+        idempotent retries: if a previous run partially failed after L1 append
+        but before JSONL marking, the next run will skip already-imported rows.
+        """
+        ids: set = set()
+        if not l1_path.exists():
+            return ids
+        try:
+            content = l1_path.read_text(encoding="utf-8", errors="replace")
+            import re
+            for m in re.finditer(r"<!-- bridge:imported id=(\S+)", content):
+                ids.add(m.group(1))
+        except OSError:
+            pass
+        return ids
 
     @staticmethod
     def _row_has_secret(row: dict) -> bool:

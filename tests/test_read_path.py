@@ -835,8 +835,8 @@ class TestEmbeddingService:
         assert config.embedding.dimensions == 768  # API 场景覆盖 dimensions
         assert config.vector.dim == 512  # 本地 vector.dim 不动
 
-    def test_api_failure_is_negative_cached(self, config, monkeypatch):
-        """API 探测失败后不再每次重试。"""
+    def test_api_failure_fallback_to_local(self, config, monkeypatch):
+        """API 探测失败后降级到本地后端（而非标记为不可用）。"""
         config.embedding.provider = "openai"
         config.embedding.base_url = "https://api.example.com/v1"
         config.embedding.model = "m"
@@ -852,11 +852,10 @@ class TestEmbeddingService:
         monkeypatch.setattr("httpx.post", failing_post)
         service = EmbeddingService.get(config)
 
-        assert service.available is False
-        assert "network down" in service.last_error
-        for _ in range(5):
-            service.embed_one("x")
-        assert calls["n"] == 1, "探测失败后仍在每次调用重试"
+        # API 失败后应该降级到本地后端，而不是标记为不可用
+        assert service.available is True
+        assert "local:" in service.backend_name
+        assert calls["n"] == 1, "API 探测只调用一次"
 
     def test_config_change_reprobes(self, config, monkeypatch):
         monkeypatch.setattr("plugin.memory_governed._embedding.load_embedder",

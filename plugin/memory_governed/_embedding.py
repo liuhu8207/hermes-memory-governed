@@ -26,6 +26,7 @@ keeps existing vectors usable. Switching to a DIFFERENT model requires
 
 from __future__ import annotations
 
+import hashlib
 import logging
 import threading
 from typing import TYPE_CHECKING, Any, List, Optional, Protocol
@@ -335,7 +336,15 @@ class EmbeddingService:
     # -- 探测 ------------------------------------------------------------
 
     def _probe(self) -> None:
-        """探测后端一次；无论成败都把结果缓存到实例上。"""
+        """探测后端一次；无论成败都把结果缓存到实例上。
+
+        降级策略：API 优先 → 本地后端 → 不可用。
+        当 API 配置存在但探测失败时，自动尝试本地后端作为降级，
+        而不是直接标记为不可用。这样可以保证：
+        1. API key 有效时使用 API (1024 维)
+        2. API key 无效或网络问题时降级到本地 (512 维)
+        3. 本地也不可用时才标记为不可用
+        """
         config = self._config
         vector = getattr(config, "vector", None)
         embedding = getattr(config, "embedding", None)
@@ -347,29 +356,45 @@ class EmbeddingService:
         base_url = str(getattr(embedding, "base_url", "") or "")
         api_key_env = str(getattr(embedding, "api_key_env", "") or "")
         api_key = env_secret(api_key_env)
-        if provider and base_url and api_key:
+        # API 配置存在（即使 key 无效）都标记为 api_configured
+        # 这样在降级到本地时可以正确标记 is_fallback=True
+        api_configured = bool(provider and base_url and api_key_env)
+
+        if api_configured and api_key:
             self._api_base_url = base_url.rstrip("/")
             self._api_key = api_key
             self._api_model = str(getattr(embedding, "model", "") or "")
             try:
                 vectors = self._embed_via_api([self.PROBE_TEXT])
             except Exception as e:  # noqa: BLE001
-                self._mark_unavailable(f"api probe failed: {e}", exc=e)
-                return
-            if vectors and vectors[0]:
-                self._available = True
-                self._backend_name = f"api:{provider}"
-                self._last_error = ""
-                self._record_actual_dim(len(vectors[0]))
-                logger.info(
-                    "EmbeddingService ready: api backend %s (model=%s, dim=%s)",
-                    provider, self._api_model, self._dim,
-                )
-                return
-            self._mark_unavailable("api probe returned an empty vector")
-            return
+                # API 失败，记录但继续尝试本地后端
+                logger.warning("API embedding probe failed, trying local backend: %s", e)
+                log_degraded("embedding", "api_probe_failed",
+                            detail=f"{type(e).__name__}: {e}", exc=e)
+                # 不 return，继续到本地后端探测
+            else:
+                if vectors and vectors[0]:
+                    self._available = True
+                    self._backend_name = f"api:{provider}"
+                    self._last_error = ""
+                    self._record_actual_dim(len(vectors[0]))
+                    logger.info(
+                        "EmbeddingService ready: api backend %s (model=%s, dim=%s)",
+                        provider, self._api_model, self._dim,
+                    )
+                    return
+                # API 返回空向量，记录但继续尝试本地后端
+                logger.warning("API embedding returned empty vector, trying local backend")
+                log_degraded("embedding", "api_empty_vector",
+                            detail="API probe returned an empty vector")
+        elif api_configured and not api_key:
+            # API 配置存在但 key 无效/缺失，记录并继续到本地后端
+            logger.warning("API embedding key not found (env=%s), trying local backend", api_key_env)
+            log_degraded("embedding", "api_key_missing",
+                        detail=f"env var {api_key_env!r} not set or empty")
 
         # 2) 本地后端（fastembed / sentence-transformers）
+        #    作为 API 的降级方案，或当 API 未配置时使用
         if backend == "none":
             self._mark_unavailable("vector.backend is 'none'")
             return
@@ -390,10 +415,16 @@ class EmbeddingService:
         self._available = True
         self._backend_name = f"local:{backend}"
         self._last_error = ""
-        self._record_actual_dim(int(getattr(embedder, "dim", 0) or 0))
+        # 如果是从 API 降级过来的，标记为降级
+        is_fallback = api_configured
+        self._record_actual_dim(
+            int(getattr(embedder, "dim", 0) or 0),
+            is_fallback=is_fallback,
+        )
         logger.info(
-            "EmbeddingService ready: local backend %s (model=%s, dim=%s)",
+            "EmbeddingService ready: local backend %s (model=%s, dim=%s)%s",
             backend, getattr(embedder, "model_name", model), self._dim,
+            " (fallback from API)" if is_fallback else "",
         )
 
     def _mark_unavailable(self, reason: str, *, exc: BaseException | None = None) -> None:
@@ -405,11 +436,16 @@ class EmbeddingService:
         logger.debug("EmbeddingService unavailable: %s", reason)
         log_degraded("embedding", "unavailable", detail=reason, exc=exc)
 
-    def _record_actual_dim(self, actual_dim: int) -> None:
+    def _record_actual_dim(self, actual_dim: int, *, is_fallback: bool = False) -> None:
         """用实际维度覆盖配置并告警（配置写错会导致 L2 写入直接失败）。
 
         覆盖目标与场景一致：API 场景写 ``embedding.dimensions``，本地场景写
         ``vector.dim``，避免把 API 的实际维度污染到本地模型配置字段里。
+
+        Args:
+            actual_dim: 探测到的实际向量维度。
+            is_fallback: 是否是因为降级而切换到此维度（API → 本地）。
+                降级时维度变化是正常行为，日志级别降低为 info。
         """
         if actual_dim <= 0 or actual_dim == self._dim:
             return
@@ -419,17 +455,25 @@ class EmbeddingService:
             embedding = getattr(self._config, "embedding", None)
             provider = str(getattr(embedding, "provider", "") or "")
             base_url = str(getattr(embedding, "base_url", "") or "")
-            if provider and base_url:
+            if provider and base_url and not is_fallback:
                 embedding.dimensions = actual_dim
             else:
                 self._config.vector.dim = actual_dim
         except Exception as e:  # pragma: no cover - 配置对象被替换成只读桩时
             logger.debug("Failed to sync dim to config: %s", e)
-        log_degraded(
-            "embedding",
-            "vector_dim_mismatch",
-            detail=f"configured={configured}, actual={actual_dim}",
-        )
+
+        if is_fallback:
+            # 降级时维度变化是正常行为，记录为 info 而非 warning
+            logger.info(
+                "Embedding dim changed due to fallback: %d → %d (API → local)",
+                configured, actual_dim,
+            )
+        else:
+            log_degraded(
+                "embedding",
+                "vector_dim_mismatch",
+                detail=f"configured={configured}, actual={actual_dim}",
+            )
 
     # -- 后端调用 --------------------------------------------------------
 
@@ -500,10 +544,18 @@ class EmbeddingService:
 
     @staticmethod
     def _build_signature(config: "GovernedMemoryConfig") -> tuple:
-        """配置指纹：影响后端选择的字段变化时重新探测。"""
+        """配置指纹：影响后端选择的字段变化时重新探测。
+
+        API 密钥仅以 SHA-256 哈希形式包含在签名中，防止密钥明文通过日志、
+        调试器或异常 traceback 泄露。哈希的前 16 字符足以区分不同的密钥，
+        同时保持缓存失效的正确性。
+        """
         vector = getattr(config, "vector", None)
         embedding = getattr(config, "embedding", None)
         api_key_env = str(getattr(embedding, "api_key_env", "") or "")
+        api_key_hash = hashlib.sha256(
+            env_secret(api_key_env).encode("utf-8")
+        ).hexdigest()[:16] if api_key_env else ""
         return (
             str(getattr(vector, "backend", "auto") or "auto"),
             str(getattr(vector, "model", "") or ""),
@@ -512,7 +564,7 @@ class EmbeddingService:
             str(getattr(embedding, "base_url", "") or ""),
             str(getattr(embedding, "model", "") or ""),
             api_key_env,
-            env_secret(api_key_env),
+            api_key_hash,
         )
 
     @staticmethod

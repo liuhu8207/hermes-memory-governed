@@ -22,6 +22,7 @@ from ._persona import persona_only
 
 from ._config import GovernedMemoryConfig
 from ._embedding import EmbeddingService
+from ._lifecycle import resolve_memory_dir, usage_touch
 
 try:  # pragma: no cover - _diag.py 由另一位工程师并行新建
     from ._diag import log_degraded, log_data_loss
@@ -189,10 +190,99 @@ def row_to_score(row: Any) -> float:
         return distance_to_score(DEFAULT_COSINE_DISTANCE)
     try:
         distance = getter("_distance", DEFAULT_COSINE_DISTANCE)
-    except Exception as e:  # noqa: BLE001 — 行的 get 可能抛任意异常
+    except Exception as e:  # noqa: BLE001 - 行的 get 可能抛任意异常
         logger.debug("L2 row _distance lookup failed, using default: %s", e)
         distance = DEFAULT_COSINE_DISTANCE
     return distance_to_score(distance)
+
+
+#: L2 双路融合的 RRF 衰减常数（与 ``_kb._RRF_K`` 同值；两模块互不 import
+#: —— ``_kb`` 已经依赖本模块，反向引入会成环）。
+_L2_RRF_K = 60
+
+#: RRF 两路等权：向量与词法各 0.5。没有先验说明哪路更可信 —— 向量长于
+#: 同义改写，词法长于精确术语，让排名说话。
+_L2_RRF_W_VEC = 0.5
+_L2_RRF_W_LEX = 0.5
+
+
+def _fuse_l2_channels(vec: List["RecallResult"],
+                      lex: List["RecallResult"]) -> List["RecallResult"]:
+    """向量 + 词法两路按加权 RRF 融合（``recall.l2_fusion`` 开启时）。
+
+    分数语义（与 ``_kb._rrf_fuse`` 的单路上限约定不同 —— 这里按**实际出现
+    的通道**归一化）：单通道第一名 = 1.0，双通道第一名 = 1.0。``score``
+    表达「在能看到的通道里排第几」，是排名量纲。
+
+    原生相似度另存 ``metadata["native_score"]``（向量 = 余弦分，词法 =
+    子串分，双路 = 取大）—— ``recall.l2_min_score``（0.76，余弦标尺标定）
+    在 ``format_recall`` 里对它生效。拿余弦标尺去量 RRF 排名分会把整层砍空，
+    这是把门槛留在原生分上的原因：**排序用融合分，准入看原生分**。
+
+    同一事实（``source_rowid`` 相同，缺失时退化为内容相同）在两路中合并为
+    一条，``metadata["trace"]`` 记下两路名次 —— 「双通道确认」是可诊断的。
+    """
+
+    def _key(r: "RecallResult") -> tuple:
+        rid = (r.metadata or {}).get("source_rowid")
+        return ("rid", rid) if rid is not None else ("content", r.content)
+
+    def _ranks(results: List["RecallResult"]) -> Dict[tuple, int]:
+        ordered = sorted(results, key=lambda r: r.score, reverse=True)
+        return {_key(r): i + 1 for i, r in enumerate(ordered)}
+
+    vec_ranks = _ranks(vec)
+    lex_ranks = _ranks(lex)
+    vec_by_key = {_key(r): r for r in vec}
+    lex_by_key = {_key(r): r for r in lex}
+
+    out: List[RecallResult] = []
+    for key in set(vec_by_key) | set(lex_by_key):
+        in_vec, in_lex = key in vec_by_key, key in lex_by_key
+        # 按实际出现的通道归一化：分母 = 出现通道的权重和在第一名处的 RRF。
+        raw = 0.0
+        present_w = 0.0
+        v_rank = vec_ranks.get(key)
+        l_rank = lex_ranks.get(key)
+        if in_vec:
+            raw += _L2_RRF_W_VEC / (_L2_RRF_K + v_rank)
+            present_w += _L2_RRF_W_VEC
+        if in_lex:
+            raw += _L2_RRF_W_LEX / (_L2_RRF_K + l_rank)
+            present_w += _L2_RRF_W_LEX
+        fused = min(1.0, raw / (present_w / (_L2_RRF_K + 1)))
+
+        # 原生分 = 各**出现**通道的原生分取大（任一通道证据足够强即过门槛）。
+        # 注意不能写成先取字典值再按 present 过滤 —— 缺席通道的键访问会在
+        # 判断之前先抛 KeyError。
+        natives = []
+        if in_vec:
+            natives.append(vec_by_key[key].score)
+        if in_lex:
+            natives.append(lex_by_key[key].score)
+        native = max(natives)
+        # 主记录优先取向量侧（多带 category 等字段），内容两路同源一致。
+        primary = vec_by_key[key] if in_vec else lex_by_key[key]
+        meta = dict(primary.metadata or {})
+        meta["native_score"] = round(native, 4)
+        meta["trace"] = {
+            "fusion": "rrf",
+            "vector_rank": v_rank,
+            "lexical_rank": l_rank,
+            "channels": ([c for c, on in (("vector", in_vec), ("lexical", in_lex))
+                          if on]),
+        }
+        out.append(RecallResult(
+            layer="l2",
+            content=primary.content,
+            score=round(fused, 4),
+            source=primary.source,
+            metadata=meta,
+        ))
+    # 分数降序；同分按内容字典序稳定排序 —— 上游按 set 并集迭代，
+    # 不加 tiebreak 同分顺序会跨进程漂移（测试与 trace 都要求可复现）。
+    out.sort(key=lambda r: (-r.score, r.content))
+    return out
 
 
 @dataclass
@@ -375,6 +465,12 @@ class RecallEngine:
                 logger.info("L2 recall narrowed to project scope %r "
                             "(globals always included)", project)
 
+            # 双路融合（recall.l2_fusion 开启且嵌入可用）：向量与词法都跑。
+            # 关闭时保持历史链路：向量优先，不可用才退词法（二选一）。
+            if bool(getattr(self._config.recall, "l2_fusion", False)) \
+                    and self._embed_fn is not None:
+                return self._search_l2_fused(query, project)
+
             # Try vector search first (requires embedding model)
             if self._embed_fn is not None:
                 return self._search_l2_vector(query, project)
@@ -384,6 +480,28 @@ class RecallEngine:
 
         except Exception as e:
             logger.debug("L2 search failed: %s", e)
+            return []
+
+    def _search_l2_fused(self, query: str,
+                         project: Optional[str] = None) -> List[RecallResult]:
+        """双路 RRF 融合检索（``recall.l2_fusion`` 开启时的 L2 主链路）。
+
+        两路都跑、按排名融合（见 :func:`_fuse_l2_channels`）：精确子串命中
+        的事实不再因为向量通道可用而被整体跳过 —— 旧链路是二选一。
+
+        任一路为空时直接返回另一路（不值得为单路开融合），此时 ``score``
+        仍是原生分、无 ``native_score``，门槛语义与历史行为一致。
+        """
+        try:
+            vec = self._search_l2_vector(query, project)
+            lex = self._search_l2_text(query, project)
+            if not vec:
+                return lex
+            if not lex:
+                return vec
+            return _fuse_l2_channels(vec, lex)
+        except Exception as e:
+            logger.debug("L2 fused search failed: %s", e)
             return []
 
     def _search_l2_vector(self, query: str,
@@ -1018,8 +1136,20 @@ class RecallEngine:
                     "fused_score": row["fused"],
                     "admit_via": via,
                     "index_status": h.get("index_status", {}),
+                    # 排序轨迹（融合模式/两路名次/亲和度），随提示一起可见
+                    "trace": h.get("trace", {}),
                 },
             ))
+
+        # 命中即计数（亲和度数据源）：只记真正注入提示的条目 —— 搜索不等于
+        # 消费。touch 按 kb.affinity_enabled 门禁、失败静默，提示通道绝不因
+        # 统计挂掉。
+        touch = getattr(kb, "touch", None)
+        if callable(touch):
+            try:
+                touch([r.source for r in out])
+            except Exception as e:  # noqa: BLE001
+                logger.debug("kb usage touch failed: %s", e)
         return out
 
     def _get_l4_result(self) -> Optional[RecallResult]:
@@ -1081,10 +1211,25 @@ class RecallEngine:
         recall_cfg = getattr(getattr(self, "_config", None), "recall", None)
         l2_floor = layer_score_floor("l2", recall_cfg, l2_min_score=l2_min_score)
         l3_floor = layer_score_floor("l3", recall_cfg)
+
+        def _passes_floor(r: RecallResult) -> bool:
+            """逐层准入：L3 按 FTS 分；L2 融合命中按**原生分**。
+
+            ``recall.l2_fusion`` 开启后 L2 的 ``score`` 是 RRF 排名量纲，
+            拿余弦标尺（0.76）去量它会把整层砍空 —— 所以带 ``native_score``
+            的融合命中按原生分（向量=余弦 / 词法=子串）过门槛，排序仍按
+            融合分：**排序用融合分，准入看原生分**。未融合的历史命中没有
+            ``native_score``，仍按 ``score`` —— 行为不变。
+            """
+            if r.layer == "l3":
+                return r.score >= l3_floor
+            native = (r.metadata or {}).get("native_score")
+            effective = float(native) if native is not None else r.score
+            return effective >= l2_floor
+
         l23_items = [
             r for r in results
-            if r.layer in ("l2", "l3")
-            and r.score >= (l2_floor if r.layer == "l2" else l3_floor)
+            if r.layer in ("l2", "l3") and _passes_floor(r)
         ]
 
         # 按 content 去重，只保留最高分那条：实测 L2 重复率 94.8%，
@@ -1110,6 +1255,16 @@ class RecallEngine:
                     break
                 selected.append(item)
                 used += item_chars
+
+            # 命中即计数（容量淘汰的受害者选择依据，Phase 3）：只记真正注入
+            # 上下文的事实。仅 ``sync.l2_max_items`` 开启时落表 —— 默认关闭
+            # = 读路径零副作用；失败静默，统计绝不影响召回。
+            if int(getattr(getattr(self._config, "sync", None),
+                           "l2_max_items", 0) or 0) > 0:
+                mem_dir = resolve_memory_dir(self._config)
+                if mem_dir is not None:
+                    usage_touch(mem_dir, [i.content for i in selected
+                                          if i.layer == "l2"])
 
             if selected:
                 lines = []
