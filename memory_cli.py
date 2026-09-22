@@ -1110,7 +1110,9 @@ EVAL_MAX_QUERIES = 20
 
 
 def _cons_bigrams(text: str) -> set:
-    t = re.sub(r"\s+", " ", (text or "").lower()).strip()
+    # 归一化复用查重那一份（同一规则），别再抄第四份 —— 漂移会让"相似度"
+    # 与"指纹/查重"对同一段文本给出不同答案。
+    t = _normalize_for_dedup(text)
     return {t[i:i + 2] for i in range(max(0, len(t) - 1))}
 
 

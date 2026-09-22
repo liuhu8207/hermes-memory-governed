@@ -132,6 +132,55 @@ class TestThereIsOnlyOneImplementation:
         assert module._ensure_utf8(SURROGATE) == _text.sanitize_utf8(SURROGATE), (
             "MCP 侧没有走共享实现")
 
+    def test_normalisation_has_exactly_one_implementation(self):
+        """查重/指纹的归一化只有一份：``_text.normalize_for_match``。
+
+        墓碑指纹（撤回）与 KB 包含性查重必须同规则，漂移的后果是**静默**的：
+        要么"撤回的事实被重新抽取复活"，要么"查重失效"。插件内已别名化。
+
+        检测本身可自证：同一模式在 ``_text.py`` 里应恰好 1 处（规范实现），
+        在 CLI 里应恰好 1 处（那一份**必须**留着 —— CLI 要在什么都没装的解释器
+        上跑），在 ``_kb``/``_lifecycle`` 里应为 0 处。
+
+        判据是**归一化那个形状**：同时含 ``re.sub(r"\\s+", " ",`` 与 ``.lower()``。
+        只折叠空白、不降大小写的用途（``slugify`` 的文件名、``kb-search`` 的
+        摘要压缩）不算同一规则，不该被误伤。
+        """
+        needle = 're.sub(r"\\s+", " ",'
+
+        def _count(path: Path) -> int:
+            return sum(1 for line in path.read_text(encoding="utf-8").splitlines()
+                       if needle in line and ".lower()" in line)
+
+        canon = _count(REPO / "plugin" / "memory_governed" / "_text.py")
+        assert canon == 1, f"规范实现应恰好 1 处，实测 {canon} 处（检测器失效？）"
+
+        for name in ("_kb.py", "_lifecycle.py"):
+            n = _count(REPO / "plugin" / "memory_governed" / name)
+            assert n == 0, f"{name} 又冒出 {n} 处归一化实现 —— 请调用 _text.normalize_for_match"
+
+        cli_n = _count(REPO / "memory_cli.py")
+        assert cli_n == 1, (
+            f"CLI 侧的归一化拷贝应是 1 处（设计如此），实测 {cli_n} 处")
+
+    def test_the_cli_copy_still_matches_the_plugin_rule(self):
+        """CLI 那份拷贝**删不掉**（依赖轻量是设计目标），所以只能钉住一致。
+
+        与 ``_status_for_section`` 两侧由测试钉一致同一个思路。
+        """
+        from plugin.memory_governed import _kb
+        import memory_cli
+
+        assert _kb._normalize_for_dedup is _text.normalize_for_match, (
+            "插件侧应别名到唯一实现，而不是自己再实现一份")
+        assert _kb._DEDUP_MIN_CHARS == _text.DEDUP_MIN_CHARS
+        assert memory_cli._DEDUP_MIN_CHARS == _text.DEDUP_MIN_CHARS
+
+        for case in ("  Hello   World ", "中文　全角空格", "\t\nA\r\nB\n",
+                     "Already-normal", "", None):
+            assert (memory_cli._normalize_for_dedup(case)
+                    == _text.normalize_for_match(case)), f"CLI 拷贝漂移了: {case!r}"
+
     def test_sync_turn_sanitizes_at_the_ingress(self):
         """The choke point: one call covers archive, FTS mirror and extraction."""
         tree = ast.parse((REPO / "plugin/memory_governed/__init__.py")

@@ -37,6 +37,7 @@ from ._embedding import EmbeddingService
 from ._bridge import has_secret_like_text
 from ._llm import chat_completion
 from ._recall import row_to_score
+from ._text import DEDUP_MIN_CHARS, normalize_for_match
 from . import _vault
 
 logger = logging.getLogger(__name__)
@@ -98,6 +99,17 @@ _AFFINITY_SATURATION = 8
 _MMR_POOL_FACTOR = 5
 _MMR_POOL_MIN = 20
 _MMR_POOL_MAX = 60
+
+
+def _mmr_pool_size(top_k: int) -> int:
+    """候选池规模：``top_k * factor``，钳在 ``[MIN, MAX]``。
+
+    **一处定义、两处调用**（语义取数与 ``_mmr_select`` 的池上限）—— 两边各写
+    一份的话，"多取多少候选"与"去冗余时能看到多少"会悄悄对不上。而 over-fetch
+    是 MMR 的**承重**部分：实测把池压到 ``top_k`` 后，近重复项立刻活下来。
+    """
+    return min(max(int(top_k or 1) * _MMR_POOL_FACTOR, _MMR_POOL_MIN),
+               _MMR_POOL_MAX)
 
 
 def _rrf_fuse(kw_scores: Dict[str, float], sem_scores: Dict[str, float],
@@ -250,12 +262,15 @@ def _status_for_section(section: str) -> str:
 
 #: 包含性查重的最小正文长度（归一化后）。低于它的正文（"好的""收到"）互相
 #: 包含是常态而不是重复 —— 门槛太低会把琐碎确认当重复拒掉。
-_DEDUP_MIN_CHARS = 120
+#: 值取自 ``_text``（唯一来源）；CLI 侧那份拷贝由测试钉住一致。
+_DEDUP_MIN_CHARS = DEDUP_MIN_CHARS
 
 
-def _normalize_for_dedup(text: str) -> str:
-    """查重用的正文归一化：小写 + 折叠全部空白。"""
-    return re.sub(r"\s+", " ", (text or "").lower()).strip()
+#: 查重归一化 = ``_text.normalize_for_match`` 的**别名**（唯一实现，别抄第二份）。
+#: 墓碑指纹与包含性查重必须同规则，漂移的后果是**静默**的：要么"撤回的事实
+#: 复活"，要么"查重失效"。CLI 侧因"必须能在什么都没装的解释器上跑"另存一份
+#: 拷贝 —— 那一份由 ``tests/test_text_hygiene.py`` 钉住与本实现行为一致。
+_normalize_for_dedup = normalize_for_match
 
 
 def _enrich_note(title: str, body: str, config: Any) -> Dict[str, Any]:
@@ -1349,8 +1364,7 @@ class KnowledgeBase:
         lam = float(getattr(kb_cfg, "mmr_lambda", 0.0) or 0.0)
         sem_fetch = top_k
         if 0.0 < lam < 1.0:
-            sem_fetch = min(max(top_k * _MMR_POOL_FACTOR, _MMR_POOL_MIN),
-                            _MMR_POOL_MAX)
+            sem_fetch = _mmr_pool_size(top_k)
 
         # 两路各自的归一化分（缺一路时置 0，由权重归一化兜底）
         kw_norm: Dict[str, float] = {}
@@ -1562,9 +1576,7 @@ class KnowledgeBase:
         """
         if len(ranked) <= top_k:
             return ranked
-        pool_size = min(len(ranked),
-                        max(top_k * _MMR_POOL_FACTOR, _MMR_POOL_MIN),
-                        _MMR_POOL_MAX)
+        pool_size = min(len(ranked), _mmr_pool_size(top_k))
         pool = ranked[:max(pool_size, top_k)]
 
         grams = [_bigrams((it.get("title") or "") + " " + (it.get("snippet") or ""))

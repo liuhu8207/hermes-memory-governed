@@ -34,6 +34,8 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
+from ._text import normalize_for_match
+
 logger = logging.getLogger(__name__)
 
 _TOMBSTONES_NAME = "l2_tombstones.json"
@@ -44,11 +46,11 @@ _USAGE_NAME = "l2_usage.db"
 def content_fp(text: str) -> str:
     """内容指纹：归一化（小写 + 折叠空白）后 sha256。
 
-    与 KB 查重用的归一化同一规则 —— 重新抽取生成的**同句**事实必然命中
-    同一指纹；改写（paraphrase）不命中是可接受的边界（墓碑记的是「这句
-    话被明确撤回过」，不是语义等价检测）。
+    归一化走 ``_text.normalize_for_match`` —— **同一份实现**，因为 KB 查重也
+    用它；重新抽取生成的**同句**事实必然命中同一指纹，改写（paraphrase）不命中
+    是可接受的边界（墓碑记的是「这句话被明确撤回过」，不是语义等价检测）。
     """
-    norm = re.sub(r"\s+", " ", (text or "").lower()).strip()
+    norm = normalize_for_match(text)
     return hashlib.sha256(norm.encode("utf-8")).hexdigest()
 
 

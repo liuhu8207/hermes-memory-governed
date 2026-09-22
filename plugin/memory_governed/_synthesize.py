@@ -21,6 +21,7 @@ import re
 from typing import Any, Dict, List
 
 from ._config import env_secret
+from ._llm import chat_completion
 
 logger = logging.getLogger(__name__)
 
@@ -204,49 +205,24 @@ def synthesize_notes(
         return []
 
     try:
-        import httpx  # type: ignore
-    except ImportError:
-        logger.warning("synthesis requires httpx; skipping")
-        return []
-
-    max_candidates = 5
-    try:
         max_candidates = int(getattr(syn, "max_candidates", 5) or 5)
     except (TypeError, ValueError):
         max_candidates = 5
     if max_candidates < 1:
         max_candidates = 1
 
-    endpoint = base_url.rstrip("/") + "/chat/completions"
-    payload = {
-        "model": model,
-        "messages": [
+    # 走共享的 ``_llm.chat_completion`` —— **不再自己维护第二份 chat/completions
+    # 客户端**。端点、鉴权头、响应解析、以及密钥查找（``env_secret``，所以
+    # ``.env`` 回退也一并继承）由此只有一处实现。失败一律返回 ``None``。
+    content = chat_completion(
+        [
             {"role": "system", "content": _SYNTH_SYSTEM_PROMPT},
             {"role": "user", "content": transcript},
         ],
-        "temperature": 0.2,
-        "max_tokens": 8000,
-    }
-    try:
-        r = httpx.post(
-            endpoint,
-            headers={"Authorization": f"Bearer {api_key}"},
-            json=payload,
-            timeout=timeout,
-        )
-    except Exception as e:  # noqa: BLE001
-        logger.warning("synthesis request failed: %s", e)
-        return []
-
-    if r.status_code >= 400:
-        logger.warning("synthesis HTTP %s: %s", r.status_code, r.text[:300])
-        return []
-
-    try:
-        data = r.json()
-        content = data["choices"][0]["message"]["content"]
-    except Exception as e:  # noqa: BLE001
-        logger.warning("synthesis bad response: %s", e)
+        config, temperature=0.2, max_tokens=8000, timeout=timeout,
+    )
+    if content is None:
+        logger.warning("synthesis llm call returned nothing; skipping")
         return []
 
     return _parse_candidates(str(content))[:max_candidates]
