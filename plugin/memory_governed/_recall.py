@@ -124,9 +124,18 @@ def layer_score_floor(layer: str, recall_cfg=None, *,
 
     * **L3**（FTS5 关键词 + 时间衰减）：有效命中实测 0.3~0.7，门槛沿用
       :data:`MIN_SCORE`（0.1）。
-    * **L2**（1024 维余弦映射 ``1 - d/2``）：无关查询的地板分就有 0.73，
-      门槛取 ``recall.l2_min_score``；未配置（``0.0``）时**回退**到
-      :data:`MIN_SCORE`，保证老配置行为不变。
+    * **L2**（1024 维，经 :func:`distance_to_score` 映射 ``1 - d/2``，
+      **不是**原始余弦相似度）：无关查询的地板分就有 0.73（score 标尺；
+      对应原始 cos ≈ 0.46）。门槛取 ``recall.l2_min_score``；未配置
+      （``0.0``）时**回退**到 :data:`MIN_SCORE`，保证老配置行为不变。
+
+    ⚠️ 0.73 是 2026-09-16 在 **21 条精选**语料上的旧标定，别当普适数。
+    2026-09-22 用独立构造的查询集重测（每条相关查询的正确行都指名在库里）：
+    噪声上沿在 33 行精选集上 0.7686、在 1632 行（含 rebuild 碎片）上
+    **0.8914**，而相关下沿只有 0.7427 / 0.7506 ⇒ **两带始终重叠**，不存在
+    能全挡噪声又全保相关的阈值。0.76 只作粗筛，其数值本身不要动；完整测量
+    见 ``_config.RecallConfig.l2_min_score`` 与
+    ``memory_cli.DEFAULT_L2_SEMANTIC_FLOOR`` 的注释。
 
     Args:
         layer: ``"l2"`` / ``"l3"`` 等记忆层标识。
@@ -214,10 +223,11 @@ def _fuse_l2_channels(vec: List["RecallResult"],
     的通道**归一化）：单通道第一名 = 1.0，双通道第一名 = 1.0。``score``
     表达「在能看到的通道里排第几」，是排名量纲。
 
-    原生相似度另存 ``metadata["native_score"]``（向量 = 余弦分，词法 =
-    子串分，双路 = 取大）—— ``recall.l2_min_score``（0.76，余弦标尺标定）
-    在 ``format_recall`` 里对它生效。拿余弦标尺去量 RRF 排名分会把整层砍空，
-    这是把门槛留在原生分上的原因：**排序用融合分，准入看原生分**。
+    原生相似度另存 ``metadata["native_score"]``（向量 =
+    :func:`distance_to_score` 的 score 标尺 ``(1+cos)/2``，**不是**原始余弦；
+    词法 = 子串分；双路 = 取大）—— ``recall.l2_min_score``（0.76，同一 score
+    标尺）在 ``format_recall`` 里对它生效。拿这个标尺去量 RRF 排名分会把整层
+    砍空，这是把门槛留在原生分上的原因：**排序用融合分，准入看原生分**。
 
     同一事实（``source_rowid`` 相同，缺失时退化为内容相同）在两路中合并为
     一条，``metadata["trace"]`` 记下两路名次 —— 「双通道确认」是可诊断的。
@@ -288,9 +298,10 @@ def _fuse_l2_channels(vec: List["RecallResult"],
 def _l2_admitted(r, l2_floor: float) -> bool:
     """L2 单条准入：融合命中按**原生分**，未融合的按 ``score``。
 
-    ``recall.l2_fusion`` 开启后 L2 的 ``score`` 是 RRF 排名量纲，拿余弦标尺
-    （部署值 0.76）去量它会把整层砍空 —— 所以带 ``native_score`` 的融合命中
-    按原生分（向量=余弦 / 词法=子串）过门槛，排序仍按融合分：
+    ``recall.l2_fusion`` 开启后 L2 的 ``score`` 是 RRF 排名量纲，拿 score 标尺
+    （``(1+cos)/2``，部署值 0.76）去量它会把整层砍空 —— 所以带 ``native_score``
+    的融合命中按原生分（向量 = ``(1+cos)/2`` / 词法 = 子串）过门槛，排序仍按
+    融合分：
     **排序用融合分、准入看原生分**。未融合的历史命中没有 ``native_score``，
     仍按 ``score``，行为不变。
 

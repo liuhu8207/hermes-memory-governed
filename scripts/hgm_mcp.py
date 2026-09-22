@@ -225,7 +225,19 @@ def tool_recall(args: dict) -> str:
     lines = []
     hits = l2.get("hits") or []
     ranking = l2.get("ranking") or {}
-    lines.append(f"L2 facts: {len(hits)} hit(s)  [{ranking.get('basis', '?')}]")
+    # floor / filtered_out are load-bearing: without them a caller cannot tell
+    # "nothing matched" from "everything was cut by the floor" (the exact
+    # defect that made a dead floor invisible). Always printed, even when 0.
+    floor = ranking.get("floor")
+    floor_src = ranking.get("floor_source") or ""
+    filtered = ranking.get("filtered_out", 0)
+    floor_txt = f"{floor:.4f}" if isinstance(floor, (int, float)) else "?"
+    if floor_src:
+        floor_txt += f"@{floor_src}"
+    lines.append(
+        f"L2 facts: {len(hits)} hit(s)  [{ranking.get('basis', '?')}]"
+        f"  floor={floor_txt}  filtered_out={filtered}"
+    )
     for h in hits:
         who = h.get("agent") or "unattributed"
         lines.append(f"  - ({h.get('score'):.4f}) {h.get('content')}   <{who}>")

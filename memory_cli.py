@@ -545,7 +545,14 @@ _L2_TERM_SATURATION = 3
 #: 0.333 and 0.667 and the exact choice inside the window is not knife-edge.
 DEFAULT_L2_LEXICAL_FLOOR = 0.4
 
-#: Floor for the CLI's **semantic** L2 channel, on the cosine scale.
+#: Floor for the CLI's **semantic** L2 channel, on the **score** scale
+#: (``distance_to_score`` / ``1 - d/2``), *not* raw cosine similarity.
+#:
+#: Unit trap (kept explicit after a near-miss): raw cosine ``cos`` and this
+#: score are related by ``score = (1 + cos) / 2``. A floor of 0.77 on the
+#: score scale corresponds to raw cosine 0.54 — comparing 0.77 against raw
+#: cos would be off by a factor that empties or floods the channel. Every
+#: calibration number below was measured through ``distance_to_score``.
 #:
 #: A DIFFERENT quantity from :data:`DEFAULT_L2_LEXICAL_FLOOR` and a different
 #: key (``recall.l2_semantic_min_score``). It must never be read from
@@ -553,17 +560,34 @@ DEFAULT_L2_LEXICAL_FLOOR = 0.4
 #: borrowing a threshold calibrated for one quantity to cut another is exactly
 #: the defect that already emptied the lexical channel once.
 #:
-#: Calibrated 2026-09-17 against the real store (21 facts; siliconflow
-#: ``BAAI/bge-m3``, 1024-d, cosine) with 10 relevant + 8 irrelevant queries:
+#: Calibrated 2026-09-17 against a 21-fact store (siliconflow ``BAAI/bge-m3``,
+#: 1024-d) with 10 relevant + 8 irrelevant queries — on the score scale:
 #:
 #:     relevant   top1 in [0.7843, 0.9640]   10/10 kept
 #:     irrelevant top1 in [0.6693, 0.7586]    0/8 leaked
 #:
 #: The usable window is (0.7586, 0.7843]; 0.77 sits inside it with margin on
-#: both sides — 0.011 below the relevant minimum, 0.014 above the irrelevant
-#: maximum. The plugin's own cosine floor happens to be 0.76, also inside the
-#: window: the two measure the same thing, but they are deliberately separate
-#: keys so retuning one cannot silently move the other.
+#: both sides — 0.014 below the relevant minimum, 0.011 above the irrelevant
+#: maximum. (An earlier revision had the two numbers swapped; read as-is it
+#: understates one margin and overstates the other.)
+#:
+#: 2026-09-22 复核（2058 行含 rebuild 噪声时）：垃圾查询 top1 可达 0.7896，
+#: 与相关命中 0.781~0.804 区间重叠 ⇒ 地板落在噪声带内部，``filtered_out`` 恒为 0。
+#:
+#: 2026-09-22 二次复核（独立构造查询集，每条真相关查询的正确行都指名在库里，
+#: 并用 ``pre_restore`` 备份复现了 33 行基线、逐位吻合）：
+#:
+#:     33 行精选集            噪声上沿 0.7686   真相关下沿 0.7427   重叠 0.0259
+#:     1632 行（含 rebuild 碎片） 噪声上沿 0.8914   真相关下沿 0.7506   重叠 0.1408
+#:
+#: ⇒ **在任何规模的语料上都不存在能同时挡住全部噪声、又保住全部相关命中的
+#: 绝对阈值**。唯一能挡住全部噪声的窗口 (0.8914, 0.9116] 只保住 1/16 条相关
+#: 查询，等于把召回砍死。
+#:
+#: **因此不要改本常量的数值。** 这不是"选错数"，是"绝对地板"这个机制在碎片
+#: 语料上不成立。可用性来自**精选**（把碎片归纳成事实），不来自阈值 —— 33 行
+#: 精选集是唯一让正确行排到 #1 的配置。要改请改机制（相对判据：top1 与次名的
+#: gap、命中比例），并重新测量。
 DEFAULT_L2_SEMANTIC_FLOOR = 0.77
 
 #: Candidates fetched per requested hit when a project scope cannot be pushed
