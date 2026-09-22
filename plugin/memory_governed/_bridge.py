@@ -102,6 +102,16 @@ SECRET_PATTERNS = [
     re.compile(r"(?i)(api[_-]?key|app[_-]?secret|token|password|passwd|pwd|secret)\s*[:=]\s*([A-Za-z0-9][A-Za-z0-9_\-]{15,})"),
     re.compile(r"-----BEGIN [A-Z ]*PRIVATE KEY-----"),
     re.compile(r"(?i)bearer\s+[A-Za-z0-9._\-]{20,}"),
+    # CSV 形状的凭据记录：`SSH-<名>,<用户>,<口令>,ssh://<host>`。
+    #
+    # 2026-09-22 实测：就是这种形状漏进了 L2（含真实口令）。上面那条
+    # key=value 规则要求 `:`/`=` 作分隔符，而 CSV 用的是**逗号**，完全匹配
+    # 不上 —— 那条规则不是不够宽，是**量纲不对**（分隔符形状不同）。
+    #
+    # 按本文件"必须要求上下文关键词"的约定：靠 `SSH-` 前缀 + `ssh://` scheme
+    # 定位，不凭裸串高熵猜。占位符（password123 之类）也会被拦，但它们同样
+    # 不该进记忆库。
+    re.compile(r"SSH-[^,\s]{1,24},[^,\s]{1,32},[^,\s]{6,64},ssh://", re.I),
 ]
 
 # Human-readable names, index-aligned with SECRET_PATTERNS.
@@ -111,6 +121,7 @@ SECRET_PATTERN_NAMES = (
     "key_value_secret",
     "pem_private_key",
     "bearer_token",
+    "csv_credential_record",
 )
 
 

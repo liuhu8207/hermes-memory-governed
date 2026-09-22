@@ -78,6 +78,30 @@ def _rebuilt_agent() -> str:
     except Exception:  # noqa: BLE001 — dry-run must work without the plugin
         return "hermes"
 
+
+# --- 写入门禁（与写路径同一把尺子）----------------------------------------
+# 2026-09-22 实测：回灌此前**完全没有门禁**，只按长度/疑问句/祈使句过滤，
+# 于是一次重建就把 2023 行对话碎片（分隔线、终端输出、表格行，以及含明文
+# SSH 口令的 CSV 记录）直接灌进 L2。事后清洗能治标，但清洗规则每版都会误伤
+# 真事实（长度阈值一改就砍掉 18 字的用户偏好）。真正的修法是**在入口拦住**。
+#
+# 门禁不可用时不静默放行 —— 那正是本系统最典型的故障形态（安静地失效）。
+# 必须显式传 --no-gate 才会退回旧行为。
+try:
+    from plugin.memory_governed._sync import (
+        external_write_verdict as _write_verdict,
+    )
+    from plugin.memory_governed._bridge import (
+        matched_secret_patterns as _secret_names,
+    )
+    _GATE_AVAILABLE = True
+    _GATE_IMPORT_ERROR = None
+except Exception as _gate_err:  # noqa: BLE001 — 让 main() 去报，别在这里猜
+    _write_verdict = None
+    _secret_names = None
+    _GATE_AVAILABLE = False
+    _GATE_IMPORT_ERROR = _gate_err
+
 #: Width of the warning banner printed before a drop.
 _BANNER = 78
 
@@ -136,7 +160,8 @@ def load_l3_messages() -> list[dict[str, Any]]:
     return messages
 
 
-def extract_facts(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
+def extract_facts(messages: list[dict[str, Any]], *,
+                  gate: bool = True) -> "tuple[list[dict[str, Any]], dict[str, int]]":
     """Extract atomic facts (same heuristics as WriteQueue._extract_atomic_facts).
 
     Each fact carries its provenance, because a rebuild that drops the columns
@@ -144,10 +169,21 @@ def extract_facts(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
     ``project`` stays NULL: a sentence lifted out of a conversation has no
     reliable project attribution, and guessing one would be worse than
     admitting we do not know.
+
+    ``gate=True``（默认）让每个候选句过一遍**与写入路径同一把尺子**：先
+    ``external_write_verdict`` 的质量门，再 ``matched_secret_patterns`` 的密钥门。
+    被拦下的原因会记进返回的 ``stats`` —— 静默丢弃在这里等同于成功，而那正是
+    这个系统最典型的故障形态，所以丢弃必须**可数、可报**。
+
+    Returns:
+        ``(facts, stats)``。``stats`` 的形如 ``{"weak:weak_signal": 412}`` /
+        ``{"secret:csv_credential_record": 3}``。
     """
     import re
+    from collections import Counter
 
     facts: list[dict[str, Any]] = []
+    stats: Counter = Counter()
     agent = _rebuilt_agent()
     for msg in messages:
         content = msg.get("content", "")
@@ -162,6 +198,15 @@ def extract_facts(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
                 continue
             if sentence.startswith(("Please", "Do ", "Don't ", "请", "不要")):
                 continue
+            if gate:
+                ok, reason = _write_verdict(sentence)
+                if not ok:
+                    stats[f"weak:{reason}"] += 1
+                    continue
+                names = _secret_names(sentence)
+                if names:
+                    stats[f"secret:{'+'.join(names)}"] += 1
+                    continue
             facts.append({
                 "content": sentence,
                 "category": "rebuild",
@@ -173,7 +218,7 @@ def extract_facts(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
                 "agent": agent,
                 "project": None,
             })
-    return facts
+    return facts, dict(stats)
 
 
 def _table_names(db) -> List[str]:
@@ -296,11 +341,28 @@ def main() -> int:
     parser = argparse.ArgumentParser(description="Rebuild L2 from L3")
     parser.add_argument("--dry-run", action="store_true", help="Preview facts without writing")
     parser.add_argument("--yes", action="store_true", help="Skip confirmation")
+    parser.add_argument(
+        "--no-gate", action="store_true",
+        help="旧行为：跳过写入门禁。不推荐 —— 见 extract_facts 的注释，"
+             "2026-09-22 的无门禁回灌正是 L2 碎片与明文口令的来源。")
     args = parser.parse_args()
 
+    gate = not args.no_gate
+    if gate and not _GATE_AVAILABLE:
+        # 门禁不可用绝不静默放行：那会一次性把碎片重新灌回 L2，
+        # 而"看起来成功了"正是这个系统最典型的故障形态。
+        logger.error("写入门禁不可用（%s: %s）—— 修好插件导入，或显式传 "
+                     "--no-gate 退回旧行为",
+                     type(_GATE_IMPORT_ERROR).__name__, _GATE_IMPORT_ERROR)
+        return 1
+
     messages = load_l3_messages()
-    facts = extract_facts(messages)
+    facts, stats = extract_facts(messages, gate=gate)
     logger.info("extracted %d facts from %d messages", len(facts), len(messages))
+    if stats:
+        # 被拦掉多少、因为什么，必须报出来：静默丢弃和成功长得一样。
+        logger.info("门禁拦下：%s",
+                    "，".join(f"{k}={v}" for k, v in sorted(stats.items())))
 
     # dry-run 只预览 facts，不解析 embedding 后端、不碰 lancedb —— 这样在没有
     # vector 依赖（无 fastembed/lancedb/API）的环境也能跑（test_dry_run 依赖此行为）。

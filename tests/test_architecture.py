@@ -381,7 +381,15 @@ def _run_rebuild(tmp_path, monkeypatch, argv=None):
 
 def _prepare_rebuild(tmp_path, monkeypatch):
     """Wire env + fake embedding; return (home, l2_dir)."""
-    l3_db = _seed_l3(tmp_path, [("user", "The server runs on port 8080 and uses Python")])
+    # ⚠️ 种子句必须**能通过写入门禁**（2026-09-23 起回灌默认过门禁），否则抽不出
+    # 事实、建不出 memories 表，本组测试会以 "Table 'memories' was not found"
+    # 失败——看着像来源列丢了，其实是种子被门禁拦了。
+    # 两个坑：① 句读按 [.!?。！？\n] 切分，所以句子里不能有 `.`（"192.0.2.1"
+    # 会被切成 4 段）；② 门禁偏严，"The server runs on port 8080 and uses
+    # Python" 与 "HGM 的 L2 表 memories 新增 project 列" 都判 weak_signal。
+    l3_db = _seed_l3(tmp_path, [
+        ("user", "memory_cli 现在会在缺少 LanceDB 时自动切换到项目 venv 重新执行"),
+    ])
     monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hermes"))
     monkeypatch.setenv("L3_DB_PATH", str(l3_db))
     monkeypatch.setenv("L2_DB_PATH", str(tmp_path / "l2"))

@@ -145,11 +145,28 @@ _KNOWN_AGENTS = frozenset({
     "hermes", "dsh", "autoclaw", "workbuddy", "mimocode", "opencode", "external",
 })
 
+#: ⚠️ 这是 CLI 的独立副本（裸解释器也要能跑写路径），必须与
+#: ``plugin.memory_governed._bridge.SECRET_PATTERNS`` **逐条一致** ——
+#: 由 ``tests/test_secret_parity.py`` 钉住。
+#:
+#: 2026-09-23 实测发现两份早就漂移了：CLI 只有 4 条，**缺 PEM 私钥与 bearer
+#: token**，key=value 那条也更松（桥要求 ≥16 位裸 token，CLI 什么都收）。
+#: 也就是说写路径当时并不拦 PEM 私钥。两份一旦分叉，"桥拦住了"会让人误以为
+#: 写路径也拦住了 —— 同一个漏洞有两个答案。
 SECRET_PATTERNS = [
     re.compile(r"sk-[A-Za-z0-9_-]{15,}"),
     re.compile(r"gh[pousr]_[A-Za-z0-9_]{15,}"),
-    re.compile(r"(?i)(api[_-]?key|app[_-]?secret|token|password|passwd|pwd|secret)"
-               r"\s*[:=]\s*([^\s,;，；]+)"),
+    # key=value：值必须是"像密钥"的裸 token（字母数字开头、>=16 位）。排除
+    # 代码表达式（含括号/引号）、属性访问（settings.x 含点）、占位符（<>）、
+    # 中文描述 —— 这些是误报主源。
+    re.compile(r"(?i)(api[_-]?key|app[_-]?secret|token|password|passwd|pwd|secret)\s*[:=]\s*([A-Za-z0-9][A-Za-z0-9_\-]{15,})"),
+    re.compile(r"-----BEGIN [A-Z ]*PRIVATE KEY-----"),
+    re.compile(r"(?i)bearer\s+[A-Za-z0-9._\-]{20,}"),
+    # CSV 形状的凭据记录：`SSH-<名>,<用户>,<口令>,ssh://<host>`。
+    # 2026-09-22 实测就是这种形状漏进了 L2（含真实口令）：key=value 那条要求
+    # `:`/`=` 分隔符，而 CSV 用**逗号** ⇒ 完全匹配不上。靠 `SSH-` 前缀 +
+    # `ssh://` scheme 定位，不凭裸串高熵猜。
+    re.compile(r"SSH-[^,\s]{1,24},[^,\s]{1,32},[^,\s]{6,64},ssh://", re.I),
 ]
 _ILLEGAL_FS = re.compile(r'[<>:"/\\|?*\x00-\x1f]')
 
