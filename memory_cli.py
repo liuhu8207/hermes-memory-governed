@@ -970,6 +970,11 @@ def _l2_enforce_capacity(table, cfg, agent: str, cap: int) -> list:
         return (usage.get(life.content_fp(content), 0.0), str(stamp or ""))
 
     victims = sorted(mine, key=_victim_key)[:over]
+    # 删除前先备份整表；失败就放弃本轮淘汰（降级可以晚一轮，数据不能丢）。
+    if life.backup_table(cfg.l2_db_path, tag="capacity",
+                         memory_dir=mem_dir) is None:
+        logger.error("容量淘汰跳过：无法在删除前备份 L2 表")
+        return []
     now = time.strftime("%Y-%m-%dT%H:%M:%S", time.localtime())
     demoted = []
     for content, stamp in victims:
@@ -1047,6 +1052,16 @@ def cmd_retract(config: dict, match: str, reason: str = "",
         base.update({"ok": True, "dry_run": True, "matched": len(matched)})
         return base
 
+    # 删除前先备份整表。retract 是**不可逆**的语义删除，而 ``match`` 是子串
+    # 匹配 —— 很容易一次命中一片；拿不到备份就拒绝动手，且**不碰任何数据**。
+    backup = life.backup_table(cfg.l2_db_path, tag="retract", memory_dir=mem_dir)
+    if backup is None:
+        base.update({"ok": False, "backup": None,
+                     "error": "refused: cannot back up the L2 table before "
+                              "deleting — nothing was touched"})
+        return base
+    base["backup"] = str(backup)
+
     now = time.strftime("%Y-%m-%dT%H:%M:%S", time.localtime())
     seen = set()
     for content, src_agent, stamp, cat, pj in matched:
@@ -1085,6 +1100,9 @@ def cmd_retract(config: dict, match: str, reason: str = "",
 #: 误合并。合并是一次有损操作，误合并比漏合并昂贵得多。
 CONS_JACCARD_MIN = 0.55
 CONS_COSINE_MIN = 0.86
+#: 单簇规模上限。没有它，链式（传递）相似会滚成一个大簇，而 LLM 合并是**有损**
+#: 操作 —— 把一堆只是彼此相邻、却互不相干的事实并成一句，比漏合并贵得多。
+CONS_MAX_CLUSTER = 5
 
 #: 自评 QA 集的样本上限（snapshot 可能上千条，评测抽样固定 20 条保廉价）。
 EVAL_MAX_QUERIES = 20
@@ -1116,7 +1134,12 @@ def _cons_cosine(va, vb) -> float:
 
 
 def _cons_clusters(rows: list) -> list:
-    """同类 + 双门槛的合并候选聚簇（并查集）。
+    """同类 + 双门槛的合并候选聚簇（**代表制**，不是传递闭包）。
+
+    为什么不用并查集：传递闭包下 A~B、B~C 会把 {A,B,C} 并成一簇，哪怕 A 与 C
+    毫不相干 —— 链式扩张没有上界，而 LLM 合并是**有损**的，误合并比漏合并贵。
+    这里改为：按出现顺序取未分配的行当**簇代表**，只吸收与**代表本身**同时过
+    双门槛的行，且单簇不超过 ``CONS_MAX_CLUSTER``。
 
     Args:
         rows: ``[{content, category, vector}]``。
@@ -1125,31 +1148,32 @@ def _cons_clusters(rows: list) -> list:
         下标组列表，每组 ≥ 2 行（单行不成簇）。
     """
     n = len(rows)
-    parent = list(range(n))
-
-    def _find(x: int) -> int:
-        while parent[x] != x:
-            parent[x] = parent[parent[x]]
-            x = parent[x]
-        return x
-
     grams = [_cons_bigrams(str(r.get("content") or "")) for r in rows]
+    cats = [str(r.get("category") or "") for r in rows]
+    assigned = [False] * n
+    clusters: list = []
     for i in range(n):
-        cat_i = str(rows[i].get("category") or "")
+        if assigned[i]:
+            continue
+        group = [i]
         for j in range(i + 1, n):
-            if cat_i != str(rows[j].get("category") or ""):
+            if assigned[j]:
+                continue
+            if len(group) >= CONS_MAX_CLUSTER:
+                break
+            if cats[i] != cats[j]:
                 continue
             if _cons_jaccard(grams[i], grams[j]) < CONS_JACCARD_MIN:
                 continue
             if _cons_cosine(rows[i].get("vector"),
                             rows[j].get("vector")) < CONS_COSINE_MIN:
                 continue
-            parent[_find(j)] = _find(i)
-
-    groups: dict = {}
-    for i in range(n):
-        groups.setdefault(_find(i), []).append(i)
-    return [sorted(idx) for idx in groups.values() if len(idx) > 1]
+            group.append(j)
+        if len(group) > 1:
+            for k in group:
+                assigned[k] = True
+            clusters.append(sorted(group))
+    return clusters
 
 
 def cmd_consolidate(config: dict, apply: bool = False,
@@ -1193,6 +1217,30 @@ def cmd_consolidate(config: dict, apply: bool = False,
             "candidates": [[str(rows[i].get("content") or "")[:80]
                             for i in c] for c in clusters],
             "merged": [], "skipped": [], "errors": []}
+    # 候选整份落文件：几十上百个簇没法靠 stdout 的 80 字前缀人工审，而
+    # ``--apply`` 是**有损**操作，审必须在动手之前（沿用 ``cmd_snapshot`` →
+    # ``l2_snapshot.json`` 的先例：要人工看的东西就落成文件）。
+    if clusters:
+        try:
+            cand = mem_dir / ("consolidate_"
+                              + time.strftime("%Y%m%d_%H%M%S") + ".json")
+            cand.write_text(json.dumps({
+                "generated_at": time.strftime("%Y-%m-%dT%H:%M:%S"),
+                "thresholds": {"jaccard_min": CONS_JACCARD_MIN,
+                               "cosine_min": CONS_COSINE_MIN,
+                               "max_cluster": CONS_MAX_CLUSTER},
+                "clusters": [
+                    {"size": len(c),
+                     "members": [{"index": int(i),
+                                  "category": rows[i].get("category"),
+                                  "agent": rows[i].get("agent"),
+                                  "content": str(rows[i].get("content") or "")}
+                                 for i in c]}
+                    for c in clusters],
+            }, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+            base["candidates_file"] = str(cand)
+        except OSError as e:
+            base["errors"].append(f"candidates file not written: {e}")
     if not apply:
         return base
     if not clusters:
@@ -1209,6 +1257,17 @@ def cmd_consolidate(config: dict, apply: bool = False,
             hint="nothing was changed; fix the embedding backend and retry"))
         base["applied"] = False
         return base
+    # 删除前先备份整表；失败即中止整个合并阶段（原条目一条不动）。
+    backup = life.backup_table(cfg.l2_db_path, tag="consolidate",
+                               memory_dir=mem_dir)
+    if backup is None:
+        base.update(_refusal(
+            "backup_failed",
+            detail="cannot back up the L2 table before deleting",
+            hint="nothing was changed; free some space and retry"))
+        base["applied"] = False
+        return base
+    base["backup"] = str(backup)
     llm = plugin_module("_llm")
     now = time.strftime("%Y-%m-%dT%H:%M:%S", time.localtime())
 

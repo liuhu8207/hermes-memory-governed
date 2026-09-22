@@ -98,6 +98,30 @@ class TestConsClusters:
         ]
         assert cli._cons_clusters(rows) == []
 
+    def test_cluster_size_is_capped(self):
+        """单簇上限：6 条互相近重复不许并成一簇（合并有损，越大越危险）。"""
+        rows = [{"content": _NEAR_A, "category": "other", "vector": [1.0, 0.0]}
+                for _ in range(6)]
+        got = cli._cons_clusters(rows)
+        assert len(got) == 1
+        assert len(got[0]) == cli.CONS_MAX_CLUSTER < 6
+
+    def test_no_transitive_chain(self):
+        """代表制：A~B 且 B~C、但 A≁C 时，C **不得**被链进同一簇。
+
+        并查集（传递闭包）会把 {A,B,C} 并成一簇 —— 哪怕 A 与 C 毫不相干；
+        链式扩张没有上界，而 LLM 合并是**有损**的（误合并比漏合并贵）。
+        """
+        a, b, c = "aaaabbbb", "aaaabbbbcccc", "bbbbcccc"
+        jab = cli._cons_jaccard(cli._cons_bigrams(a), cli._cons_bigrams(b))
+        jbc = cli._cons_jaccard(cli._cons_bigrams(b), cli._cons_bigrams(c))
+        jac = cli._cons_jaccard(cli._cons_bigrams(a), cli._cons_bigrams(c))
+        assert jab >= cli.CONS_JACCARD_MIN and jbc >= cli.CONS_JACCARD_MIN
+        assert jac < cli.CONS_JACCARD_MIN, "前置条件没造对，用例无意义"
+        rows = [{"content": t, "category": "other", "vector": [1.0, 0.0]}
+                for t in (a, b, c)]
+        assert cli._cons_clusters(rows) == [[0, 1]], "C 被链式并进来了"
+
 
 # ---------------------------------------------------------------------------
 # 2) consolidate：命令级（dry-run / apply / 各失败路径）
@@ -117,6 +141,23 @@ class TestConsolidateCommand:
         assert out["clusters"] == 1
         assert out["merged"] == [] and _archive_records(store) == []
         assert len(_table_contents(store)) == 3
+
+    def test_dry_run_writes_the_candidates_file(self, store, monkeypatch):
+        """候选整份落文件：几十上百个簇没法靠 stdout 的 80 字前缀人工审，
+        而 ``--apply`` 有损 —— 审必须在动手之前。"""
+        pytest.importorskip("lancedb")
+        _install_fake_embedding(monkeypatch)
+        self._seed(store)
+
+        out = cli.cmd_consolidate({}, apply=False)
+        path = Path(out["candidates_file"])
+        assert path.exists(), "候选文件没落盘"
+        assert path.parent == store.home / "memory"
+        data = json.loads(path.read_text(encoding="utf-8"))
+        assert data["clusters"], "候选文件里没有簇"
+        assert data["thresholds"]["max_cluster"] == cli.CONS_MAX_CLUSTER
+        member = data["clusters"][0]["members"][0]
+        assert member["content"] and "index" in member
 
     def test_apply_merges_and_supersedes_originals(self, store, monkeypatch):
         pytest.importorskip("lancedb")

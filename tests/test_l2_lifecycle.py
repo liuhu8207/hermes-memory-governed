@@ -271,3 +271,59 @@ class TestHealthLifecycle:
         assert "usage_rows" in lc and "max_items" in lc
         # active 是表行数（撤回后剩 0）或 unknown（表读不到）
         assert lc.get("active") in (0, "unknown")
+
+
+# ---------------------------------------------------------------------------
+# 破坏性删除前的备份守卫（2026-09-22）
+#
+# ``retract`` / ``consolidate --apply`` / 容量淘汰此前是**全仓唯一没有表备份**
+# 的破坏性命令，而 ``l2_rebuild`` 早就「拿不到备份就拒绝 drop」。这里钉住：
+# ① 真的落了字节级副本；② 拿不到备份就拒绝、且一条都不碰。
+# ---------------------------------------------------------------------------
+
+class TestDestructiveBackupGuard:
+    def test_backup_table_copies_the_directory(self, store, monkeypatch):
+        pytest.importorskip("lancedb")
+        _install_fake_embedding(monkeypatch)
+        # 夹具只建了空的 memory/l2 —— 表是写入时才出现的，先写一条。
+        assert cli.cmd_remember({}, _FACT_A, "dsh")["ok"] is True
+
+        dest = life.backup_table(store.home / "memory" / "l2", tag="unit",
+                                 memory_dir=_memory_dir(store))
+        assert dest is not None and dest.is_dir(), "表目录副本没落盘"
+        assert dest.parent.name == "l2_backups"
+        # 字节级副本：副本内容应与源表目录**逐一对应**（不是逻辑导出文件）
+        src = store.home / "memory" / "l2" / "memories.lance"
+        assert src.is_dir(), f"表目录不叫 memories.lance？{list(src.parent.iterdir())}"
+        assert ({p.name for p in dest.iterdir()}
+                == {p.name for p in src.iterdir()}), "副本与源表目录内容不一致"
+
+    def test_backup_table_refuses_without_a_table_directory(self, tmp_path):
+        """找不到表目录 ⇒ None（调用方据此中止删除），而不是"静默备份了个空"。"""
+        assert life.backup_table(tmp_path, tag="unit") is None
+
+    def test_retract_records_the_backup_and_deletes(self, store, monkeypatch):
+        pytest.importorskip("lancedb")
+        _install_fake_embedding(monkeypatch)
+        # ROCKET_TLS 在 _FACT_B 里（_FACT_A 不含它）—— 既有用例也是写两条再撤一条。
+        assert cli.cmd_remember({}, _FACT_B, "dsh")["ok"] is True
+
+        out = cli.cmd_retract({}, "ROCKET_TLS", reason="outdated", agent="tester")
+        assert out["ok"] is True, out
+        assert out["backup"], "retract 必须报告备份路径"
+        assert Path(out["backup"]).is_dir()
+        assert _FACT_B not in _table_contents(store)
+
+    def test_retract_refuses_when_the_backup_fails(self, store, monkeypatch):
+        """拿不到备份 ⇒ 拒绝动手，且**一条都不碰**（不归档、不立碑、不删行）。"""
+        pytest.importorskip("lancedb")
+        _install_fake_embedding(monkeypatch)
+        assert cli.cmd_remember({}, _FACT_B, "dsh")["ok"] is True
+
+        monkeypatch.setattr(life, "backup_table", lambda *a, **k: None)
+        out = cli.cmd_retract({}, "ROCKET_TLS", reason="outdated", agent="tester")
+
+        assert out["ok"] is False, out
+        assert "refused" in str(out["error"])
+        assert _FACT_B in _table_contents(store), "拒绝之后事实必须原样还在"
+        assert _archive_records(store) == [], "拒绝时不该归档任何东西"

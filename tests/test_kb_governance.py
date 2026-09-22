@@ -385,3 +385,30 @@ class TestFrontmatterMigrate:
         # 幂等：再扫一遍没有待办
         would2, already2, _ = mod._plan(cfg)
         assert would2 == [] and already2 == 4
+
+    def test_snapshot_copies_notes_outside_the_vault(self, tmp_path):
+        """``--apply`` 前必须先把将改写的笔记整份复制到 vault **之外**。
+
+        vault 是人工策展的正本、通常不在版本控制下 —— 原地批量改写一旦出错
+        就无从还原（本次真实迁移就发生过：30 篇被原地改写而没有任何备份）。
+        """
+        mod = _load_migrate_module()
+        vault = tmp_path / "vault"
+        (vault / "notes").mkdir(parents=True)
+        note = vault / "notes" / "a.md"
+        note.write_text("---\ntitle: A\n---\n正文", encoding="utf-8")
+
+        dest = mod._snapshot([note], vault, tmp_path / "backups")
+
+        assert dest is not None and dest.is_dir()
+        assert dest.parent == tmp_path / "backups"
+        copy = dest / "notes" / "a.md"
+        assert copy.read_text(encoding="utf-8") == note.read_text(encoding="utf-8")
+
+    def test_snapshot_refuses_a_path_outside_the_vault(self, tmp_path):
+        """快照失败 ⇒ None（调用方据此**拒绝写入**），绝不"备份了个空"就往下走。"""
+        mod = _load_migrate_module()
+        outside = tmp_path / "outside.md"
+        outside.write_text("x", encoding="utf-8")
+        assert mod._snapshot([outside], tmp_path / "vault",
+                             tmp_path / "backups") is None

@@ -27,8 +27,10 @@ import hashlib
 import json
 import logging
 import re
+import shutil
 import sqlite3
 import time
+from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
@@ -115,6 +117,44 @@ def archive_count(memory_dir: Path) -> int:
 
 
 # -- 使用度（容量淘汰的受害者选择依据） -------------------------------------
+
+def backup_table(l2_db_path, *, tag: str,
+                 memory_dir: Optional[Path] = None,
+                 table: str = "memories") -> Optional[Path]:
+    """破坏性删除前，把表目录**字节级**复制到 ``memory/l2_backups/``。
+
+    为什么不是 ``to_arrow()`` 导出：**损坏的表根本导不出来**，而「损坏」恰恰
+    是备份最要紧的那一个情形（同 ``scripts/l2_rebuild.py::_backup_table``）。
+
+    找不到表目录或复制失败 ⇒ 返回 ``None``，**调用方必须据此中止删除** ——
+    本仓库对破坏性操作一贯「拿不到备份就拒绝动手」（见 ``l2_rebuild`` 的
+    drop 守卫）。归档 JSONL 不是还原点：它**不含 ``vector``**，要还原得重新
+    嵌入；这一点此前全仓没有写明。
+    """
+    base = Path(l2_db_path)
+    src: Optional[Path] = None
+    for candidate in (base / f"{table}.lance", base / table):
+        if candidate.is_dir():
+            src = candidate
+            break
+    if src is None:
+        logger.error("找不到表目录（%s 下没有 %s.lance）—— 拒绝在没有备份的情况下删除",
+                     base, table)
+        return None
+    dest_root = Path(memory_dir) if memory_dir is not None else base.parent
+    dest = (dest_root / "l2_backups"
+            / f"{src.name}_{tag}_{datetime.now():%Y%m%d_%H%M%S}")
+    try:
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        if dest.exists():
+            shutil.rmtree(dest)
+        shutil.copytree(src, dest)
+    except OSError as e:
+        logger.error("表备份失败（%s）—— 拒绝删除 %s", e, src)
+        return None
+    logger.info("破坏性操作前已备份 %s -> %s", src, dest)
+    return dest
+
 
 def _usage_connect(db_path: Path) -> sqlite3.Connection:
     db_path.parent.mkdir(parents=True, exist_ok=True)

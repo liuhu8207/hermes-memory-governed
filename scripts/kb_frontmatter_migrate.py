@@ -12,6 +12,8 @@ status 契约（与 ``plugin._kb._status_for_section`` 同一规则，由
 行为约定：
 
 - 默认 **dry-run**：只报告将写入什么，一个文件都不碰（批量操作先报 scope）。
+- ``--apply`` 前先落 **vault 外快照**（``$HERMES_HOME/memory/vault_backups/<ts>/``）：
+  vault 是人工策展的正本、通常不在版本控制下，**拿不到快照就拒绝写入**。
 - ``--apply`` 才落盘：原子写（tmp + ``os.replace``），保留原正文与全部既有
   字段，只补 ``status``。
 - **幂等**：已有 ``status`` 的笔记跳过 —— 重复执行是零写入。
@@ -27,8 +29,10 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import shutil
 import sys
 import tempfile
+import time
 from collections import Counter
 from pathlib import Path
 
@@ -88,6 +92,26 @@ def _apply_one(path: Path, meta: dict, body: str, status: str) -> None:
         raise
 
 
+def _snapshot(paths, vault: Path, dest_root: Path) -> Path | None:
+    """把将要改写的笔记**整份复制到 vault 之外**，成功返回快照目录。
+
+    vault 是人工策展的正本、通常不在版本控制下 —— 原地批量改写一旦出错就
+    无从还原。宁可多占一份磁盘，不可没有退路（同 ``l2_rebuild`` 的
+    「拿不到备份就拒绝 drop」）。
+    """
+    dest = dest_root / time.strftime("%Y%m%d_%H%M%S")
+    try:
+        for p in paths:
+            target = dest / p.relative_to(vault)
+            target.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(p, target)
+    except (OSError, ValueError) as e:
+        print(json.dumps({"ok": False, "error": f"snapshot failed: {e}"},
+                         ensure_ascii=False), file=sys.stderr)
+        return None
+    return dest
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(
         description="Backfill frontmatter status for existing vault notes "
@@ -112,6 +136,19 @@ def main() -> int:
     }
 
     if args.apply:
+        if would:
+            # 先落 vault 外快照，拿不到就**拒绝写入**（一条都不碰）。
+            dest_root = (Path(memory_cli.hermes_home())
+                         / "memory" / "vault_backups")
+            snap = _snapshot([p for p, *_ in would],
+                             memory_cli.wiki_dir(config), dest_root)
+            if snap is None:
+                out.update({"ok": False, "applied": False,
+                            "error": "refused: could not snapshot the notes "
+                                     "before writing — nothing was touched"})
+                print(json.dumps(out, ensure_ascii=False, indent=2))
+                return 1
+            out["backup_dir"] = str(snap)
         for path, meta, body, status, _section in would:
             try:
                 _apply_one(path, meta, body, status)
