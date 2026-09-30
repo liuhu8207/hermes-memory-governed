@@ -27,16 +27,55 @@ from ._lifecycle import resolve_memory_dir, usage_touch
 try:  # pragma: no cover - _diag.py 由另一位工程师并行新建
     from ._diag import log_degraded, log_data_loss
 except Exception:  # noqa: BLE001 — 文件尚未落地时的兼容回退
+    # 兜底实现与真实 ``_diag`` **同一"永不抛异常"契约**：调用点都在 ``except``
+    # 里，诊断日志一旦抛就把优雅降级变成崩溃。整段属"诊断引导区"，护栏豁免
+    # （见 ``tests/test_recall_degraded_visibility.py`` 的 bootstrap 规则）。
     def log_data_loss(component: str, reason: str, *, detail: str = "",
                       exc: BaseException | None = None) -> None:
-        """Fallback: ERROR 级数据丢失日志（真实 _diag.py 落地后即被替换）。"""
-        logger.error("[data-loss] %s: %s %s", component, reason, detail, exc_info=exc)
+        """Fallback: ERROR 级数据丢失日志（真实 _diag.py 落地后即被替换）。
+
+        与真实实现同一契约：**永不抛异常**（调用点都在 ``except`` 里）。
+        """
+        try:
+            logger.error("[data-loss] %s: %s %s", component, reason, detail, exc_info=exc)
+        except Exception:  # noqa: BLE001 — 诊断兜底绝不能再抛
+            pass
 
     def log_degraded(component: str, reason: str, *, detail: str = "",
                      exc: BaseException | None = None) -> None:
-        """Fallback: WARNING 级优雅降级日志（真实 _diag.py 落地后即被替换）。"""
-        logger.warning("[degraded] %s: %s %s", component, reason, detail, exc_info=exc)
+        """Fallback: WARNING 级优雅降级日志（真实 _diag.py 落地后即被替换）。
 
+        与真实实现同一契约：**永不抛异常**（调用点都在 ``except`` 里）。
+        """
+        try:
+            logger.warning("[degraded] %s: %s %s", component, reason, detail, exc_info=exc)
+        except Exception:  # noqa: BLE001 — 诊断兜底绝不能再抛
+            pass
+
+
+# 为什么本模块的 except 一律用 ``log_degraded`` / ``log_data_loss``，**禁止**
+# 只写 ``logger.debug``：
+#   * DEBUG 在正常运行（默认 level）下**不可见** —— 而"嵌入后端挂了"与
+#     "确实没匹配到"对调用方**完全一样**（都返回 ``[]``）。只在 DEBUG 留痕，
+#     排查召回问题时输出就不可信（本项目最典型的故障形态："安静地失效"）。
+#   * ``log_degraded`` 是 WARNING，且带 (component, reason) 计数 ——
+#     :func:`_diag.stats` / ``governed_health`` 直接可读。
+# 唯一例外是上面的 ``_diag`` 导入回退：那一刻 ``log_degraded`` 还没定义，
+# 不可能调用自己。护栏见 ``tests/test_recall_degraded_visibility.py``。
+#
+# 护栏认的合法例外只有两种（其余一律必须 ``log_degraded`` / ``log_data_loss``
+# 或重新抛出）：
+#   1. 上面的 ``_diag`` 导入回退（引导块，不可能调用尚未定义的自己）。
+#   2. **值级回退**：只在解析坏配置值 / 坏行字段、返回默认值这类防御里，且
+#      ``except`` 行**显式**标注 ``# silent-ok: value-fallback``（可接一句理由）。
+#      ⚠️ 标记必须**逐站点**写下 —— 不是"窄异常类型就自动免报"，否则有人用
+#      ``except OSError`` 包住一次真实的磁盘读失败，也会被默默放过。新增静默点
+#      会被护栏拦住，除非有人明确写上 ``silent-ok`` 并说明理由。
+#   注意：上报 / 裸重抛必须是 ``except`` 体的**直接语句**（``if False: raise``、
+#   嵌套 ``def h(): raise``、``if False: log_degraded(...)`` 都不算；
+#   ``return log_degraded(...)`` 算上报）；``suppress``（无 ``ExceptHandler``
+#   节点）按"**提及即拦**"扫 —— 出现该词即违规，除非带标记。
+# 审计：``grep -n "silent-ok:" plugin/memory_governed/_recall.py``。
 logger = logging.getLogger(__name__)
 
 #: LanceDB ``cosine`` metric 返回的是**余弦距离** d ∈ [0, 2]：
@@ -153,7 +192,7 @@ def layer_score_floor(layer: str, recall_cfg=None, *,
         value = getattr(recall_cfg, "l2_min_score", 0.0)
     try:
         value = float(value or 0.0)
-    except (TypeError, ValueError):
+    except (TypeError, ValueError):  # silent-ok: value-fallback — 坏门槛值回退 MIN_SCORE，非子系统故障
         return MIN_SCORE
     if value <= 0.0 or math.isnan(value):
         return MIN_SCORE
@@ -180,7 +219,7 @@ def distance_to_score(distance: float) -> float:
     """
     try:
         value = float(distance)
-    except (TypeError, ValueError):
+    except (TypeError, ValueError):  # silent-ok: value-fallback — 坏 _distance 值按正交兜底，非子系统故障
         value = DEFAULT_COSINE_DISTANCE
     # NaN / ±inf 会让后续的比较与排序失去意义，统一按缺省距离处理
     if math.isnan(value) or math.isinf(value):
@@ -200,7 +239,7 @@ def row_to_score(row: Any) -> float:
     try:
         distance = getter("_distance", DEFAULT_COSINE_DISTANCE)
     except Exception as e:  # noqa: BLE001 - 行的 get 可能抛任意异常
-        logger.debug("L2 row _distance lookup failed, using default: %s", e)
+        log_degraded("l2", "row_distance_failed", exc=e)
         distance = DEFAULT_COSINE_DISTANCE
     return distance_to_score(distance)
 
@@ -472,8 +511,8 @@ class RecallEngine:
                     text = p.read_text(encoding="utf-8", errors="replace").strip()
                     if text:
                         parts.append(text)
-                except Exception:
-                    pass
+                except Exception as e:
+                    log_degraded("l1", "read_failed", detail=str(path_str), exc=e)
 
         self._l1_cache = "\n\n".join(parts) if parts else ""
         self._l1_cache_time = now
@@ -485,8 +524,19 @@ class RecallEngine:
         max_mtime = 0.0
         for path_str in (self._config.l1_memory_path, self._config.l1_user_path):
             try:
-                stat_result = Path(path_str).stat()
-            except (OSError, ValueError):
+                p = Path(path_str)
+                # 非法 / 不可编码路径（如含 NUL）已由 ``exists()`` 处理：其内部
+                # ``except ValueError: return False`` 会让这里直接 ``continue``，
+                # 根本进不到下面的分支 —— 故**无需**再单独兜 ``ValueError``
+                # （那只会是永远不可达的死分支 + 一个让"标记"机制失信的装饰性豁免）。
+                if not p.exists():
+                    continue
+                stat_result = p.stat()
+            except OSError as e:
+                # 子系统级失败：存在性已通过却仍 stat 失败（权限 / IO / 设备错误）。
+                # 静默跳过会掩盖"L1 无法刷新"—— mtime 永远不变 → 缓存永不失效 →
+                # 记忆更新读不到。属子系统故障，必须上报。
+                log_degraded("l1", "mtime_stat_failed", detail=str(path_str), exc=e)
                 continue
             max_mtime = max(max_mtime, stat_result.st_mtime)
         return max_mtime
@@ -496,7 +546,7 @@ class RecallEngine:
         try:
             return self._l1_mtime_signature() != self._l1_cache_mtime
         except Exception as e:  # noqa: BLE001 — 任何异常都不能影响读路径
-            logger.debug("L1 mtime check failed, keeping cache: %s", e)
+            log_degraded("l1", "mtime_check_failed", exc=e)
             return False
 
     # -- L4: Persona (cached, background refresh) ---------------------------
@@ -524,7 +574,8 @@ class RecallEngine:
             try:
                 raw = p.read_text(encoding="utf-8", errors="replace").strip()
                 self._l4_cache = persona_only(raw)
-            except Exception:
+            except Exception as e:
+                log_degraded("l4", "read_failed", detail=str(p), exc=e)
                 self._l4_cache = ""
         else:
             self._l4_cache = ""
@@ -587,7 +638,7 @@ class RecallEngine:
             return self._search_l2_text(query, project)
 
         except Exception as e:
-            logger.debug("L2 search failed: %s", e)
+            log_degraded("l2", "search_failed", exc=e)
             return []
 
     def _search_l2_fused(self, query: str,
@@ -609,7 +660,7 @@ class RecallEngine:
                 return vec
             return _fuse_l2_channels(vec, lex)
         except Exception as e:
-            logger.debug("L2 fused search failed: %s", e)
+            log_degraded("l2", "fused_search_failed", exc=e)
             return []
 
     def _search_l2_vector(self, query: str,
@@ -638,9 +689,9 @@ class RecallEngine:
                     log_degraded(
                         "l2",
                         "project_prefilter_unsupported",
-                        detail=f"{type(e).__name__}: {e}; "
-                               f"falling back to over-fetch x{_L2_SCOPE_OVERFETCH} "
-                               f"then filtering in Python",
+                        detail=f"falling back to over-fetch "
+                               f"x{_L2_SCOPE_OVERFETCH} then filtering in Python",
+                        exc=e,
                     )
             # metric 必须显式指定 cosine：LanceDB 默认是 L2 欧氏距离，其量纲与
             # distance_to_score() 的 [0, 2] 假设不符（旧 P0 的根因之一）。
@@ -671,7 +722,7 @@ class RecallEngine:
                     break
             return out
         except Exception as e:
-            logger.debug("L2 vector search failed: %s", e)
+            log_degraded("l2", "vector_search_failed", exc=e)
             return []
 
     def _search_l2_text(self, query: str,
@@ -717,7 +768,7 @@ class RecallEngine:
             results.sort(key=lambda r: r.score, reverse=True)
             return results[:self._config.recall.l2_max_results]
         except Exception as e:
-            logger.debug("L2 text search failed: %s", e)
+            log_degraded("l2", "text_search_failed", exc=e)
             return []
 
     def _init_l2(self) -> None:
@@ -781,7 +832,7 @@ class RecallEngine:
 
         except Exception as e:
             logger.debug("L2 init failed: %s", e)
-            log_degraded("l2", "init_failed", detail=str(e), exc=e)
+            log_degraded("l2", "init_failed", exc=e)
 
     # -- L3: Conversation archive (SQLite FTS5) ----------------------------
 
@@ -799,7 +850,7 @@ class RecallEngine:
         try:
             conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
         except Exception as e:
-            logger.debug("L3 connect failed: %s", e)
+            log_degraded("l3", "connect_failed", exc=e)
             return []
 
         try:
@@ -842,7 +893,7 @@ class RecallEngine:
 
             return results
         except Exception as e:
-            logger.debug("L3 search failed: %s", e)
+            log_degraded("l3", "search_failed", exc=e)
             return []
         finally:
             self._close_quietly(conn)
@@ -863,7 +914,7 @@ class RecallEngine:
                 (fts_query, *L3_RECALL_ROLES, self._config.recall.l3_max_results),
             ).fetchall()
         except Exception as e:
-            logger.debug("L3 FTS5 search failed: %s", e)
+            log_degraded("l3", "fts_search_failed", exc=e)
             return results
 
         now = time.time()
@@ -886,7 +937,7 @@ class RecallEngine:
                 ts = float(row["timestamp"]) if row["timestamp"] else now
                 age_seconds = max(0, now - ts)
                 age_factor = math.exp(-0.693 * age_seconds / half_life_seconds)
-            except (ValueError, TypeError):
+            except (ValueError, TypeError):  # silent-ok: value-fallback — 坏 timestamp 用 age_factor=1.0（不衰减），非子系统故障
                 age_factor = 1.0
             results.append(RecallResult(
                 layer="l3",
@@ -978,7 +1029,7 @@ class RecallEngine:
                 (*patterns, *L3_RECALL_ROLES, self._config.recall.l3_max_results),
             ).fetchall()
         except Exception as e:
-            logger.debug("L3 LIKE search failed: %s", e)
+            log_degraded("l3", "like_search_failed", exc=e)
             return []
         finally:
             if owns_conn:
@@ -993,7 +1044,7 @@ class RecallEngine:
                 ts = float(row["timestamp"]) if row["timestamp"] else now
                 age_seconds = max(0, now - ts)
                 age_factor = math.exp(-0.693 * age_seconds / half_life_seconds)
-            except (ValueError, TypeError):
+            except (ValueError, TypeError):  # silent-ok: value-fallback — 坏 timestamp 用 age_factor=1.0（不衰减），非子系统故障
                 age_factor = 1.0
             # LIKE 没有 rank 信号：命中片段越多分越高（0.5~0.8）。
             # 单片段全命中 = 0.8 × 时间衰减，与历史行为一致。
@@ -1045,7 +1096,7 @@ class RecallEngine:
             conn.row_factory = sqlite3.Row
             return conn
         except Exception as e:
-            logger.debug("L3 LIKE connect failed: %s", e)
+            log_degraded("l3", "like_connect_failed", exc=e)
             return None
 
     @staticmethod
@@ -1056,7 +1107,7 @@ class RecallEngine:
         try:
             conn.close()
         except Exception as e:  # noqa: BLE001
-            logger.debug("L3 connection close failed: %s", e)
+            log_degraded("l3", "close_failed", exc=e)
 
     # -- Merge and rank ----------------------------------------------------
 
@@ -1099,13 +1150,16 @@ class RecallEngine:
                             results.append(layer_results)
                         collected.add(id(future))
                     except Exception as e:
-                        logger.debug("Recall layer %s failed: %s", layer, e)
+                        log_degraded("recall", "layer_failed",
+                                     detail=layer, exc=e)
                         collected.add(id(future))
             # concurrent.futures.TimeoutError 在 Python 3.10 不是内建 TimeoutError
             # 的子类（3.11 才合并为别名），只写 `except TimeoutError` 在 3.10 上是
             # 死代码：超时会逃逸到外层被 debug 吞掉，静默返回空结果。
-            except (TimeoutError, FuturesTimeoutError):
-                logger.debug("Recall timeout after %.1fs, collected %d results", timeout, len(results))
+            except (TimeoutError, FuturesTimeoutError) as e:
+                log_degraded("recall", "timeout",
+                             detail=f"after {timeout}s, collected {len(results)}",
+                             exc=e)
                 for future, layer in futures.items():
                     if id(future) not in collected and future.done():
                         try:
@@ -1114,8 +1168,8 @@ class RecallEngine:
                                 results.extend(layer_results)
                             elif isinstance(layer_results, RecallResult):
                                 results.append(layer_results)
-                        except Exception:
-                            pass
+                        except Exception as e:
+                            log_degraded("recall", "late_result_failed", exc=e)
         finally:
             # shutdown(wait=False): never block the caller.
             # Orphan threads die when the process exits.
@@ -1141,7 +1195,7 @@ class RecallEngine:
                 elif isinstance(r, RecallResult):
                     results.append(r)
             except Exception as e:
-                logger.debug("Sequential recall layer failed: %s", e)
+                log_degraded("recall", "sequential_layer_failed", exc=e)
         results.sort(key=lambda r: r.score, reverse=True)
         return results
 
@@ -1199,7 +1253,7 @@ class RecallEngine:
         try:
             hits = kb.search(query, top_k=pool)
         except Exception as e:  # noqa: BLE001 — 提示通道失败绝不能影响主召回
-            logger.debug("KB recall failed: %s", e)
+            log_degraded("kb", "recall_failed", exc=e)
             return []
 
         admitted: List[Tuple[float, str, Dict[str, Any]]] = []
@@ -1257,7 +1311,7 @@ class RecallEngine:
             try:
                 touch([r.source for r in out])
             except Exception as e:  # noqa: BLE001
-                logger.debug("kb usage touch failed: %s", e)
+                log_degraded("kb", "usage_touch_failed", exc=e)
         return out
 
     def _get_l4_result(self) -> Optional[RecallResult]:
@@ -1344,8 +1398,7 @@ class RecallEngine:
                 try:
                     l23_items = _fuse_cross_layer(l2_adm, l3_adm)
                 except Exception as e:  # noqa: BLE001 — 读路径绝不因融合失败而空手
-                    log_degraded("recall", "cross_layer_fusion_failed",
-                                 detail=f"{type(e).__name__}: {e}")
+                    log_degraded("recall", "cross_layer_fusion_failed", exc=e)
                     l23_items = admitted
 
         # 按 content 去重，只保留最高分那条：实测 L2 重复率 94.8%，
@@ -1407,7 +1460,8 @@ class RecallEngine:
         """
         try:
             results = self.parallel_recall(query)
-        except Exception:  # noqa: BLE001 — 评测门不该因单条查询崩掉
+        except Exception as e:  # noqa: BLE001 — 评测门不该因单条查询崩掉
+            log_degraded("recall", "eval_query_failed", exc=e)
             return []
         recall_cfg = getattr(self._config, "recall", None)
         floor = layer_score_floor("l2", recall_cfg)

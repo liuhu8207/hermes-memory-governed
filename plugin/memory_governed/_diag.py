@@ -57,13 +57,36 @@ _metrics: Dict[str, int] = {}
 _suppressed = 0
 
 
+def _safe_str(value: Any) -> str:
+    """Stringify ``value`` **without ever raising**.
+
+    Exception (and other) objects are UNTRUSTED input: a custom ``__str__``
+    may itself raise. Diagnostics run inside ``except`` blocks, so a raise
+    here would turn a graceful degradation into a crash — precisely the bug
+    this module exists to prevent. Any failure falls back to a safe
+    placeholder instead.
+    """
+    try:
+        return str(value)
+    except Exception as e:  # noqa: BLE001 — 被格式化的对象 __str__ 本身可能抛
+        try:
+            return f"<unrepr {type(value).__name__}: {type(e).__name__}>"
+        except Exception:  # noqa: BLE001 — type()/__name__ 理论上安全，仍兜底
+            return "<unrepr>"
+
+
 def _format(component: str, reason: str, detail: str, exc: Optional[BaseException]) -> str:
-    """Build the log line for an event (English: log text is English)."""
+    """Build the log line for an event (English: log text is English).
+
+    Every untrusted value is stringified through :func:`_safe_str`, so a broken
+    ``__str__`` on ``exc``/``detail`` can never propagate (see the never-throw
+    contract on :func:`log_degraded`).
+    """
     message = f"{component}: {reason}"
     if detail:
-        message += f" | {detail}"
+        message += f" | {_safe_str(detail)}"
     if exc is not None:
-        message += f" | {type(exc).__name__}: {exc}"
+        message += f" | {type(exc).__name__}: {_safe_str(exc)}"
     return message
 
 
@@ -71,10 +94,18 @@ def log_degraded(component: str, reason: str, *, detail: str = "",
                  exc: BaseException | None = None) -> None:
     """Record a graceful-degradation event (WARNING, throttled per 60s).
 
+    **Contract — this function never raises.** Every call site lives inside an
+    ``except`` block; if it raised, a graceful degradation would become a
+    crash. All formatting of untrusted values (``detail``/``exc``) is guarded
+    via :func:`_safe_str`, including a ``__str__`` that itself raises.
+
     Args:
         component: Subsystem that degraded, e.g. ``"l2_write"``, ``"l3_fts"``.
         reason: Machine-friendly reason code, e.g. ``"lancedb_missing"``.
-        detail: Optional human-readable context (paths, ids, counts).
+        detail: Optional human-readable context (paths, ids, counts). Pass
+            **static/context** text here, not eagerly-formatted exception text
+            (``exc`` already carries the exception; the diagnostic layer
+            produces its text safely).
         exc: Optional exception that caused the degradation.
     """
     global _suppressed
@@ -100,6 +131,10 @@ def log_data_loss(component: str, reason: str, *, detail: str = "",
     Use for every path where a write is partially applied: main table written
     but index not, row deleted but not re-added, candidate marked imported but
     not landed in L1, etc.
+
+    **Contract — this function never raises** (same as :func:`log_degraded`):
+    it is called from ``except`` blocks, and its formatting is guarded via
+    :func:`_safe_str`.
     """
     counter_key = f"{component}::{reason}"
     with _lock:
