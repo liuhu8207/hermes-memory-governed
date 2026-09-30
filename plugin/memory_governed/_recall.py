@@ -1358,17 +1358,23 @@ class RecallEngine:
 
         # 显式按分数降序，不依赖调用方：parallel_recall 已经排好序，但
         # format_recall 也会被直接调用（测试 / 其它入口），必须先排序再进预算
-        # 循环，否则低分条目会先占满预算、把高分条目 break 掉。
+        # 循环，否则低分条目会先占满预算、把高分条目挤到装不下而被跳过。
         l23_items = sorted(best_by_content.values(), key=lambda r: r.score, reverse=True)
 
         if l23_items:
             budget_chars = l23_budget * 4  # rough token→char
             used = 0
             selected = []
+            # 按排名贪心装包：装不下的项**跳过**（``continue``），**不是终止**
+            # （``break``）。实测（真实库，查 "公开仓库 hermes-memory-governed
+            # GitHub"）：一条 **3505 字**的 L3 闲聊排在第 5 位，前 5 项已占 2047 字，
+            # ``2047 + 3505 > 4800`` —— 旧代码 ``break`` 把它**其后 9 条短 L2 事实
+            # 全部丢弃**，哪怕它们加起来远小于剩余预算。``continue`` 只跳过这一条
+            # （跳过不改序：``selected`` 仍是排名序，排序即优先级）。
             for item in l23_items:
                 item_chars = len(item.content)
                 if used + item_chars > budget_chars:
-                    break
+                    continue
                 selected.append(item)
                 used += item_chars
 

@@ -216,6 +216,64 @@ class TestFormatRecallDedup:
         assert engine.format_recall([], "", l1_budget=800, l23_budget=1200) == ""
 
 
+class TestBudgetGreedyPack:
+    """L2/L3 共享预算按**排名贪心装包**：装不下的项只跳过（``continue``），
+    **不终止**循环（``break``）。
+
+    回归（真实库实测）：查 "公开仓库 hermes-memory-governed GitHub"，跨层融合
+    ``cross_layer_fusion=True`` 时序的第 5 位是一条 **3505 字**的 L3 闲聊
+    （``native_score`` 仅 0.2044）。前 5 项已占 2047 字，``2047 + 3505 > 4800``
+    ⇒ 旧代码 ``break`` 让其**其后 9 条短 L2 事实全部被丢弃**（注入从 12 条 L2
+    掉到 3 条），哪怕它们加起来远小于剩余预算。
+    """
+
+    def test_oversized_item_does_not_truncate_tail(self, tmp_path):
+        """一条装不下的超长项只应被跳过，后面的短项仍要进得来。"""
+        engine = _make_engine(tmp_path)
+        huge = "X" * 1000
+        results = [
+            RecallResult(layer="l2", content="AAAA", score=0.95),
+            RecallResult(layer="l2", content=huge, score=0.94),
+            RecallResult(layer="l2", content="BBBB", score=0.93),
+            RecallResult(layer="l2", content="CCCC", score=0.92),
+        ]
+        # 预算 10 → budget_chars=40：装得下 A+B+C（12 字），装不下 1000 字那条。
+        text = engine.format_recall(results, "", l1_budget=800, l23_budget=10)
+
+        assert "AAAA" in text
+        assert "BBBB" in text
+        assert "CCCC" in text
+        assert huge not in text, "超长项本应被跳过（装不下）"
+
+    def test_budget_is_strictly_enforced(self, tmp_path):
+        """``continue`` 不能退化成无界填充：注入内容字符数仍受预算约束。"""
+        engine = _make_engine(tmp_path)
+        contents = ["AAAAAA", "BBBBBB", "CCCCCC", "DDDDDD", "EEEEEE"]  # 各 6 字
+        results = [RecallResult(layer="l2", content=c, score=0.9 - i * 0.01)
+                   for i, c in enumerate(contents)]
+        # 预算 6 → budget_chars=24：正好装 4 条（4×6），第 5 条装不下。
+        text = engine.format_recall(results, "", l1_budget=800, l23_budget=6)
+
+        injected = [c for c in contents if c in text]
+        assert len(injected) == 4
+        assert sum(len(c) for c in injected) == 24        # ≤ budget_chars
+        # 再多装一条就超预算 → 预算被严格遵守。
+        assert sum(len(c) for c in injected) + 6 > 24
+
+    def test_selected_keeps_rank_order(self, tmp_path):
+        """跳过装不下的项**不改序**：``selected`` 仍是排名序（排序即优先级）。"""
+        engine = _make_engine(tmp_path)
+        results = [
+            RecallResult(layer="l2", content="AAAA", score=0.95),
+            RecallResult(layer="l2", content="X" * 1000, score=0.94),
+            RecallResult(layer="l2", content="BBBB", score=0.93),
+            RecallResult(layer="l2", content="CCCC", score=0.92),
+        ]
+        text = engine.format_recall(results, "", l1_budget=800, l23_budget=10)
+
+        assert text.index("AAAA") < text.index("BBBB") < text.index("CCCC")
+
+
 # ---------------------------------------------------------------------------
 # 3) KB min_score 真正生效
 # ---------------------------------------------------------------------------
