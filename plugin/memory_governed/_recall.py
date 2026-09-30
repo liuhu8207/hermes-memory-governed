@@ -215,6 +215,93 @@ _L2_RRF_W_VEC = 0.5
 _L2_RRF_W_LEX = 0.5
 
 
+def _rrf_merge(groups: List[Tuple[str, List["RecallResult"], float]]
+               ) -> List["RecallResult"]:
+    """多路按排名 RRF 融合，归一化到 (0,1]。groups = [(通道名, 结果, 权重), ...]。
+
+    这是 L2 内部双路（:func:`_fuse_l2_channels`）与 L2/L3 跨层
+    （:func:`_fuse_cross_layer`）**共用的唯一 RRF 内核** —— 两份实现迟早会漂移
+    出两个答案，这里只留一份。
+
+    语义（逐字复现 ``_fuse_l2_channels`` 的历史行为）：
+
+    * 键：``metadata["source_rowid"]`` 存在则用 ``("rid", rid)``，否则退化为
+      ``("content", content)``（同一事实跨通道合并为一条）。
+    * 名次：每路内部按 ``score`` 降序，从 1 开始。
+    * 原始分：``raw = Σ 权重_i / (k + rank_i)``，``present_w = Σ 出现路的权重``。
+    * 归一化：``fused = min(1.0, raw / (present_w / (k + 1)))``，``k = _L2_RRF_K``。
+      按**实际出现的路**归一化：单路第一名 = 双路第一名 = 1.0。``score`` 表达
+      「在能看到的通道里排第几」，是**排名量纲**，不可当作相似度门槛。
+    * 原生分：``metadata["native_score"] = round(max(各出现路的原生 score), 4)``。
+    * trace：``{"fusion": "rrf", "<通道名>_rank": …, "channels": [...]}``
+      （缺席路的 ``*_rank`` 为 ``None``）。
+    * 主记录：**按传入的组顺序取第一个出现的路**（L2 双路里 = 优先向量侧，
+      多带 category 等字段）。
+    * ``layer`` / ``source`` 取自主记录。
+    * 排序：``(-score, content, repr(key))`` —— **必须是全序**。上游按 ``set``
+      并集迭代，只排 ``(-score, content)`` 时「**同内容不同键**」（一边有
+      ``source_rowid`` 一边没有，且两边都是本层 rank 1 ⇒ 融合分同为 1.0）会
+      退化到集合迭代序、随哈希种子漂移 —— 注入 tag（Fact/History）因此非确定。
+      ``repr(("rid", int))`` / ``repr(("content", str))`` 对 str/int/None 都是
+      确定的，补上键级 tiebreak 后跨进程稳定。
+    """
+
+    def _key(r: "RecallResult") -> tuple:
+        rid = (r.metadata or {}).get("source_rowid")
+        return ("rid", rid) if rid is not None else ("content", r.content)
+
+    channel_ranks: Dict[str, Dict[tuple, int]] = {}
+    channel_by_key: Dict[str, Dict[tuple, "RecallResult"]] = {}
+    for name, items, _weight in groups:
+        ordered = sorted(items, key=lambda r: r.score, reverse=True)
+        channel_ranks[name] = {_key(r): i + 1 for i, r in enumerate(ordered)}
+        channel_by_key[name] = {_key(r): r for r in items}
+
+    all_keys: set = set()
+    for name, _items, _weight in groups:
+        all_keys |= set(channel_by_key[name])
+
+    out: List[RecallResult] = []
+    for key in all_keys:
+        raw = 0.0
+        present_w = 0.0
+        natives: List[float] = []
+        # 主记录：按传入组顺序取**第一个出现**的路（缺席通道的键访问不能先于
+        # present 判断 —— 历史实现曾有 KeyError 陷阱）。
+        primary: Optional["RecallResult"] = None
+        trace: Dict[str, Any] = {"fusion": "rrf"}
+        channels: List[str] = []
+        for name, _items, weight in groups:
+            # trace 逐路都要写名次（缺席为 None），与历史 trace 一致。
+            trace[f"{name}_rank"] = channel_ranks[name].get(key)
+            hit = channel_by_key[name].get(key)
+            if hit is None:
+                continue
+            raw += weight / (_L2_RRF_K + channel_ranks[name][key])
+            present_w += weight
+            natives.append(hit.score)
+            channels.append(name)
+            if primary is None:
+                primary = hit
+        fused = min(1.0, raw / (present_w / (_L2_RRF_K + 1)))
+        trace["channels"] = channels
+        meta = dict(primary.metadata or {})
+        meta["native_score"] = round(max(natives), 4)
+        meta["trace"] = trace
+        out.append(RecallResult(
+            layer=primary.layer,
+            content=primary.content,
+            score=round(fused, 4),
+            source=primary.source,
+            metadata=meta,
+        ))
+    # 分数降序；同分同内容再按键级 tiebreak（``repr(key)``）—— 排序必须是
+    # **全序**，否则「同内容不同键」（有/无 source_rowid）会退化到上面的 set
+    # 并集迭代序，随哈希种子漂移（测试与 trace 都要求可复现）。
+    out.sort(key=lambda r: (-r.score, r.content, repr(_key(r))))
+    return out
+
+
 def _fuse_l2_channels(vec: List["RecallResult"],
                       lex: List["RecallResult"]) -> List["RecallResult"]:
     """向量 + 词法两路按加权 RRF 融合（``recall.l2_fusion`` 开启时）。
@@ -231,68 +318,61 @@ def _fuse_l2_channels(vec: List["RecallResult"],
 
     同一事实（``source_rowid`` 相同，缺失时退化为内容相同）在两路中合并为
     一条，``metadata["trace"]`` 记下两路名次 —— 「双通道确认」是可诊断的。
+
+    内核已提为 :func:`_rrf_merge`（跨层融合共用同一份），这里只剩通道装配。
+    """
+    return _rrf_merge([("vector", vec, _L2_RRF_W_VEC),
+                       ("lexical", lex, _L2_RRF_W_LEX)])
+
+
+#: L2/L3 跨层 RRF 两路等权：各 1.0。两层都无「哪层更可信」的先验 ——
+#: 让排名说话（与 ``_L2_RRF_W_VEC`` / ``_L2_RRF_W_LEX`` 的等权取舍同理）。
+_XL_RRF_W_L2 = 1.0
+_XL_RRF_W_L3 = 1.0
+
+
+def _fuse_cross_layer(l2_items: List["RecallResult"],
+                      l3_items: List["RecallResult"]) -> List["RecallResult"]:
+    """L2 与 L3 **跨层**按排名 RRF 融合（``recall.cross_layer_fusion`` 开启时）。
+
+    为什么按排名而不是按分：L2 是 1024 维余弦映射（``(1+cos)/2`` 标尺），L3 是
+    FTS5 原始分（0.3~0.7），两者**不同源**，混排时分数不可比（``format_recall``
+    的历史注释记着：套 L2 门槛会误砍 L3 的 82/91 条）。RRF 只用**名次**，天然
+    回避了量纲问题。
+
+    融合分写进 ``score``，原生分保留在 ``metadata["native_score"]`` —— 仅供
+    可观测：**准入已经在融合前按各层自己的门槛做完了**（L2 用原生分、L3 恒用
+    ``MIN_SCORE``）。``score`` 是排名量纲，**绝不能**回流去当准入门槛。
+
+    诊断：``metadata["trace"]["fusion"] = "rrf-cross-layer"`` 区分于 L2 内部
+    融合的 ``"rrf"``。若某条命中在进入本层前**已在 L2 内部**做过 vec/lex 融合
+    （其 ``metadata["trace"]`` 非空），把那份 trace 挪到 ``metadata["l2_trace"]``
+    再写跨层 trace —— 否则内层 trace 被覆盖，「双通道确认」就不可诊断了。
     """
 
     def _key(r: "RecallResult") -> tuple:
         rid = (r.metadata or {}).get("source_rowid")
         return ("rid", rid) if rid is not None else ("content", r.content)
 
-    def _ranks(results: List["RecallResult"]) -> Dict[tuple, int]:
-        ordered = sorted(results, key=lambda r: r.score, reverse=True)
-        return {_key(r): i + 1 for i, r in enumerate(ordered)}
+    # 融合会覆盖 metadata["trace"]：先按 key 捞出内层（L2 vec/lex）trace。
+    inner_trace: Dict[tuple, Any] = {}
+    for r in list(l2_items) + list(l3_items):
+        inner = (r.metadata or {}).get("trace")
+        if inner is not None:
+            inner_trace[_key(r)] = inner
 
-    vec_ranks = _ranks(vec)
-    lex_ranks = _ranks(lex)
-    vec_by_key = {_key(r): r for r in vec}
-    lex_by_key = {_key(r): r for r in lex}
-
-    out: List[RecallResult] = []
-    for key in set(vec_by_key) | set(lex_by_key):
-        in_vec, in_lex = key in vec_by_key, key in lex_by_key
-        # 按实际出现的通道归一化：分母 = 出现通道的权重和在第一名处的 RRF。
-        raw = 0.0
-        present_w = 0.0
-        v_rank = vec_ranks.get(key)
-        l_rank = lex_ranks.get(key)
-        if in_vec:
-            raw += _L2_RRF_W_VEC / (_L2_RRF_K + v_rank)
-            present_w += _L2_RRF_W_VEC
-        if in_lex:
-            raw += _L2_RRF_W_LEX / (_L2_RRF_K + l_rank)
-            present_w += _L2_RRF_W_LEX
-        fused = min(1.0, raw / (present_w / (_L2_RRF_K + 1)))
-
-        # 原生分 = 各**出现**通道的原生分取大（任一通道证据足够强即过门槛）。
-        # 注意不能写成先取字典值再按 present 过滤 —— 缺席通道的键访问会在
-        # 判断之前先抛 KeyError。
-        natives = []
-        if in_vec:
-            natives.append(vec_by_key[key].score)
-        if in_lex:
-            natives.append(lex_by_key[key].score)
-        native = max(natives)
-        # 主记录优先取向量侧（多带 category 等字段），内容两路同源一致。
-        primary = vec_by_key[key] if in_vec else lex_by_key[key]
-        meta = dict(primary.metadata or {})
-        meta["native_score"] = round(native, 4)
-        meta["trace"] = {
-            "fusion": "rrf",
-            "vector_rank": v_rank,
-            "lexical_rank": l_rank,
-            "channels": ([c for c, on in (("vector", in_vec), ("lexical", in_lex))
-                          if on]),
-        }
-        out.append(RecallResult(
-            layer="l2",
-            content=primary.content,
-            score=round(fused, 4),
-            source=primary.source,
-            metadata=meta,
-        ))
-    # 分数降序；同分按内容字典序稳定排序 —— 上游按 set 并集迭代，
-    # 不加 tiebreak 同分顺序会跨进程漂移（测试与 trace 都要求可复现）。
-    out.sort(key=lambda r: (-r.score, r.content))
-    return out
+    merged = _rrf_merge([("l2", l2_items, _XL_RRF_W_L2),
+                         ("l3", l3_items, _XL_RRF_W_L3)])
+    for r in merged:
+        meta = dict(r.metadata or {})
+        trace = dict(meta.get("trace") or {})
+        trace["fusion"] = "rrf-cross-layer"
+        prev = inner_trace.get(_key(r))
+        if prev is not None:
+            meta["l2_trace"] = prev
+        meta["trace"] = trace
+        r.metadata = meta
+    return merged
 
 
 def _l2_admitted(r, l2_floor: float) -> bool:
@@ -1245,10 +1325,28 @@ class RecallEngine:
                 return r.score >= l3_floor
             return _l2_admitted(r, l2_floor)
 
-        l23_items = [
+        admitted = [
             r for r in results
             if r.layer in ("l2", "l3") and _passes_floor(r)
         ]
+
+        # 跨层 RRF 融合（``recall.cross_layer_fusion``）。**准入在上一步已按各层
+        # 自己的原生分门槛做完**，这里只重排：L2 是 ``(1+cos)/2`` 标尺、L3 是
+        # FTS5 原始分，两者不同源，直接按 score 混排没有可比性；RRF 只用名次。
+        # 融合分是排名量纲，**绝不回流去当准入门槛**（拿 A 的尺子量 B 已烧过两次）。
+        l23_items = admitted
+        if bool(getattr(recall_cfg, "cross_layer_fusion", False)):
+            l2_adm = [r for r in admitted if r.layer == "l2"]
+            l3_adm = [r for r in admitted if r.layer == "l3"]
+            # 只有两层都有货时才融合：单层缺失时融合没有意义，直接回退成现行为
+            # （与 ``_search_l2_fused`` 的单通道回退同一取舍）。
+            if l2_adm and l3_adm:
+                try:
+                    l23_items = _fuse_cross_layer(l2_adm, l3_adm)
+                except Exception as e:  # noqa: BLE001 — 读路径绝不因融合失败而空手
+                    log_degraded("recall", "cross_layer_fusion_failed",
+                                 detail=f"{type(e).__name__}: {e}")
+                    l23_items = admitted
 
         # 按 content 去重，只保留最高分那条：实测 L2 重复率 94.8%，
         # 同一事实的副本会彼此抢占 l23_budget，把真正多样的记忆挤出去。

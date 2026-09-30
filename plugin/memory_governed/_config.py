@@ -90,6 +90,16 @@ class RecallConfig:
     #: **默认 False = 现行为**：与本文件其它新行为同一约定，部署侧显式开启。
     l2_fusion: bool = False
 
+    #: L2 与 L3 **跨层**按排名 RRF 融合（只在这一项为 True 时生效）。
+    #:
+    #: 为什么需要：L2 是 1024 维余弦映射（`(1+cos)/2` 标尺），L3 是 FTS5
+    #: 原始分（0.3~0.7），两者**不同源**，混排时无法比较。RRF 只用**名次**，
+    #: 因此天然回避了这个量纲问题（同理见 `_fuse_l2_channels` 的注释）。
+    #: 准入仍在**融合前**按各层自己的门槛判（L2 用原生分、L3 恒用 MIN_SCORE）。
+    #:
+    #: **默认 False = 现行为**：与本文件其它新行为同一约定，部署侧显式开启。
+    cross_layer_fusion: bool = False
+
 
 @dataclass
 class SyncConfig:
