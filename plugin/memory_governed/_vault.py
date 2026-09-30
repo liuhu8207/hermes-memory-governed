@@ -32,6 +32,8 @@ import time
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
+from ._diag import log_degraded
+
 logger = logging.getLogger(__name__)
 
 #: vault 的标准子目录（PARA + inbox + notes + knowledge 自动区）
@@ -142,7 +144,8 @@ def parse_frontmatter(text: str) -> Tuple[Dict[str, Any], str]:
         data = yaml.safe_load(raw_fm)
         if isinstance(data, dict):
             return data, body
-    except Exception:  # noqa: BLE001 — 回退到内置解析
+    except Exception as e:  # noqa: BLE001 — 回退到内置解析
+        log_degraded("kb_vault", "yaml_frontmatter_fallback", exc=e)
         pass
     data: Dict[str, Any] = {}
     for line in raw_fm.splitlines():
@@ -156,7 +159,8 @@ def parse_frontmatter(text: str) -> Tuple[Dict[str, Any], str]:
             try:
                 data[key] = json.loads(raw_value)
                 continue
-            except Exception:  # noqa: BLE001
+            except Exception as e:  # noqa: BLE001
+                log_degraded("kb_vault", "frontmatter_list_parse_failed", exc=e)
                 inner = [v.strip().strip("'\"") for v in raw_value[1:-1].split(",") if v.strip()]
                 data[key] = inner
                 continue
@@ -166,12 +170,12 @@ def parse_frontmatter(text: str) -> Tuple[Dict[str, Any], str]:
         try:
             data[key] = int(raw_value)
             continue
-        except ValueError:
+        except ValueError:  # silent-ok: value-fallback — 非整数标量回退为字符串
             pass
         try:
             data[key] = float(raw_value)
             continue
-        except ValueError:
+        except ValueError:  # silent-ok: value-fallback — 非浮点标量回退为字符串
             pass
         data[key] = raw_value.strip("'\"")
     return data, body
@@ -189,7 +193,7 @@ def write_note(path: Path, meta: Dict[str, Any], body: str) -> None:
     except BaseException:
         try:
             os.unlink(tmp)
-        except OSError:
+        except OSError:  # silent-ok: value-fallback — 临时文件善后失败不掩盖原异常（best-effort）
             pass
         raise
 
@@ -198,7 +202,7 @@ def read_note(path: Path) -> Tuple[Dict[str, Any], str]:
     """读取一篇笔记 → (frontmatter, body)。读失败返回 ({}, "")。"""
     try:
         return parse_frontmatter(path.read_text(encoding="utf-8", errors="replace"))
-    except OSError as e:
+    except OSError as e:  # silent-ok: value-fallback — 笔记读不到 → ({}, "")，per-note 遍历里跳过
         logger.debug("read_note failed for %s: %s", path, e)
         return {}, ""
 

@@ -22,7 +22,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 from ._config import GovernedMemoryConfig
-from ._diag import log_data_loss
+from ._diag import log_data_loss, log_degraded
 from ._sync import (
     _ABS_PATH_RE,
     _MEDIA_PLACEHOLDER_RE,
@@ -228,10 +228,10 @@ class BridgeExporter:
                                 cid = existing.get("id")
                                 if cid:
                                     existing_ids.add(cid)
-                            except json.JSONDecodeError:
+                            except json.JSONDecodeError:  # silent-ok: value-fallback — 坏行按缺失处理，逐行跳过
                                 pass
-                except Exception:  # noqa: BLE001 - dedup is best-effort
-                    pass
+                except Exception as e:  # noqa: BLE001 - dedup is best-effort
+                    log_degraded("bridge", "dedup_read_failed", exc=e)
 
             # Append mode inside the lock: concurrent callers serialise here.
             with open(jsonl_path, "a", encoding="utf-8") as f:
@@ -365,7 +365,8 @@ class BridgeExporter:
             return
         try:
             line_count = sum(1 for _ in jsonl_path.open(encoding="utf-8"))
-        except Exception:
+        except Exception as e:
+            log_degraded("bridge", "archive_count_failed", exc=e)
             return
         if line_count <= self.MAX_JSONL_LINES:
             return
@@ -379,6 +380,7 @@ class BridgeExporter:
             jsonl_path.rename(archive_path)
             logger.info("Bridge archived %d lines to %s", line_count, archive_path)
         except OSError as e:
+            log_degraded("bridge", "archive_rename_failed", exc=e)
             logger.debug("Bridge archive failed: %s", e)
 
     def _validate_candidate(self, candidate: dict) -> bool:
@@ -421,14 +423,14 @@ class BridgeExporter:
             try:
                 with open(jsonl_path, encoding="utf-8") as f:
                     status["candidate_count"] = sum(1 for _ in f)
-            except Exception:
-                pass
+            except Exception as e:
+                log_degraded("bridge", "status_count_failed", exc=e)
 
         if report_path.exists():
             try:
                 status["last_export"] = json.loads(report_path.read_text(encoding="utf-8"))
-            except Exception:
-                pass
+            except Exception as e:
+                log_degraded("bridge", "status_report_read_failed", exc=e)
 
         return status
 
@@ -491,7 +493,7 @@ class BridgeExporter:
                     continue
                 try:
                     rows.append((raw, json.loads(raw)))
-                except json.JSONDecodeError:
+                except json.JSONDecodeError:  # silent-ok: value-fallback — 坏行保留原文并另行 quarantine，不在此上报
                     rows.append((raw, None))
                     corrupt_lines.append(raw)
                     skipped += 1
@@ -639,8 +641,8 @@ class BridgeExporter:
             import re
             for m in re.finditer(r"<!-- bridge:imported id=(\S+)", content):
                 ids.add(m.group(1))
-        except OSError:
-            pass
+        except OSError as e:
+            log_degraded("bridge", "imported_ids_read_failed", exc=e)
         return ids
 
     @staticmethod
@@ -666,7 +668,8 @@ class BridgeExporter:
             return 0
         try:
             return sum(1 for line in path.open(encoding="utf-8") if line.strip())
-        except OSError:
+        except OSError as e:
+            log_degraded("bridge", "count_lines_failed", exc=e)
             return 0
 
     def _quarantine_corrupt(self, corrupt_lines: List[str]) -> Optional[Path]:
@@ -710,7 +713,7 @@ class BridgeExporter:
             try:
                 if tmp_path.exists():
                     tmp_path.unlink()
-            except OSError:
+            except OSError:  # silent-ok: value-fallback — 临时文件清理失败可忽略（主失败已在下方上报）
                 pass
             log_data_loss("bridge", "jsonl_rewrite_failed", detail=str(jsonl_path), exc=e)
             return False

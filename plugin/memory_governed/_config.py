@@ -15,6 +15,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Dict, Optional
 
+from ._diag import log_degraded
+
 logger = logging.getLogger(__name__)
 
 
@@ -386,7 +388,7 @@ def _read_dotenv_values(path: Path) -> Dict[str, str]:
     values: Dict[str, str] = {}
     try:
         text = path.read_text(encoding="utf-8", errors="replace")
-    except OSError:
+    except OSError:  # silent-ok: value-fallback — 可选 .env 缺失/不可读 → 空映射（非错误）
         return values
     for line in text.splitlines():
         line = line.strip()
@@ -454,6 +456,8 @@ def load_governed_config(hermes_home: str | Path) -> GovernedMemoryConfig:
             _apply_dict_to_config(config, raw)
         except Exception as e:
             logger.warning("Failed to load config from %s: %s — using defaults", config_path, e)
+            log_degraded("config", "config_load_failed",
+                         detail=str(config_path), exc=e)
 
     _validate_numeric_fields(config)
     _validate_positive_fields(config)
@@ -479,7 +483,9 @@ def _load_agent_model_config(hermes_home: Path) -> Optional[Dict[str, str]]:
         return None
     try:
         text = config_path.read_text(encoding="utf-8", errors="replace")
-    except OSError:
+    except OSError as e:
+        log_degraded("config", "agent_model_read_failed",
+                     detail=str(config_path), exc=e)
         return None
 
     result: Dict[str, str] = {}
@@ -611,7 +617,7 @@ def _validate_numeric_fields(config: GovernedMemoryConfig) -> None:
                         section_name, field_name, value, coerced,
                     )
                     setattr(section, field_name, coerced)
-                except (TypeError, ValueError):
+                except (TypeError, ValueError):  # silent-ok: value-fallback — 坏数值字段值回退默认
                     default_section = GovernedMemoryConfig()
                     default_value = getattr(getattr(default_section, section_name), field_name)
                     logger.warning(

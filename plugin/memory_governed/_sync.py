@@ -1246,6 +1246,7 @@ def _flush_all_queues() -> None:
         try:
             q.stop(timeout=1.0)
         except Exception as e:  # noqa: BLE001 - atexit must never raise
+            log_data_loss("write_queue", "atexit_flush_failed", exc=e)
             logger.debug("atexit write-queue flush failed: %s", e)
 
 
@@ -1317,7 +1318,7 @@ class WriteQueue:
         while drained < max_items:
             try:
                 item = self._queue.get_nowait()
-            except queue.Empty:
+            except queue.Empty:  # silent-ok: value-fallback — 队列已空=正常控制流，非故障
                 break
             if item is _STOP_SENTINEL:
                 continue
@@ -1329,13 +1330,14 @@ class WriteQueue:
                 with self._stats_lock:
                     self._stats["errors"] += 1
                 logger.error("Write queue drain error: %s", e)
+                log_data_loss("write_queue", "drain_item_failed", exc=e)
             finally:
                 drained += 1
 
         # Wake a worker sleeping in get(timeout=1.0) so the join is immediate.
         try:
             self._queue.put_nowait(_STOP_SENTINEL)
-        except queue.Full:
+        except queue.Full:  # silent-ok: value-fallback — 哨兵未入队=唤醒失败但无害，正常控制流
             pass
 
         thread = self._worker_thread
@@ -1396,7 +1398,7 @@ class WriteQueue:
         while self._running:
             try:
                 item = self._queue.get(timeout=1.0)
-            except queue.Empty:
+            except queue.Empty:  # silent-ok: value-fallback — 空队列轮询=正常控制流，非故障
                 continue
             if item is _STOP_SENTINEL:
                 break
@@ -1404,12 +1406,13 @@ class WriteQueue:
                 self._process_item(item)
                 with self._stats_lock:
                     self._stats["processed"] += 1
-            except queue.Empty:
+            except queue.Empty:  # silent-ok: value-fallback — 空队列轮询=正常控制流，非故障
                 continue
             except Exception as e:  # noqa: BLE001 - worker must not die
                 with self._stats_lock:
                     self._stats["errors"] += 1
                 logger.error("Write worker error: %s", e)
+                log_data_loss("write_queue", "worker_item_failed", exc=e)
 
     def _process_item(self, item: dict) -> None:
         """Process a single write item: L2 indexing + extraction."""
@@ -1516,7 +1519,8 @@ class WriteQueue:
                         if match:
                             return int(match.group(1))
             return 0
-        except Exception:
+        except Exception as e:  # noqa: BLE001 - schema 不可检视→退回"无维度"(关闭维度校验)
+            log_degraded("l2_write", "dim_probe_failed", exc=e)
             return 0
 
     def _existing_contents(self) -> set:
@@ -1556,7 +1560,8 @@ class WriteQueue:
                 return set()
             table = store.search().select(["content"]).limit(n).to_arrow()
             return {str(c) for c in table.column("content").to_pylist() if c is not None}
-        except Exception:  # noqa: BLE001 - fall through to the next strategy
+        except Exception as e:  # noqa: BLE001 - fall through to the next strategy
+            log_degraded("l2_write", "dedup_projected_scan_failed", exc=e)
             pass
 
         # STRATEGY 2: full-table Arrow scan. No column projection, so it drags
@@ -1565,7 +1570,8 @@ class WriteQueue:
         try:
             table = store.to_arrow()
             return {str(c) for c in table.column("content").to_pylist() if c is not None}
-        except Exception:  # noqa: BLE001 - fall through
+        except Exception as e:  # noqa: BLE001 - fall through
+            log_degraded("l2_write", "dedup_fulltable_scan_failed", exc=e)
             pass
 
         # STRATEGY 3: pandas-based projection over a scan query. Works ONLY
@@ -1576,14 +1582,16 @@ class WriteQueue:
                 return set()
             df = store.search().select(["content"]).limit(n).to_pandas()
             return {str(c) for c in df["content"].tolist() if c is not None}
-        except Exception:  # noqa: BLE001 - fall through to the next strategy
+        except Exception as e:  # noqa: BLE001 - fall through to the next strategy
+            log_degraded("l2_write", "dedup_pandas_scan_failed", exc=e)
             pass
 
         # STRATEGY 4: some LanceDB builds expose column projection on to_pandas().
         try:
             df = store.to_pandas(columns=["content"])
             return {str(c) for c in df["content"].tolist() if c is not None}
-        except Exception:  # noqa: BLE001 - fall through
+        except Exception as e:  # noqa: BLE001 - fall through
+            log_degraded("l2_write", "dedup_pandas_columns_failed", exc=e)
             pass
 
         # STRATEGY 5: older LanceDB builds project through the Lance dataset
@@ -1591,7 +1599,8 @@ class WriteQueue:
         try:
             table = store.to_lance().to_table(columns=["content"])
             return {str(c) for c in table.column("content").to_pylist() if c is not None}
-        except Exception:  # noqa: BLE001 - fall through
+        except Exception as e:  # noqa: BLE001 - fall through
+            log_degraded("l2_write", "dedup_lance_scan_failed", exc=e)
             pass
 
         # STRATEGY 6: in-memory doubles (e.g. test stores) expose their rows
@@ -2245,7 +2254,8 @@ class L3Writer:
             # Legacy tables: backfill hash column for idempotent writes
             try:
                 self._conn.execute("ALTER TABLE messages ADD COLUMN hash TEXT")
-            except Exception:  # noqa: BLE001 - column already exists
+            except Exception as e:  # noqa: BLE001 - column already exists
+                log_degraded("l3_write", "legacy_hash_alter_failed", exc=e)
                 pass
             # Dedup + retention indexes (new databases never run migration 003).
             self._ensure_indexes(self._conn)
@@ -2285,7 +2295,8 @@ class L3Writer:
         """
         try:
             rows = conn.execute("PRAGMA table_info(messages_fts)").fetchall()
-        except Exception:  # noqa: BLE001
+        except Exception as e:  # noqa: BLE001
+            log_degraded("l3_fts", "layout_detect_failed", exc=e)
             return []
         return [r[1] for r in rows]
 
@@ -2379,7 +2390,8 @@ class L3Writer:
             except Exception:
                 try:
                     conn.rollback()
-                except Exception:  # noqa: BLE001
+                except Exception as e:  # noqa: BLE001
+                    log_degraded("l3_write", "rollback_failed", exc=e)
                     pass
                 raise
 

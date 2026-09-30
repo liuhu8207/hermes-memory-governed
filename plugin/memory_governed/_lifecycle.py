@@ -34,6 +34,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
+from ._diag import log_degraded
 from ._text import normalize_for_match
 
 logger = logging.getLogger(__name__)
@@ -78,9 +79,11 @@ def load_tombstones(memory_dir: Path) -> Dict[str, Dict[str, Any]]:
         if isinstance(data, dict):
             return {str(k): v for k, v in data.items() if isinstance(v, dict)}
         logger.warning("l2 tombstones file is not a dict: %s", path)
-    except FileNotFoundError:
+    except FileNotFoundError:  # silent-ok: value-fallback — 文件尚未创建=空墓碑表，正常
         return {}
     except (OSError, ValueError) as e:
+        # 墓碑丢失 ⇒ 被撤回的事实可能复活：除 warning 外再进 _diag 计数（可诊断）
+        log_degraded("l2_lifecycle", "tombstones_unreadable", detail=str(path), exc=e)
         logger.warning("l2 tombstones unreadable (%s): %s", path, e)
     return {}
 
@@ -114,7 +117,7 @@ def archive_count(memory_dir: Path) -> int:
     try:
         with path.open("r", encoding="utf-8") as f:
             return sum(1 for line in f if line.strip())
-    except OSError:
+    except OSError:  # silent-ok: value-fallback — 归档文件缺失/不可读→计数 0，正常
         return 0
 
 
@@ -152,6 +155,7 @@ def backup_table(l2_db_path, *, tag: str,
             shutil.rmtree(dest)
         shutil.copytree(src, dest)
     except OSError as e:
+        log_degraded("l2_lifecycle", "backup_failed", detail=f"src={src}", exc=e)
         logger.error("表备份失败（%s）—— 拒绝删除 %s", e, src)
         return None
     logger.info("破坏性操作前已备份 %s -> %s", src, dest)
@@ -188,12 +192,14 @@ def usage_touch(memory_dir: Path, contents: List[str]) -> None:
             )
         conn.commit()
     except Exception as e:  # noqa: BLE001
+        log_degraded("l2_usage", "touch_failed", exc=e)
         logger.debug("l2 usage touch failed: %s", e)
     finally:
         if conn is not None:
             try:
                 conn.close()
             except Exception as e:  # noqa: BLE001
+                log_degraded("l2_usage", "conn_close_failed", exc=e)
                 logger.debug("l2 usage conn close failed: %s", e)
 
 
@@ -205,6 +211,7 @@ def usage_last_used(memory_dir: Path) -> Dict[str, float]:
         rows = conn.execute("SELECT fp, last_used FROM l2_usage").fetchall()
         return {str(fp): float(lu or 0.0) for fp, lu in rows}
     except Exception as e:  # noqa: BLE001
+        log_degraded("l2_usage", "read_failed", exc=e)
         logger.debug("l2 usage read failed: %s", e)
         return {}
     finally:
@@ -212,6 +219,7 @@ def usage_last_used(memory_dir: Path) -> Dict[str, float]:
             try:
                 conn.close()
             except Exception as e:  # noqa: BLE001
+                log_degraded("l2_usage", "conn_close_failed", exc=e)
                 logger.debug("l2 usage conn close failed: %s", e)
 
 
@@ -221,13 +229,15 @@ def usage_count(memory_dir: Path) -> int:
         conn = _usage_connect(usage_db_path(memory_dir))
         row = conn.execute("SELECT COUNT(*) FROM l2_usage").fetchone()
         return int(row[0]) if row else 0
-    except Exception:  # noqa: BLE001
+    except Exception as e:  # noqa: BLE001
+        log_degraded("l2_usage", "count_failed", exc=e)
         return 0
     finally:
         if conn is not None:
             try:
                 conn.close()
             except Exception as e:  # noqa: BLE001
+                log_degraded("l2_usage", "conn_close_failed", exc=e)
                 logger.debug("l2 usage conn close failed: %s", e)
 
 

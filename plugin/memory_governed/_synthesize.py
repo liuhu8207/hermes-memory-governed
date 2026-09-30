@@ -22,6 +22,7 @@ from typing import Any, Dict, List
 
 from ._config import env_secret
 from ._llm import chat_completion
+from ._diag import log_degraded
 
 logger = logging.getLogger(__name__)
 
@@ -118,7 +119,7 @@ def _salvage_truncated_array(s: str) -> List[Any]:
             break
         try:
             obj, end = decoder.raw_decode(s, idx)
-        except json.JSONDecodeError:
+        except json.JSONDecodeError:  # silent-ok: value-fallback — 抢救循环在截断处至多触发一次
             break
         out.append(obj)
         idx = end
@@ -145,6 +146,7 @@ def _parse_candidates(text: str) -> List[Dict[str, Any]]:
             raw = json.loads(text[start:end + 1])
         except Exception as e:  # noqa: BLE001
             logger.warning("synthesis JSON parse failed, salvaging: %s", e)
+            log_degraded("synthesis", "json_parse_failed", exc=e)
             raw = _salvage_truncated_array(text[start:end + 1])
 
     if not isinstance(raw, list):
@@ -160,7 +162,7 @@ def _parse_candidates(text: str) -> List[Dict[str, Any]]:
             continue
         try:
             confidence = float(item.get("confidence", 0.5))
-        except (TypeError, ValueError):
+        except (TypeError, ValueError):  # silent-ok: value-fallback — 坏 confidence 值按 0.5，per-item
             confidence = 0.5
         confidence = max(0.0, min(1.0, confidence))
         out.append({
@@ -206,7 +208,7 @@ def synthesize_notes(
 
     try:
         max_candidates = int(getattr(syn, "max_candidates", 5) or 5)
-    except (TypeError, ValueError):
+    except (TypeError, ValueError):  # silent-ok: value-fallback — 坏 max_candidates 值回退 5
         max_candidates = 5
     if max_candidates < 1:
         max_candidates = 1

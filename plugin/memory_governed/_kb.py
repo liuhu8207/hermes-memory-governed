@@ -43,8 +43,15 @@ from . import _vault
 logger = logging.getLogger(__name__)
 
 try:  # pragma: no cover - _diag.py 尚未落地时的兼容回退（与 _recall.py 同一套）
-    from ._diag import log_degraded
+    from ._diag import _safe_str, log_degraded
 except Exception:  # noqa: BLE001
+    def _safe_str(value: object) -> str:
+        """Fallback: 无 _diag.py 时的安全字符串化（绝不抛出）。"""
+        try:
+            return str(value)
+        except Exception:  # noqa: BLE001 — 诊断兜底绝不能再抛
+            return "<unrepr>"
+
     def log_degraded(component: str, reason: str, *, detail: str = "",
                      exc: BaseException | None = None) -> None:
         """Fallback: 无 _diag.py 时的 WARNING 级降级日志。"""
@@ -192,7 +199,7 @@ def _file_mtime(path: Path) -> float:
     """
     try:
         return float(path.stat().st_mtime)
-    except OSError:
+    except OSError:  # silent-ok: value-fallback — stat 取不到 mtime 时按 0.0（未知），per-note 调用
         return 0.0
 
 
@@ -227,10 +234,13 @@ def _unlink_with_retry(
         try:
             path.unlink()
             return None
-        except FileNotFoundError:
+        except FileNotFoundError:  # silent-ok: value-fallback — 目标状态（不存在）已达成，缺席即成功
             return None          # 已经不存在 —— 目的已经达到
         except OSError as e:     # noqa: BLE001 - 需要 errno，不吞
-            last_reason = "errno=%s: %s" % (getattr(e, "errno", None), e)
+            log_degraded("kb_unlink", "unlink_failed",
+                         detail="attempt %d/%d for %s" % (i + 1, max(1, attempts), path),
+                         exc=e)
+            last_reason = "errno=%s: %s" % (getattr(e, "errno", None), _safe_str(e))
             if i < max(1, attempts) - 1:
                 time.sleep(base_delay * (2 ** i))
     return last_reason
@@ -309,6 +319,7 @@ def _enrich_note(title: str, body: str, config: Any) -> Dict[str, Any]:
         return out
     except Exception as e:  # noqa: BLE001 - 富化失败不阻断写入
         logger.debug("kb enrich parse failed: %s", e)
+        log_degraded("kb_enrich", "parse_failed", exc=e)
         return {}
 
 
@@ -441,7 +452,8 @@ class KBIndex:
                 EmbeddingService.reset()
                 self._service = EmbeddingService.get(self._config)
         except Exception as e:  # noqa: BLE001 — 索引只是投影，失败不能影响主流程
-            self._last_error = f"embedding: {e}"
+            self._last_error = f"embedding: {_safe_str(e)}"
+            log_degraded("kb_index", "embedding_init_failed", exc=e)
             return
         if self._service is None or not getattr(self._service, "available", False):
             self._last_error = "embedding unavailable"
@@ -451,6 +463,8 @@ class KBIndex:
             import pyarrow as pa  # noqa: F401
         except ImportError as e:
             self._last_error = f"lancedb missing: {e.name}"
+            log_degraded("kb_index", "lancedb_missing",
+                         detail="vector index disabled (text/keyword only)", exc=e)
             return
         try:
             self._db_path.mkdir(parents=True, exist_ok=True)
@@ -478,9 +492,10 @@ class KBIndex:
                 self._store = db.create_table(_TABLE_NAME, schema=schema)
             self._available = True
         except Exception as e:  # noqa: BLE001
-            self._last_error = f"lancedb: {e}"
+            self._last_error = f"lancedb: {_safe_str(e)}"
             self._store = None
             self._available = False
+            log_degraded("kb_index", "lancedb_init_failed", exc=e)
 
     @property
     def available(self) -> bool:
@@ -518,13 +533,15 @@ class KBIndex:
             return
         try:
             self.delete(path)
-        except Exception:  # noqa: BLE001 — 删不掉就靠搜索侧去重兜底
+        except Exception as e:  # noqa: BLE001 — 删不掉就靠搜索侧去重兜底
+            log_degraded("kb_index", "upsert_delete_failed", detail=str(path), exc=e)
             pass
         try:
             self._store.add([{"path": path, "text": text,
                               "mtime": float(mtime or 0.0), "vector": vec}])
         except Exception as e:  # noqa: BLE001
             logger.debug("kb index upsert failed for %s: %s", path, e)
+            log_degraded("kb_index", "upsert_add_failed", detail=str(path), exc=e)
 
     def path_mtimes(self) -> Dict[str, float]:
         """索引里 ``path -> mtime`` 的映射（供增量同步比对）。
@@ -549,6 +566,7 @@ class KBIndex:
             return {p: float(m or 0.0) for p, m in zip(paths, mtimes)}
         except Exception as e:  # noqa: BLE001
             logger.debug("kb index path_mtimes failed: %s", e)
+            log_degraded("kb_index", "path_mtimes_failed", exc=e)
             return {}
 
     def delete(self, path: str) -> None:
@@ -567,6 +585,7 @@ class KBIndex:
                 db.drop_table(_TABLE_NAME)
         except Exception as e:  # noqa: BLE001
             logger.debug("kb index drop failed: %s", e)
+            log_degraded("kb_index", "drop_failed", exc=e)
         self._available = False
         self._init()
         self._schedule_next_reprobe()
@@ -589,6 +608,7 @@ class KBIndex:
             )
         except Exception as e:  # noqa: BLE001
             logger.debug("kb index search failed: %s", e)
+            log_degraded("kb_index", "search_failed", exc=e)
             return []
         out: List[Dict[str, Any]] = []
         for r in rows:
@@ -623,13 +643,13 @@ def _is_link(path: Path) -> bool:
     try:
         if path.is_symlink():
             return True
-    except OSError:
+    except OSError:  # silent-ok: value-fallback — 无法判定符号链接时视为非链接，per-file
         return False
     isjunction = getattr(os.path, "isjunction", None)
     if callable(isjunction):
         try:
             return bool(isjunction(str(path)))
-        except OSError:
+        except OSError:  # silent-ok: value-fallback — 无法判定 junction 时视为非链接，per-file
             return False
     return False
 
@@ -639,7 +659,7 @@ def _is_within(child: Path, parent: Path) -> bool:
     try:
         child.relative_to(parent)
         return True
-    except ValueError:
+    except ValueError:  # silent-ok: value-fallback — relative_to 抛 ValueError 即不在 parent 下，per-file
         return False
 
 
@@ -683,7 +703,7 @@ def iter_vault_notes(vault: Path, *,
         try:
             if not p.is_file():
                 continue
-        except OSError:
+        except OSError:  # silent-ok: value-fallback — stat 失败的文件跳过，per-file
             continue
         # rglob 已经跟着链接走出去了，所以这里必须用 realpath 复核「还在不在库里」。
         real = Path(os.path.realpath(str(p)))
@@ -697,7 +717,7 @@ def iter_vault_notes(vault: Path, *,
             continue
         try:
             rel = p.relative_to(vault)
-        except ValueError:
+        except ValueError:  # silent-ok: value-fallback — 经链接到达时退回 realpath 相对路径，per-file
             # 只可能经由「留在库内」的链接到达；此时真实身份才是可用的那个
             rel = real.relative_to(vault_real)
         if any(part.startswith(".") for part in rel.parts[:-1]):
@@ -726,7 +746,7 @@ def iter_vault_notes(vault: Path, *,
             dirnames.remove(name)
             try:
                 real = Path(os.path.realpath(str(candidate)))
-            except OSError:  # pragma: no cover — unresolvable link
+            except OSError:  # pragma: no cover — unresolvable link  # silent-ok: value-fallback — 不可解析的链接跳过，per-link
                 continue
             if _is_within(real, vault_real):
                 continue
@@ -771,12 +791,14 @@ class _UsageStore:
             return {str(p): int(h) for p, h in rows}
         except Exception as e:  # noqa: BLE001 - 统计失败绝不影响检索
             logger.debug("kb_usage read failed: %s", e)
+            log_degraded("kb_usage", "hits_read_failed", exc=e)
             return {}
         finally:
             if conn is not None:
                 try:
                     conn.close()
-                except Exception:  # noqa: BLE001
+                except Exception as e:  # noqa: BLE001
+                    log_degraded("kb_usage", "close_failed", exc=e)
                     pass
 
     def entries(self) -> Dict[str, Tuple[int, float]]:
@@ -794,12 +816,14 @@ class _UsageStore:
                     for p, h, lu in rows}
         except Exception as e:  # noqa: BLE001
             logger.debug("kb_usage read failed: %s", e)
+            log_degraded("kb_usage", "entries_read_failed", exc=e)
             return {}
         finally:
             if conn is not None:
                 try:
                     conn.close()
-                except Exception:  # noqa: BLE001
+                except Exception as e:  # noqa: BLE001
+                    log_degraded("kb_usage", "close_failed", exc=e)
                     pass
 
     def touch(self, rel_paths: List[str]) -> None:
@@ -820,11 +844,13 @@ class _UsageStore:
             conn.commit()
         except Exception as e:  # noqa: BLE001
             logger.debug("kb_usage touch failed: %s", e)
+            log_degraded("kb_usage", "touch_failed", exc=e)
         finally:
             if conn is not None:
                 try:
                     conn.close()
-                except Exception:  # noqa: BLE001
+                except Exception as e:  # noqa: BLE001
+                    log_degraded("kb_usage", "close_failed", exc=e)
                     pass
 
 
@@ -1083,6 +1109,7 @@ class KnowledgeBase:
                 self.sync_index(background=True)
             except Exception as e:  # noqa: BLE001 — 同步是增强，失败不影响主流程
                 logger.debug("kb background sync failed to start: %s", e)
+                log_degraded("kb_sync", "background_start_failed", exc=e)
         return result
 
     def _index_get(self) -> KBIndex:
@@ -1181,7 +1208,7 @@ class KnowledgeBase:
                 continue
             try:
                 text = path.read_text(encoding="utf-8", errors="replace")
-            except OSError as e:
+            except OSError as e:  # silent-ok: value-fallback — 单篇读失败 → 跳过并计 errors，per-note
                 logger.debug("kb sync read failed for %s: %s", rel, e)
                 errors += 1
                 continue
@@ -1191,12 +1218,14 @@ class KnowledgeBase:
                 idx.upsert(rel, note.full_text, mtime=mt)
             except Exception as e:  # noqa: BLE001
                 logger.debug("kb sync upsert failed for %s: %s", rel, e)
+                log_degraded("kb_sync", "upsert_failed", detail=rel, exc=e)
                 errors += 1
         for rel in removed:
             try:
                 idx.delete(rel)
             except Exception as e:  # noqa: BLE001
                 logger.debug("kb sync delete failed for %s: %s", rel, e)
+                log_degraded("kb_sync", "delete_failed", detail=rel, exc=e)
                 errors += 1
 
         result = {
@@ -1226,7 +1255,7 @@ class KnowledgeBase:
         for path in self._walk():  # 与索引同步侧共用同一份遍历规则
             try:
                 text = path.read_text(encoding="utf-8", errors="replace")
-            except OSError:
+            except OSError:  # silent-ok: value-fallback — 单篇读失败 → 跳过该笔记，per-note
                 continue
             meta, body = _vault.parse_frontmatter(text)
             notes.append(_Note(path, _vault.note_title(path), meta, body))
@@ -1235,7 +1264,7 @@ class KnowledgeBase:
     def _rel(self, path: Path) -> str:
         try:
             return str(path.relative_to(self._vault)).replace("\\", "/")
-        except ValueError:
+        except ValueError:  # silent-ok: value-fallback — 不在 vault 下时退回绝对路径字符串，per-note
             return str(path)
 
     def get(self, title: str) -> Optional[Dict[str, Any]]:
@@ -1563,6 +1592,7 @@ class KnowledgeBase:
             self._usage_store().touch(rel_paths)
         except Exception as e:  # noqa: BLE001 - 统计失败绝不影响召回
             logger.debug("kb touch failed: %s", e)
+            log_degraded("kb", "usage_touch_failed", exc=e)
 
     @staticmethod
     def _mmr_select(ranked: List[Dict[str, Any]], top_k: int,
@@ -1735,7 +1765,7 @@ class KnowledgeBase:
         if confidence is not None:
             try:
                 conf = float(confidence)
-            except (TypeError, ValueError):
+            except (TypeError, ValueError):  # silent-ok: value-fallback — 坏 confidence 值 → None（按显式 section 落库）
                 conf = None
             if conf is not None:
                 threshold = float(
@@ -2058,8 +2088,8 @@ class KnowledgeBase:
                                   note.body).full_text,
                             mtime=_file_mtime(note.path))
                         flagged.append(rel)
-                    except OSError as e:
-                        errors.append(f"flag failed: {rel}: {e}")
+                    except OSError as e:  # silent-ok: value-fallback — per-item 且失败已聚合进返回的 errors，避免逐条 log 污染计数
+                        errors.append(f"flag failed: {rel}: {_safe_str(e)}")
 
             if note.section not in ("inbox", "knowledge") or not usage_available:
                 continue

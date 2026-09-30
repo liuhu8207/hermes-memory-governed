@@ -24,6 +24,8 @@ import sqlite3
 from pathlib import Path
 from typing import Any, Callable
 
+from ._diag import log_degraded
+
 logger = logging.getLogger(__name__)
 
 
@@ -70,9 +72,11 @@ def _l2_add_source_rowid_column(provider, config) -> None:
     except ImportError as e:
         # Optional dependency missing → expected graceful degradation.
         logger.info("migration 002 skipped (lancedb not installed, L2 disabled): %s", e)
+        log_degraded("migrations", "lancedb_missing", exc=e)
     except Exception as e:
         # Unexpected: the L2 directory exists but could not be migrated.
         logger.warning("migration 002 skipped: %s", e)
+        log_degraded("migrations", "migration_002_failed", exc=e)
 
 
 def _l3_add_perf_indexes(provider, config) -> None:
@@ -134,7 +138,8 @@ class MigrationRunner:
             try:
                 data = json.loads(self.state_file.read_text(encoding="utf-8"))
                 return set(data.get("applied", []))
-            except Exception:
+            except Exception as e:  # noqa: BLE001
+                log_degraded("migrations", "state_read_failed", exc=e)
                 pass
         return set()
 
@@ -160,4 +165,6 @@ class MigrationRunner:
                 logger.info("migration %03d_%s applied", version, name)
             except Exception as e:
                 logger.warning("migration %03d_%s failed: %s", version, name, e)
+                log_degraded("migrations", "migration_failed",
+                             detail=name, exc=e)
         return ran

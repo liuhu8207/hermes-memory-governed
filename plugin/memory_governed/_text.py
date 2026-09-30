@@ -79,7 +79,7 @@ def sanitize_utf8(text: Any) -> str:
     try:
         value.encode("utf-8")
         return value
-    except UnicodeEncodeError:
+    except UnicodeEncodeError:  # silent-ok: value-fallback — 写路径热函数，孤立代理字符可能 per-message；replace 编码
         return value.encode("utf-8", errors="replace").decode("utf-8")
 
 

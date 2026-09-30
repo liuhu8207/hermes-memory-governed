@@ -42,7 +42,7 @@ from . import _ingest
 from . import _synthesize
 
 try:  # pragma: no cover - _diag.py 由另一位工程师并行新建
-    from ._diag import log_data_loss, log_degraded
+    from ._diag import log_data_loss, log_degraded, _safe_str
 except Exception:  # noqa: BLE001 — 文件尚未落地时的兼容回退
     def log_data_loss(component: str, reason: str, *, detail: str = "",
                       exc: BaseException | None = None) -> None:
@@ -53,6 +53,13 @@ except Exception:  # noqa: BLE001 — 文件尚未落地时的兼容回退
                      exc: BaseException | None = None) -> None:
         """Fallback: WARNING 级优雅降级日志（真实 _diag.py 落地后即被替换）。"""
         logger.warning("[degraded] %s: %s %s", component, reason, detail, exc_info=exc)
+
+    def _safe_str(value) -> str:  # type: ignore[misc]
+        """Fallback: 与真实 ``_diag._safe_str`` 同一"永不抛"契约（见其 docstring）。"""
+        try:
+            return str(value)
+        except Exception:  # noqa: BLE001 — 被格式化的对象 __str__ 本身可能抛
+            return "<unrepr>"
 
 logger = logging.getLogger(__name__)
 
@@ -331,12 +338,12 @@ class _PrefetchCache(OrderedDict):
                 entry = OrderedDict.__getitem__(self, key)
                 _, timestamp = entry
                 expired = (now - float(timestamp)) >= self.ttl_seconds
-            except (KeyError, TypeError, ValueError):
+            except (KeyError, TypeError, ValueError):  # silent-ok: value-fallback — 缓存条目缺失或结构非法（删除竞态/坏值），按"过期"清掉
                 expired = True
             if expired:
                 try:
                     del self[key]
-                except KeyError:
+                except KeyError:  # silent-ok: value-fallback — 删除竞态：条目已被并发移除
                     continue
                 removed += 1
         return removed
@@ -401,7 +408,8 @@ class GovernedMemoryProvider:
         try:
             from hermes_constants import get_hermes_home
             hermes_home = get_hermes_home()
-        except Exception:
+        except Exception as e:  # noqa: BLE001 — 宿主模块缺失→退回默认 HERMES_HOME
+            log_degraded("provider", "hermes_constants_unavailable", exc=e)
             hermes_home = Path.home() / ".hermes"
 
         config_path = hermes_home / "governed_memory.json"
@@ -424,7 +432,8 @@ class GovernedMemoryProvider:
             try:
                 from hermes_constants import get_hermes_home
                 hermes_home = str(get_hermes_home())
-            except Exception:
+            except Exception as e:  # noqa: BLE001 — 宿主模块缺失→退回默认 HERMES_HOME
+                log_degraded("provider", "hermes_constants_unavailable", exc=e)
                 hermes_home = str(Path.home() / ".hermes")
 
         self._config = load_governed_config(hermes_home)
@@ -496,7 +505,7 @@ class GovernedMemoryProvider:
                 # 过期条目顺手清掉，别让它留在缓存里占地方
                 try:
                     del self._prefetch_cache[query]
-                except KeyError:
+                except KeyError:  # silent-ok: value-fallback — 删除竞态：过期条目已被并发移除
                     pass
             self._cache_misses += 1
 
@@ -539,6 +548,7 @@ class GovernedMemoryProvider:
         try:
             _get_prefetch_executor().submit(self._run_prefetch, query)
         except Exception as e:  # noqa: BLE001 — 线程池不可用时不能影响主流程
+            log_degraded("provider", "prefetch_submit_failed", exc=e)
             with _inflight_lock:
                 _inflight.discard(query)
             logger.debug("Prefetch submit failed: %s", e)
@@ -567,7 +577,8 @@ class GovernedMemoryProvider:
             self._last_recall_count = len(results)
             self._last_recall_time = time.time()
 
-        except Exception as e:
+        except Exception as e:  # noqa: BLE001 — 后台召回失败不能影响主流程
+            log_degraded("provider", "prefetch_failed", exc=e)
             logger.debug("Prefetch failed: %s", e)
         finally:
             with _inflight_lock:
@@ -697,7 +708,7 @@ class GovernedMemoryProvider:
                 _ENQUEUE_SUPPORTS_PROVENANCE = "provenance_missing" in params or any(
                     p.kind is inspect.Parameter.VAR_KEYWORD for p in params.values()
                 )
-            except (TypeError, ValueError, ImportError):
+            except (TypeError, ValueError, ImportError):  # silent-ok: value-fallback — 签名探测失败→按"不支持 provenance"处理
                 _ENQUEUE_SUPPORTS_PROVENANCE = False
         return bool(_ENQUEUE_SUPPORTS_PROVENANCE)
 
@@ -739,6 +750,7 @@ class GovernedMemoryProvider:
         try:
             notes = _synthesize.synthesize_notes(messages, self._config)
         except Exception as e:  # noqa: BLE001
+            log_degraded("synthesis", "session_synthesis_failed", exc=e)
             logger.warning("session synthesis failed: %s", e)
             return
         if not notes:
@@ -758,6 +770,7 @@ class GovernedMemoryProvider:
                 if r.get("ok"):
                     added += 1
             except Exception as e:  # noqa: BLE001
+                log_degraded("synthesis", "note_add_failed", exc=e)
                 logger.warning("synthesis add failed: %s", e)
         logger.info("session synthesis: %d candidates, %d added", len(notes), added)
 
@@ -964,7 +977,8 @@ class GovernedMemoryProvider:
             conn.close()
             if row:
                 return {"role": row[0], "content": (row[1] or "")[:200], "timestamp": row[2]}
-        except Exception as e:
+        except Exception as e:  # noqa: BLE001 — 下钻是 best-effort，失败即"无溯源"
+            log_degraded("provider", "l3_drilldown_failed", exc=e)
             logger.debug("L3 drill-down failed for rowid %s: %s", rowid, e)
         return None
 
@@ -1024,8 +1038,9 @@ class GovernedMemoryProvider:
                 confidence=args.get("confidence"),
             )
         except Exception as e:  # noqa: BLE001 — 工具绝不抛给 agent
+            log_degraded("kb", "add_failed", exc=e)
             logger.warning("governed_kb_add failed: %s", e)
-            return json.dumps({"error": f"Failed to add note: {e}"}, ensure_ascii=False)
+            return json.dumps({"error": f"Failed to add note: {_safe_str(e)}"}, ensure_ascii=False)
         return json.dumps(result, ensure_ascii=False)
 
     def _handle_kb_get(self, args: dict) -> str:
@@ -1047,7 +1062,7 @@ class GovernedMemoryProvider:
             if action == "list":
                 try:
                     limit = int(args.get("limit", 50) or 50)
-                except (TypeError, ValueError):
+                except (TypeError, ValueError):  # silent-ok: value-fallback — 非法 limit→默认 50
                     limit = 50
                 result = {"ok": True, "pending": self._kb.list_review(limit=limit)}
             elif action == "approve":
@@ -1065,8 +1080,9 @@ class GovernedMemoryProvider:
             else:
                 result = {"ok": False, "error": f"Unknown action: {action}"}
         except Exception as e:  # noqa: BLE001 — 工具绝不抛给 agent
+            log_degraded("kb", "review_failed", exc=e)
             logger.warning("governed_kb_review failed: %s", e)
-            return json.dumps({"error": f"Review failed: {e}"}, ensure_ascii=False)
+            return json.dumps({"error": f"Review failed: {_safe_str(e)}"}, ensure_ascii=False)
         return json.dumps(result, ensure_ascii=False)
 
     def _handle_kb_govern(self, args: dict) -> str:
@@ -1076,8 +1092,9 @@ class GovernedMemoryProvider:
             apply = bool(args.get("apply", False))
             result = self._kb.governance(apply=apply)
         except Exception as e:  # noqa: BLE001 — 工具绝不抛给 agent
+            log_degraded("kb", "govern_failed", exc=e)
             logger.warning("governed_kb_govern failed: %s", e)
-            return json.dumps({"error": f"Governance sweep failed: {e}"}, ensure_ascii=False)
+            return json.dumps({"error": f"Governance sweep failed: {_safe_str(e)}"}, ensure_ascii=False)
         return json.dumps(result, ensure_ascii=False)
 
     def _handle_kb_fetch(self, args: dict) -> str:
@@ -1087,8 +1104,9 @@ class GovernedMemoryProvider:
         try:
             result = _ingest.fetch_url(url)
         except Exception as e:  # noqa: BLE001
+            # silent-ok: already-reported — 内层 _ingest.fetch_url 已 log_degraded("ingest","fetch_failed") 上报，此处再报即双重计数；错误已返回调用方
             logger.warning("governed_kb_fetch failed: %s", e)
-            return json.dumps({"error": f"fetch failed: {e}"}, ensure_ascii=False)
+            return json.dumps({"error": f"fetch failed: {_safe_str(e)}"}, ensure_ascii=False)
         return json.dumps(result, ensure_ascii=False)
 
     def _handle_kb_read_file(self, args: dict) -> str:
@@ -1098,8 +1116,9 @@ class GovernedMemoryProvider:
         try:
             result = _ingest.read_file(path)
         except Exception as e:  # noqa: BLE001
+            # silent-ok: already-reported — 内层 _ingest.read_file（及其 _read_pdf/_read_docx）已 log_degraded("ingest","read_failed"/"pdf_extract_failed"/"docx_extract_failed") 上报，此处再报即双重计数；错误已返回调用方
             logger.warning("governed_kb_read_file failed: %s", e)
-            return json.dumps({"error": f"read_file failed: {e}"}, ensure_ascii=False)
+            return json.dumps({"error": f"read_file failed: {_safe_str(e)}"}, ensure_ascii=False)
         return json.dumps(result, ensure_ascii=False)
 
     def _handle_kb_transcribe(self, args: dict) -> str:
@@ -1109,8 +1128,9 @@ class GovernedMemoryProvider:
         try:
             result = _ingest.transcribe_audio_auto(path, self._config)
         except Exception as e:  # noqa: BLE001
+            # silent-ok: already-reported — 内层 _ingest.transcribe_audio_auto 已 log_degraded("ingest","auto_transcode_failed"/"duration_probe_failed"/"audio_split_failed") 上报，此处再报即双重计数；错误已返回调用方
             logger.warning("governed_kb_transcribe failed: %s", e)
-            return json.dumps({"error": f"transcribe failed: {e}"}, ensure_ascii=False)
+            return json.dumps({"error": f"transcribe failed: {_safe_str(e)}"}, ensure_ascii=False)
         return json.dumps(result, ensure_ascii=False)
 
     # -- Helpers ------------------------------------------------------------
@@ -1125,6 +1145,7 @@ class GovernedMemoryProvider:
                 with open(p, "a", encoding="utf-8") as f:
                     f.write(f"\n\n{content.strip()}\n")
         except Exception as e:
+            log_degraded("provider", "l1_append_failed", exc=e)
             logger.debug("Failed to append to %s: %s", path_str, e)
 
     def _replace_in_file(self, path_str: str, old_text: str, new_text: str) -> None:
@@ -1142,6 +1163,7 @@ class GovernedMemoryProvider:
                 # Old text not found — append new
                 self._append_to_file(path_str, new_text)
         except Exception as e:
+            log_degraded("provider", "l1_replace_failed", exc=e)
             logger.debug("Failed to replace in %s: %s", path_str, e)
 
     def _remove_from_file(self, path_str: str, old_text: str) -> None:
@@ -1158,6 +1180,7 @@ class GovernedMemoryProvider:
                     content = content.replace("\n\n\n", "\n\n")
                 p.write_text(content, encoding="utf-8")
         except Exception as e:
+            log_degraded("provider", "l1_remove_failed", exc=e)
             logger.debug("Failed to remove from %s: %s", path_str, e)
 
     def _extract_session_candidates(self, messages: List[Dict[str, Any]]) -> List[dict]:

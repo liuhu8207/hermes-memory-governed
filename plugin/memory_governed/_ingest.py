@@ -39,8 +39,34 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 from ._config import env_secret
+from ._diag import _safe_str, log_degraded
 
 logger = logging.getLogger(__name__)
+
+#: 已上报过的缺失可选依赖（每进程每依赖只报一次，避免逐调用路径污染计数）。
+#:
+#: ⚠️ 取舍：这是**可变 set + check-then-add**，在多线程下（写队列 worker 与工具
+#: 处理器并发首次触发同一依赖）同一依赖**可能各加一次**，最坏结果是多一条
+#: ``optional_dep_missing`` 日志行 —— 这是**宽松过滤**，不是"恰好一条"的强保证。
+#: 之所以可接受：① 只影响**日志行数**，不影响 ``_diag`` 的 (component, reason)
+#: 计数语义；② ``_diag`` 自身有 60s 节流兜底；③ 为它加 ``Lock`` 会给所有 ingest
+#: 调用路径引入争用，得不偿失。若要严格一次，需引入 ``threading.Lock``；当前不需要。
+_MISSING_OPTIONAL_DEPS_REPORTED: set = set()
+
+
+def _report_missing_optional_dep(dep: str) -> None:
+    """首次发现某个可选依赖缺失时上报一次 ``ingest::optional_dep_missing``。
+
+    httpx / pypdf / python-docx 的 ``import`` 都在**逐调用**路径上（无负缓存），
+    逐站点上报会按调用次数污染 ``_diag`` 计数，而完全不上报又是漏报。故折中：
+    **每进程每依赖只上报一次**（``detail`` = 依赖名），其余调用静默 —— 站点上的
+    ``# silent-ok:`` 标记正是这个"值级回退、不逐站点上报"的显式声明。
+    """
+    if dep in _MISSING_OPTIONAL_DEPS_REPORTED:
+        return
+    _MISSING_OPTIONAL_DEPS_REPORTED.add(dep)
+    log_degraded("ingest", "optional_dep_missing", detail=dep)
+
 
 #: 摄入内容的最大字符数（超长截断，避免爆 agent context；归纳用原文更优，
 #: 但不可控的网页/文件需要上限）。
@@ -82,8 +108,8 @@ def _http_get(url: str, timeout: float) -> tuple[int, str, Dict[str, str]]:
 
         r = httpx.get(url, timeout=timeout, follow_redirects=True, headers=headers)
         return r.status_code, r.text, {k.lower(): v for k, v in r.headers.items()}
-    except ImportError:
-        pass
+    except ImportError:  # silent-ok: value-fallback — httpx 未安装，回退标准库 urllib
+        _report_missing_optional_dep("httpx")
     import urllib.error
     import urllib.request
 
@@ -93,8 +119,10 @@ def _http_get(url: str, timeout: float) -> tuple[int, str, Dict[str, str]]:
             body = resp.read().decode("utf-8", errors="replace")
             return resp.status, body, {k.lower(): v for k, v in resp.headers.items()}
     except urllib.error.HTTPError as e:
+        log_degraded("ingest", "http_error", detail=url, exc=e)
         return e.code, "", {}
     except Exception as e:  # noqa: BLE001
+        log_degraded("ingest", "http_get_failed", detail=url, exc=e)
         logger.debug("http get failed for %s: %s", url, e)
         return 0, "", {}
 
@@ -125,7 +153,7 @@ def _read_text(path: Path) -> str:
     for enc in ("utf-8", "utf-8-sig", "gbk"):
         try:
             return path.read_text(encoding=enc)
-        except (UnicodeDecodeError, UnicodeError):
+        except (UnicodeDecodeError, UnicodeError):  # silent-ok: value-fallback — 该编码解不出，换下一编码，属正常回退
             continue
     return path.read_text(encoding="utf-8", errors="replace")
 
@@ -145,7 +173,8 @@ def fetch_url(url: str, timeout: float = 15.0) -> Dict[str, Any]:
     try:
         status, body, headers = _http_get(url, timeout)
     except Exception as e:  # noqa: BLE001 — 摄入工具绝不抛给 agent
-        return {"ok": False, "error": f"fetch failed: {e}"}
+        log_degraded("ingest", "fetch_failed", detail=url, exc=e)
+        return {"ok": False, "error": f"fetch failed: {_safe_str(e)}"}
     if status == 0:
         return {"ok": False, "error": f"fetch failed (network error): {url}"}
     if status >= 400:
@@ -188,14 +217,16 @@ _TEXT_SUFFIXES = {
 def _read_pdf(path: Path) -> Dict[str, Any]:
     try:
         from pypdf import PdfReader  # type: ignore
-    except ImportError:
+    except ImportError:  # silent-ok: value-fallback — 可选依赖 pypdf 缺失，返回结构化错误信封
+        _report_missing_optional_dep("pypdf")
         return {"ok": False, "error": "reading PDF requires pypdf: pip install pypdf"}
     try:
         reader = PdfReader(str(path))
         parts = [page.extract_text() or "" for page in reader.pages]
         text = "\n\n".join(parts)
     except Exception as e:  # noqa: BLE001
-        return {"ok": False, "error": f"pdf extract failed: {e}"}
+        log_degraded("ingest", "pdf_extract_failed", detail=path.name, exc=e)
+        return {"ok": False, "error": f"pdf extract failed: {_safe_str(e)}"}
     if not text.strip():
         return {"ok": False, "error": f"no extractable text (scanned PDF?): {path.name}"}
     return {"ok": True, "content": text}
@@ -204,7 +235,8 @@ def _read_pdf(path: Path) -> Dict[str, Any]:
 def _read_docx(path: Path) -> Dict[str, Any]:
     try:
         import docx  # type: ignore
-    except ImportError:
+    except ImportError:  # silent-ok: value-fallback — 可选依赖 python-docx 缺失，返回结构化错误信封
+        _report_missing_optional_dep("python-docx")
         return {"ok": False, "error": "reading docx requires python-docx: pip install python-docx"}
     try:
         d = docx.Document(str(path))
@@ -217,7 +249,8 @@ def _read_docx(path: Path) -> Dict[str, Any]:
                     paras.append(" | ".join(cells))
         text = "\n".join(paras)
     except Exception as e:  # noqa: BLE001
-        return {"ok": False, "error": f"docx extract failed: {e}"}
+        log_degraded("ingest", "docx_extract_failed", detail=path.name, exc=e)
+        return {"ok": False, "error": f"docx extract failed: {_safe_str(e)}"}
     if not text.strip():
         return {"ok": False, "error": f"no extractable text: {path.name}"}
     return {"ok": True, "content": text}
@@ -241,7 +274,8 @@ def read_file(path: str) -> Dict[str, Any]:
         try:
             content = _read_text(p)
         except OSError as e:
-            return {"ok": False, "error": f"read failed: {e}"}
+            log_degraded("ingest", "read_failed", detail=str(p), exc=e)
+            return {"ok": False, "error": f"read failed: {_safe_str(e)}"}
     elif suffix == ".pdf":
         r = _read_pdf(p)
         if not r.get("ok"):
@@ -295,7 +329,8 @@ def transcribe_audio(path: str, config: Any, timeout: float = 180.0) -> Dict[str
 
     try:
         import httpx  # type: ignore
-    except ImportError:
+    except ImportError:  # silent-ok: value-fallback — 可选依赖 httpx 缺失，返回结构化错误信封
+        _report_missing_optional_dep("httpx")
         return {"ok": False, "error": "transcription requires httpx: pip install httpx"}
 
     mime = _AUDIO_MIME.get(p.suffix.lower(), "application/octet-stream")
@@ -316,14 +351,16 @@ def transcribe_audio(path: str, config: Any, timeout: float = 180.0) -> Dict[str
             timeout=timeout,
         )
     except Exception as e:  # noqa: BLE001
-        return {"ok": False, "error": f"transcription request failed: {e}"}
+        log_degraded("ingest", "transcription_request_failed", detail=endpoint, exc=e)
+        return {"ok": False, "error": f"transcription request failed: {_safe_str(e)}"}
 
     if r.status_code >= 400:
         return {"ok": False, "error": f"ASR HTTP {r.status_code}: {r.text[:300]}"}
     try:
         payload = r.json()
         text = payload.get("text", "") or ""
-    except Exception:  # noqa: BLE001
+    except Exception as e:  # noqa: BLE001
+        log_degraded("ingest", "transcription_bad_json", detail=endpoint, exc=e)
         return {"ok": False, "error": "ASR returned non-JSON response"}
 
     if not text.strip():
@@ -369,7 +406,8 @@ def _transcribe_chat_audio(path: str, config: Any, timeout: float) -> Dict[str, 
 
     try:
         import httpx  # type: ignore
-    except ImportError:
+    except ImportError:  # silent-ok: value-fallback — 可选依赖 httpx 缺失，返回结构化错误信封
+        _report_missing_optional_dep("httpx")
         return {"ok": False, "error": "transcription requires httpx: pip install httpx"}
 
     tmp_dir = tempfile.mkdtemp(prefix="hgm_chat_")
@@ -378,17 +416,20 @@ def _transcribe_chat_audio(path: str, config: Any, timeout: float) -> Dict[str, 
         try:
             mp3_path = _transcode_to_mp3(p, tmp_dir)
         except Exception as e:  # noqa: BLE001
+            log_degraded("ingest", "chat_audio_transcode_failed",
+                         detail=p.suffix or "(none)", exc=e)
             return {
                 "ok": False,
                 "error": (
                     f"cannot decode '{p.suffix or '(none)'}' audio "
-                    f"(unsupported by this ffmpeg build?): {e}"),
+                    f"(unsupported by this ffmpeg build?): {_safe_str(e)}"),
             }
 
         try:
             encoded = base64.b64encode(mp3_path.read_bytes())
         except OSError as e:
-            return {"ok": False, "error": f"read failed: {e}"}
+            log_degraded("ingest", "chat_audio_read_failed", exc=e)
+            return {"ok": False, "error": f"read failed: {_safe_str(e)}"}
 
         max_bytes = _positive_int(getattr(asr, "max_encoded_bytes", None), 10_000_000)
         if len(encoded) > max_bytes:
@@ -427,13 +468,15 @@ def _transcribe_chat_audio(path: str, config: Any, timeout: float) -> Dict[str, 
                 timeout=timeout,
             )
         except Exception as e:  # noqa: BLE001
-            return {"ok": False, "error": f"transcription request failed: {e}"}
+            log_degraded("ingest", "chat_audio_request_failed", detail=endpoint, exc=e)
+            return {"ok": False, "error": f"transcription request failed: {_safe_str(e)}"}
 
         if r.status_code >= 400:
             return {"ok": False, "error": f"ASR HTTP {r.status_code}: {r.text[:300]}"}
         try:
             payload = r.json()
-        except Exception:  # noqa: BLE001
+        except Exception as e:  # noqa: BLE001
+            log_degraded("ingest", "chat_audio_bad_json", detail=endpoint, exc=e)
             return {"ok": False, "error": "ASR returned non-JSON response"}
 
         choices = payload.get("choices") or []
@@ -528,12 +571,13 @@ def probe_audio_duration(path: str) -> Optional[float]:
                         continue
                     try:
                         dur = float(line)
-                    except ValueError:
+                    except ValueError:  # silent-ok: value-fallback — ffprobe 输出非数值，放弃本次解析
                         break
                     if math.isfinite(dur) and dur >= 0:
                         return dur
                     break
         except Exception as e:  # noqa: BLE001 — 探测失败不是错误，只是未知
+            log_degraded("ingest", "ffprobe_failed", detail=str(p), exc=e)
             logger.debug("ffprobe failed for %s: %s", p, e)
 
     # 标准库兜底：仅 .wav 可读
@@ -547,6 +591,7 @@ def probe_audio_duration(path: str) -> Optional[float]:
             if rate:
                 return frames / float(rate)
         except Exception as e:  # noqa: BLE001
+            log_degraded("ingest", "wave_fallback_failed", detail=str(p), exc=e)
             logger.debug("wave fallback failed for %s: %s", p, e)
 
     return None
@@ -592,7 +637,7 @@ def split_audio(path: str, chunk_seconds: float, out_dir: Any) -> List[Path]:
                 capture_output=True, text=True, timeout=600,
             )
         except Exception as e:  # noqa: BLE001
-            raise RuntimeError(f"ffmpeg could not run: {e}") from e
+            raise RuntimeError(f"ffmpeg could not run: {_safe_str(e)}") from e
         if proc.returncode != 0 or not dst.exists():
             detail = (proc.stderr or "").strip().splitlines()
             tail = detail[-1] if detail else "unknown error"
@@ -631,7 +676,7 @@ def _transcode_to_mp3(src: Any, out_dir: Any) -> Path:
             capture_output=True, text=True, timeout=600,
         )
     except Exception as e:  # noqa: BLE001
-        raise RuntimeError(f"ffmpeg could not run: {e}") from e
+        raise RuntimeError(f"ffmpeg could not run: {_safe_str(e)}") from e
     if proc.returncode != 0 or not dst.exists():
         detail = (proc.stderr or "").strip().splitlines()
         tail = detail[-1] if detail else "unknown error"
@@ -644,7 +689,7 @@ def _positive_float(value: Any, default: float) -> float:
     """转成正浮点，否则退回 ``default``；绝不抛异常。"""
     try:
         num = float(value)
-    except (TypeError, ValueError):
+    except (TypeError, ValueError):  # silent-ok: value-fallback — 坏数量值退回默认，非子系统故障
         return default
     if not math.isfinite(num) or num <= 0:
         return default
@@ -655,7 +700,7 @@ def _positive_int(value: Any, default: int) -> int:
     """转成正整数，否则退回 ``default``；绝不抛异常。"""
     try:
         num = int(value)
-    except (TypeError, ValueError):
+    except (TypeError, ValueError):  # silent-ok: value-fallback — 坏数量值退回默认，非子系统故障
         return default
     if num <= 0:
         return default
@@ -713,17 +758,20 @@ def transcribe_audio_auto(path: str, config: Any) -> Dict[str, Any]:
             try:
                 work_path = str(_transcode_to_mp3(src, tmp_dir))
             except Exception as e:  # noqa: BLE001
+                log_degraded("ingest", "auto_transcode_failed",
+                             detail=suffix or "(none)", exc=e)
                 return {
                     "ok": False,
                     "path": str(src),
                     "error": (
                         f"cannot decode '{suffix or '(none)'}' audio "
-                        f"(unsupported by this ffmpeg build?): {e}"),
+                        f"(unsupported by this ffmpeg build?): {_safe_str(e)}"),
                 }
 
         try:
             duration = probe_audio_duration(work_path)
         except Exception as e:  # noqa: BLE001 — 探测绝不该变成一次失败
+            log_degraded("ingest", "duration_probe_failed", detail=work_path, exc=e)
             logger.debug("duration probe raised for %s: %s", work_path, e)
             duration = None
 
@@ -751,8 +799,9 @@ def transcribe_audio_auto(path: str, config: Any) -> Dict[str, Any]:
         try:
             chunks = split_audio(work_path, threshold, tmp_dir)
         except Exception as e:  # noqa: BLE001
+            log_degraded("ingest", "audio_split_failed", detail=str(src), exc=e)
             return {"ok": False, "path": str(src),
-                    "error": f"audio split failed: {e}"}
+                    "error": f"audio split failed: {_safe_str(e)}"}
 
         # 拆段却一个片段都没有：绝不报成功（一个没有内容的成功报告正是本项目
         # 反复被坑的那类静默失败）

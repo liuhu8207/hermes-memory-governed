@@ -40,8 +40,19 @@ if TYPE_CHECKING:  # pragma: no cover - 仅供类型检查，避免运行时循�
 logger = logging.getLogger(__name__)
 
 try:  # pragma: no cover - _diag.py 由另一位工程师并行新建
-    from ._diag import log_data_loss, log_degraded
+    from ._diag import _safe_str, log_data_loss, log_degraded
 except Exception:  # noqa: BLE001 — 文件尚未落地时的兼容回退
+    def _safe_str(value: Any) -> str:
+        """Fallback: 安全字符串化（真实 _diag.py 落地后即被替换）。
+
+        与真实实现同一"永不抛"契约：``__str__`` 抛错时退回安全占位 —— 调用点
+        都在 ``except`` 里，一旦抛就把优雅降级变成崩溃。
+        """
+        try:
+            return str(value)
+        except Exception:  # noqa: BLE001 — 诊断兜底绝不能再抛
+            return "<unrepr>"
+
     def log_data_loss(component: str, reason: str, *, detail: str = "",
                       exc: BaseException | None = None) -> None:
         """Fallback: ERROR 级数据丢失日志（真实 _diag.py 落地后即被替换）。"""
@@ -128,6 +139,8 @@ class _FastEmbedBackend:
                 dim = len(sample[0])
             except Exception as e:  # noqa: BLE001 — 换下一个候选，不放弃整个后端
                 last_error = e
+                log_degraded("embedding", "fastembed_candidate_failed",
+                             detail=candidate, exc=e)
                 logger.debug("fastembed model %r unusable: %s", candidate, e)
                 continue
             if dim <= 0:
@@ -186,9 +199,10 @@ def load_embedder(backend: str, model_name: str) -> Embedder | None:
             inst = cls(model_name)
             logger.info("L2 embedding backend: %s (model=%s, dim=%s)", name, inst.model_name, inst.dim)
             return inst
-        except ImportError:
+        except ImportError:  # silent-ok: value-fallback — 该本地后端未安装，换下一个候选
             logger.debug("embedding backend %r not installed", name)
         except Exception as e:
+            log_degraded("embedding", "backend_load_failed", detail=name, exc=e)
             logger.warning("embedding backend %r failed to load: %s", name, e)
     return None
 
@@ -305,7 +319,8 @@ class EmbeddingService:
                     vectors = self._encode_local([text])
                     return vectors[0] if vectors else None
             except Exception as e:  # noqa: BLE001 — 嵌入永远不能打断主流程
-                self._last_error = f"embed_one failed: {e}"
+                self._last_error = f"embed_one failed: {_safe_str(e)}"
+                log_degraded("embedding", "embed_one_failed", exc=e)
                 logger.debug("EmbeddingService embed_one failed: %s", e)
                 return None
         return None
@@ -327,7 +342,8 @@ class EmbeddingService:
                 else:
                     vectors = []
             except Exception as e:  # noqa: BLE001 — 嵌入永远不能打断主流程
-                self._last_error = f"embed_batch failed: {e}"
+                self._last_error = f"embed_batch failed: {_safe_str(e)}"
+                log_degraded("embedding", "embed_batch_failed", exc=e)
                 logger.debug("EmbeddingService embed_batch failed: %s", e)
                 vectors = []
 
@@ -370,7 +386,7 @@ class EmbeddingService:
                 # API 失败，记录但继续尝试本地后端
                 logger.warning("API embedding probe failed, trying local backend: %s", e)
                 log_degraded("embedding", "api_probe_failed",
-                            detail=f"{type(e).__name__}: {e}", exc=e)
+                            detail=f"{type(e).__name__}: {_safe_str(e)}", exc=e)
                 # 不 return，继续到本地后端探测
             else:
                 if vectors and vectors[0]:
@@ -402,7 +418,8 @@ class EmbeddingService:
         try:
             embedder = load_embedder(backend, model)
         except Exception as e:  # noqa: BLE001
-            self._mark_unavailable(f"backend probe raised: {e}", exc=e)
+            log_degraded("embedding", "backend_probe_failed", detail=backend, exc=e)
+            self._mark_unavailable(f"backend probe raised: {_safe_str(e)}", exc=e)
             return
 
         if embedder is None:
@@ -460,6 +477,7 @@ class EmbeddingService:
             else:
                 self._config.vector.dim = actual_dim
         except Exception as e:  # pragma: no cover - 配置对象被替换成只读桩时
+            log_degraded("embedding", "dim_sync_failed", exc=e)
             logger.debug("Failed to sync dim to config: %s", e)
 
         if is_fallback:
@@ -538,7 +556,7 @@ class EmbeddingService:
                 value = int(getattr(embedding, "dimensions", 0) or 0)
             else:
                 value = int(getattr(config.vector, "dim", 0) or 0)
-        except (TypeError, ValueError):
+        except (TypeError, ValueError):  # silent-ok: value-fallback — 坏维度配置回退 384，非子系统故障
             return 384
         return value if value > 0 else 384
 

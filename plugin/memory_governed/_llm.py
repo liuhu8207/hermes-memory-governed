@@ -16,6 +16,7 @@ import logging
 from typing import Any, Dict, List, Optional
 
 from ._config import env_secret
+from ._diag import log_degraded
 
 logger = logging.getLogger(__name__)
 
@@ -41,8 +42,10 @@ def chat_completion(messages: List[Dict[str, Any]],
         return None
     try:
         import httpx  # type: ignore
-    except ImportError:
+    except ImportError as e:
         logger.debug("llm chat requires httpx; skipping")
+        log_degraded("llm", "httpx_missing",
+                     detail="optional llm enhancement disabled", exc=e)
         return None
     try:
         r = httpx.post(
@@ -58,4 +61,5 @@ def chat_completion(messages: List[Dict[str, Any]],
         return str(r.json()["choices"][0]["message"]["content"])
     except Exception as e:  # noqa: BLE001 — 可选增强，失败降级不抛栈
         logger.debug("llm chat failed: %s", e)
+        log_degraded("llm", "chat_failed", exc=e)
         return None

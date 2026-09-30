@@ -69,9 +69,11 @@ def _safe_str(value: Any) -> str:
     try:
         return str(value)
     except Exception as e:  # noqa: BLE001 — 被格式化的对象 __str__ 本身可能抛
+        # silent-ok: value-fallback — _safe_str 的终极兜底，本函数就是"永不抛"的实现
         try:
             return f"<unrepr {type(value).__name__}: {type(e).__name__}>"
         except Exception:  # noqa: BLE001 — type()/__name__ 理论上安全，仍兜底
+            # silent-ok: value-fallback — _safe_str 的终极兜底，本函数就是"永不抛"的实现
             return "<unrepr>"
 
 
