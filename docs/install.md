@@ -73,7 +73,7 @@ pip install hermes-memory-governed
 pip install hermes-memory-governed[vector]
 ```
 
-The plugin is automatically discovered by Hermes Agent via the `hermes.memory_provider` entry point. After install, set the active provider in `~/.hermes/config.yaml`:
+The plugin is automatically discovered by Hermes Agent via the `hermes.memory_provider` entry point. After install, set the active provider in `$HERMES_HOME/config.yaml` (see the note above on locating `HERMES_HOME`):
 
 ```yaml
 memory:
@@ -100,7 +100,7 @@ Options:
 
 ```bash
 # Custom HERMES_HOME
-bash install.sh --hermes-home ~/.hermes
+bash install.sh --hermes-home /opt/hermes-home
 
 # With L2 vector search
 bash install.sh --with-vector
@@ -109,8 +109,16 @@ bash install.sh --with-vector
 bash install.sh --configure-cron
 
 # All options
-bash install.sh --hermes-home ~/.hermes --wiki-dir ~/wiki --with-vector --configure-cron
+bash install.sh --hermes-home /opt/hermes-home --wiki-dir ~/wiki --with-vector --configure-cron
 ```
+
+> Every `~/.hermes` path below is really `$HERMES_HOME`, and it is not always
+> `~/.hermes`: Hermes Agent resolves it from `$HERMES_HOME` first and otherwise
+> falls back to its own default, which on Windows is `%LOCALAPPDATA%\hermes`.
+> If you passed `--hermes-home` (or `-HermesHome`) above, substitute that value
+> for `~/.hermes` in the remaining steps — otherwise the files will be written
+> somewhere the agent never reads. The same goes for `python memory_cli.py`,
+> which resolves the store through the same variable.
 
 ### Windows
 
@@ -191,8 +199,9 @@ fi
 ### 5. Create config
 
 ```bash
-if [ ! -f ~/.hermes/governed_memory.json ]; then
-    cp config/governed_memory.example.json ~/.hermes/governed_memory.json
+HERMES_HOME="${HERMES_HOME:-$HOME/.hermes}"   # match whatever install.sh used
+if [ ! -f "$HERMES_HOME/governed_memory.json" ]; then
+    cp config/governed_memory.example.json "$HERMES_HOME/governed_memory.json"
 fi
 # Edit paths as needed
 ```
@@ -219,7 +228,10 @@ pip install lancedb sentence-transformers
 ### 8. Verify
 
 ```bash
-python ~/.hermes/scripts/memory_pipeline.py health
+# Same variable the installer wrote to — check the path you actually installed to.
+python "$HERMES_HOME/scripts/memory_pipeline.py" health
+# Or, to see which store this interpreter resolves:
+python "$HERMES_HOME/scripts/memory_cli.py" runtime
 ```
 
 ## 4. Upgrade
