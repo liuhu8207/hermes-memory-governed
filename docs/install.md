@@ -230,8 +230,8 @@ pip install lancedb sentence-transformers
 ```bash
 # Same variable the installer wrote to — check the path you actually installed to.
 python "$HERMES_HOME/scripts/memory_pipeline.py" health
-# Or, to see which store this interpreter resolves:
-python "$HERMES_HOME/scripts/memory_cli.py" runtime
+# Or, to see which store this interpreter resolves (prints hermes_home):
+python "$HERMES_HOME/scripts/memory_cli.py" health
 ```
 
 ## 4. Upgrade
