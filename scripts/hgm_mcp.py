@@ -249,6 +249,16 @@ def tool_recall(args: dict) -> str:
     sem = ranking.get("semantic")
     if isinstance(sem, dict) and sem.get("available") is False:
         lines.append(f"  ! semantic channel unavailable: {sem.get('reason')}")
+    # A vector channel that ran and rejected every candidate is a third case,
+    # and the count of rejects is not the text of them. Without this an agent
+    # reading an empty L2 concludes nothing was ever remembered, which is how
+    # the 2026-10-02 miss on a real ASR/MiMo query hid a fact that was in the
+    # store. Echoed here because the whole point is that the caller sees it.
+    near = ranking.get("near_miss") or (sem or {}).get("near_miss") or []
+    if near:
+        lines.append(f"  near misses below the floor ({len(near)}):")
+        for c in near:
+            lines.append(f"    - ({c.get('score'):.4f}) {c.get('content')}")
 
     lines.append(f"KB notes: {len(kb)} hit(s)")
     for note in kb:

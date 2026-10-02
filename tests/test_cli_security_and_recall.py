@@ -900,6 +900,91 @@ class TestL2SemanticChannel:
         assert parser.parse_args(["recall", "openssl"]).lexical_only is False
 
 
+class TestL2SemanticEmptyDegradesInsteadOfGoingEmpty:
+    """A vector channel that ran and rejected everything is a third outcome.
+
+    Measured on the real store 2026-10-02: the query "ASR 小米 MiMo 转写配置"
+    returned 0 hits with ``filtered_out=10`` — ten candidates had been seen and
+    rejected, and the caller was handed an empty list. An agent reads that as
+    "nothing was ever remembered", which is the one answer this module must not
+    give. It used to be indistinguishable from a genuine miss, because
+    ``semantic.available`` was True and the early return fired on availability
+    rather than on having hits.
+    """
+
+    def test_a_floor_rejection_degrades_to_lexical_instead_of_going_empty(
+            self, store, monkeypatch):
+        # The fake embedder is axis-per-token, so a row only lands far from the
+        # query when it lights a *different* axis: "car alpha" is orthogonal-ish
+        # to "car", which is what puts its score under the floor while its
+        # wording still matches lexically. That is the exact shape of the
+        # measured failure — semantically rejected, lexically findable.
+        (store.home / "governed_memory.json").write_text(json.dumps({
+            "wiki_dir": str(store.vault),
+            "recall": {"l2_semantic_min_score": 0.99},
+        }), encoding="utf-8")
+        _install_fake_embedding(monkeypatch)
+        _seed_vectors(store.home, ["car alpha gamma"])
+        errors: list = []
+        result = cli.recall_l2("car", 5, errors)
+        assert result["ranking"]["basis"] == "lexical-dis-max"
+        assert result["ranking"]["ranked"] is True
+        assert result["ranking"]["semantic"]["available"] is True
+        assert result["ranking"]["semantic"]["degraded"] == "semantic-empty"
+        assert result["ranking"]["semantic"]["filtered_out"] > 0
+        # The lexical channel still answers, rather than the layer going empty.
+        assert [h["content"] for h in result["hits"]] == ["car alpha gamma"]
+
+    def test_the_degradation_is_labelled_in_the_note_and_the_near_misses_are_echoed(
+            self, store, monkeypatch):
+        # A bare filtered_out count says how many lost, not what they said. The
+        # note must forbid reading an empty L2 as "never remembered", and the
+        # rejected candidates must come back with their scores.
+        (store.home / "governed_memory.json").write_text(json.dumps({
+            "wiki_dir": str(store.vault),
+            "recall": {"l2_semantic_min_score": 0.99},
+        }), encoding="utf-8")
+        _install_fake_embedding(monkeypatch)
+        _seed_vectors(store.home, ["car alpha gamma"])
+        ranking = cli.recall_l2("car", 5, [])["ranking"]
+        assert "DEGRADED" in ranking["note"]
+        assert "nothing was remembered" in ranking["note"]
+        near = ranking.get("near_miss") or []
+        assert near, "rejected candidates must be echoed, not just counted"
+        assert all(0.0 <= c["score"] < 0.99 for c in near)
+        assert len(near) <= cli._L2_NEAR_MISS
+        # Bounded on purpose: a diagnostic, not a second result set.
+        assert cli._L2_NEAR_MISS == 3
+
+    def test_a_productive_vector_channel_is_untouched(self, store, monkeypatch):
+        # The fallback must not fire when the vector channel has hits, or every
+        # good semantic answer would be relabelled as a degradation.
+        _install_fake_embedding(monkeypatch)
+        _seed_vectors(store.home, [_CAR_DOC])
+        ranking = cli.recall_l2("car", 5, [])["ranking"]
+        assert ranking["basis"] == "semantic-cosine"
+        assert "degraded" not in (ranking.get("semantic") or {})
+        assert "near_miss" not in ranking
+
+    def test_a_query_with_no_wording_overlap_degrades_to_an_empty_answer(
+            self, store, monkeypatch):
+        # Degraded does not mean "answers anyway": with no lexical overlap
+        # either, the honest answer is still empty — but it is labelled, so the
+        # caller can tell "searched, found nothing" from "cannot read L2"
+        # (which is ranked=False) and from "never remembered".
+        (store.home / "governed_memory.json").write_text(json.dumps({
+            "wiki_dir": str(store.vault),
+            "recall": {"l2_semantic_min_score": 0.99},
+        }), encoding="utf-8")
+        _install_fake_embedding(monkeypatch)
+        _seed_vectors(store.home, ["car alpha gamma"])
+        result = cli.recall_l2("kubernetes", 5, [])
+        assert result["hits"] == []
+        assert result["ranking"]["ranked"] is True
+        assert result["ranking"]["semantic"]["degraded"] == "semantic-empty"
+        assert "DEGRADED" in result["ranking"]["note"]
+
+
 # -- P2: threshold drift must be visible, not corrected ---------------------
 class TestL2ThresholdDriftIsVisible:
     """The CLI's semantic floor and the plugin's cosine floor cut the same

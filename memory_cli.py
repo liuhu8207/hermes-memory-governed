@@ -612,6 +612,12 @@ DEFAULT_L2_SEMANTIC_FLOOR = 0.77
 #: whole shortlist and the scoped rows never surface at all.
 _L2_SEMANTIC_OVERFETCH = 5
 
+#: How many below-floor candidates to echo back as `near_miss` when the vector
+#: channel finds nothing. Enough for a caller to see what was rejected and how
+#: close it was; small enough that this stays a diagnostic rather than a
+#: second, differently-ranked result set.
+_L2_NEAR_MISS = 3
+
 #: Stated on every CLI L2 answer. The two channels both land on [0, 1] but
 #: measure different things — one measures meaning, the other measures wording —
 #: and each is cut by its own floor. Leaving that unsaid would let a caller
@@ -870,7 +876,7 @@ def _l2_semantic_hits(query: str, top_k: int, project: str = "",
     floor, floor_source = _resolve_l2_semantic_floor(None)
     out = {"available": False, "hits": [], "floor": floor,
            "floor_source": floor_source, "filtered_out": 0, "truncated": 0,
-           "reason": "", "backend": ""}
+           "reason": "", "backend": "", "near_miss": []}
 
     def _unavailable(reason: str) -> dict:
         out["reason"] = reason
@@ -926,7 +932,7 @@ def _l2_semantic_hits(query: str, top_k: int, project: str = "",
                 prefiltered = True
             except Exception:  # noqa: BLE001 — older LanceDB has no prefilter
                 limit = limit * _L2_SEMANTIC_OVERFETCH
-        hits, filtered = [], 0
+        hits, filtered, near_miss = [], 0, []
         for r in search.limit(limit).to_list():
             if project and not prefiltered \
                     and not recall_mod.l2_project_allows(project, r.get("project")):
@@ -934,6 +940,15 @@ def _l2_semantic_hits(query: str, top_k: int, project: str = "",
             score = recall_mod.distance_to_score(r.get("_distance"))
             if score < floor:
                 filtered += 1
+                # Keep the closest misses. `filtered_out: 10` next to `hits: []`
+                # says ten candidates lost, not what they said — so an agent
+                # reads an empty L2 as "nothing was ever remembered". Echoing
+                # the top few lets the caller judge for itself instead of
+                # trusting a bare count. Bounded: this is a diagnostic, not a
+                # second result set.
+                near_miss.append({"content": str(r.get("content", ""))[:200],
+                                  "score": round(score, 4),
+                                  "score_basis": "semantic-cosine"})
                 continue
             hit = {"layer": "l2", "content": str(r.get("content", ""))[:600],
                    "score": round(score, 4),
@@ -945,9 +960,11 @@ def _l2_semantic_hits(query: str, top_k: int, project: str = "",
             hits.append(hit)
         hits.sort(key=lambda h: h["score"], reverse=True)
         kept = hits[:max(int(top_k or 0), 0)]
+        near_miss.sort(key=lambda h: h["score"], reverse=True)
         _touch_l2_usage([h.get("content", "") for h in kept])
         out.update({"available": True, "hits": kept, "filtered_out": filtered,
                     "truncated": len(hits) - len(kept),
+                    "near_miss": near_miss[:_L2_NEAR_MISS],
                     "backend": getattr(embedding, "backend_name", "") or ""})
         return out
     except Exception as e:  # noqa: BLE001
@@ -1504,11 +1521,22 @@ def recall_l2(query: str, top_k: int, errors: list = None,
 
     Two channels, one answer. The **semantic** channel embeds the query with the
     backend the plugin uses and searches by cosine; it is tried first, and when
-    it works it *replaces* the lexical one rather than being merged into it —
-    the two scores are different quantities, and ranking them in one list would
-    be the same dimension error as thresholding one with the other's floor. The
-    **lexical** channel is the fallback, used when ``lexical_only`` is set or
-    when no embedding backend can serve the query.
+    it produces hits it *replaces* the lexical one rather than being merged into
+    it — the two scores are different quantities, and ranking them in one list
+    would be the same dimension error as thresholding one with the other's
+    floor. The **lexical** channel is the fallback, used when ``lexical_only``
+    is set, when no embedding backend can serve the query, or when the vector
+    channel ran fine and rejected every candidate.
+
+    That last case is the reason this function has three outcomes and not two.
+    "Vector search worked and cleared the floor", "vector search could not
+    run", and "vector search ran and rejected everything" all used to collapse
+    into an empty list, and only the first two were distinguishable from the
+    ``semantic`` block. A caller that got the third one concluded nothing had
+    ever been written. Now that case falls through to the lexical channel and is
+    labelled ``degraded: semantic-empty`` in both the ``semantic`` block and the
+    ranking note, with the rejected top candidates in ``near_miss`` — a count
+    of what was thrown away is not the same thing as the text of it.
 
     Returns ``{"hits": [...], "ranking": {...}}``. ``ranking["basis"]`` says
     which channel produced the hits and ``ranking["semantic"]`` says whether the
@@ -1557,13 +1585,25 @@ def recall_l2(query: str, top_k: int, errors: list = None,
     semantic = None
     if not lexical_only:
         semantic = _l2_semantic_hits(query, top_k, project, errors)
-        if semantic["available"]:
+        # Available AND productive: this is the answer.
+        if semantic["available"] and semantic["hits"]:
             return {"hits": semantic["hits"],
                     "ranking": _l2_ranking(
                         True, semantic["floor"], semantic["floor_source"],
                         filtered=semantic["filtered_out"],
                         truncated=semantic["truncated"],
                         basis="semantic-cosine", semantic=semantic)}
+        # Available but nothing cleared the floor. Returning here gave an agent
+        # an empty L2 and no statement that anything had been *seen and
+        # rejected* — which reads as "never remembered" and is the one answer
+        # this module must not give (measured 2026-10-02: a real query about
+        # the ASR/MiMo config returned 0 hits with filtered_out=10, while a
+        # matching fact sat in the store). Fall through to the lexical channel
+        # instead, and carry the near misses plus an explicit degraded flag so
+        # the answer cannot be mistaken for a clean semantic miss.
+        if semantic["available"]:
+            semantic = dict(semantic)
+            semantic["degraded"] = "semantic-empty"
 
     def _fail(msg: str) -> dict:
         if errors is not None:
@@ -1638,6 +1678,26 @@ def recall_l2(query: str, top_k: int, errors: list = None,
         hits.sort(key=lambda h: h["score"], reverse=True)
         kept = hits[:max(int(top_k or 0), 0)]
         _touch_l2_usage([h.get("content", "") for h in kept])
+        # A lexical answer reached *after* a working vector channel came back
+        # empty is a degradation, and the ranking has to say so: the caller is
+        # otherwise reading wording-level scores while believing it got a
+        # meaning-level search. `near_miss` rides along for the same reason
+        # `filtered_out` does — the rejected candidates are the evidence for
+        # what the vector channel saw.
+        if semantic is not None and semantic.get("available") \
+                and not semantic.get("hits"):
+            ranking = _l2_ranking(
+                True, floor, floor_source, filtered, len(hits) - len(kept),
+                note=("DEGRADED: the vector channel was available but every "
+                      "candidate fell below its floor "
+                      f"({semantic.get('floor')}), so these hits are lexical. "
+                      "See 'semantic.near_miss' for what the vector channel "
+                      "rejected — do not read an empty L2 as 'nothing was "
+                      "remembered'."),
+                basis="lexical-dis-max", semantic=semantic)
+            if semantic.get("near_miss"):
+                ranking["near_miss"] = semantic["near_miss"]
+            return {"hits": kept, "ranking": ranking}
         return {"hits": kept,
                 "ranking": _l2_ranking(True, floor, floor_source, filtered,
                                        len(hits) - len(kept),
