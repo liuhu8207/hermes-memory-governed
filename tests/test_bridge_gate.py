@@ -31,9 +31,11 @@ from plugin.memory_governed._sync import (
     _fact_signal_score,
     dialogue_fact_admits,
     external_structural_evidence,
+    external_write_verdict,
     has_template_scaffold,
     is_ephemeral_content,
     is_memory_aggregate,
+    is_non_assertive_speech,
     is_template_placeholder,
     strip_template_fragments,
 )
@@ -470,3 +472,115 @@ class TestNoPrivateRuler:
             "发现 _sync.py 之外的私有强信号准入尺子，请改用 "
             f"dialogue_fact_admits()：{offenders}"
         )
+
+
+# ---------------------------------------------------------------------------
+# Non-assertive speech must not become a fact (2026-10-18)
+# ---------------------------------------------------------------------------
+
+class TestNonAssertiveSpeechIsNotAFact:
+    """条件句、转述与引语不得进入 L2。
+
+    此前门禁只量「一句话有多少证据」，从不问「这句话做了什么」。于是够长的
+    条件句凭长度直接过关——2026-10-18 在运行系统上实测：
+    ``remember --dry-run「如果值班表调整，就会改成 #ops-pager」`` 返回
+    ``admitted=True``，一个关于值班表如何变更的**假设**被当成了既成事实。
+
+    这正是外部 provider scope-recall
+    （``410979729/scope-recall-hermes`` v3.11.0）用一个版本堵掉的缺陷类别：
+    它的 recall benchmark 上「denial 变成事实」的比例从 12/21 降到 1/21。
+
+    HGM 的规则刻意更窄——L2 是 append-only，没有 slot 可覆盖，所以这里没有
+    「否定顶掉了旧值」要防；要防的是**别人的话或假设以主人的权威进入召回层**。
+    """
+
+    # --- 该挡住的 ---
+    @pytest.mark.parametrize("text", [
+        "如果值班表调整，就会改成 #ops-pager",
+        "假如 Gateway 重启失败，先看 gateway.log 的最后 50 行再处理",
+        "要是 embedding 服务不可用，recall 会整体走词法降级通道",
+        "万一同步盘清理了 refs 目录，push 就会失败，先确认目录还在",
+        "张三说配色换成了银色",       # 句中陈述，首版正则漏了这个形态
+        "张三说：配色换成了银色",       # 带分隔符的引述标签
+        "据说官方已经发布了 3.11 版本",
+        "他表示值班表下周换人",
+        "he said the pager was rotated last night",
+    ])
+    def test_it_is_refused(self, text):
+        assert is_non_assertive_speech(text), text
+
+    def test_the_reason_is_reported_not_silent(self):
+        """门禁的 reason 必须报出来——静默丢弃和成功长得一模一样。"""
+        admitted, reason = _admit_with_reason(
+            "如果值班表调整，就会改成 #ops-pager")
+        assert admitted is False
+        assert reason == "non_assertive", reason
+
+    def test_a_long_conditional_still_falls_to_this_reason(self):
+        """够长、有证据的条件句曾经凭长度过关，现在必须按「它不主张任何事」拒。"""
+        long_conditional = (
+            "如果值班表在下周三调整，那么 #ops-pager 这个分页组就会改成 "
+            "oncall-rotation，届时值班表与分页组的对应关系需要重新核对一遍")
+        assert is_non_assertive_speech(long_conditional)
+
+    # --- 绝不能挡住的：现网 54 条真实事实里的好句子 ---
+    @pytest.mark.parametrize("text", [
+        # 澄清式否定是库里最有价值的事实之一，不是病
+        "判断的是那个代理节点在不在，不是端口：7890/7891/7892/8888 是同一台机器",
+        # 陈述的未来变更是值得记住的计划
+        "下周换成 X",
+        # 主人的自我归属
+        "我认为记得每天备份比记住备份命令更重要",
+        "我表示这个配置已经改过了",
+        "更正：wiki_dir 在 governed_memory.json 里，不在环境变量",
+        # 括号内的引号是给名词做注解，不是转述
+        "WorkBuddy 的邮箱连接器显示名『Agent Mail 智能体邮箱』，不存在 qq-mail 命名空间",
+        # 引号包住的是被提及的术语，句子主体另有断言
+        "对中文查询「ASR 小米 MiMo 转写配置」0 命中，L2 全部被语义 floor 过滤",
+        # 强调性引号
+        '执行必须在本机，那"算力跟数据分离"就绕不过去',
+        # 结构化前缀
+        "status: archived 表示这篇笔记已归档，不参与默认检索",
+    ])
+    def test_good_facts_survive(self, text):
+        assert not is_non_assertive_speech(text), text
+
+    def test_the_owner_marker_veto_beats_the_quotes(self):
+        """主人的自我归属要能救回带引号的句子，否则「我表示…」会被误杀。"""
+        assert not is_non_assertive_speech('我说的是"节点"不是"端口"')
+
+    def test_a_conditional_particle_alone_is_not_a_conditional(self):
+        """「…的话」必须由连词带动，否则那是承诺或断言。"""
+        assert not is_non_assertive_speech("出问题的话我不在这")
+        assert not is_non_assertive_speech("失败的话就是配置错了")
+        assert is_non_assertive_speech("如果出问题的话就不在这")
+
+    def test_it_is_the_same_ruler_for_every_consumer(self):
+        """三个消费者共用一把尺子；新判据住在 _sync.py，所以自动继承。
+
+        这是本仓库的既有纪律（见上面 test_only_the_ruler_module_may_call_*）：
+        规则定义在 _sync.py，写入 / 回放 / Bridge 三条路径都调
+        ``dialogue_fact_admits``，因此不需要为新判据再加一个消费者。
+
+        两条断言都用**证据充足**的句子，否则测到的是 weak_signal 而不是新判据
+        —— 「值班表调整后会改成 #ops-pager」本来就过不了证据线，拿它断言 True
+        只会把一个无关的失败混进来。
+        """
+        conditional = ("如果值班表调整，#ops-pager 分页组就会改成 "
+                       "oncall-rotation，值班表与分页组对应关系需重新核对")
+        assert dialogue_fact_admits(conditional) is False
+
+        plain = ("值班表调整后，#ops-pager 分页组已改成 oncall-rotation，"
+                 "值班表与分页组对应关系已重新核对过一遍")
+        assert external_write_verdict(plain)[0] is True
+
+    def test_the_reason_tag_is_new_and_named(self):
+        """reason 必须是可机读的短标签，不能是散文。"""
+        assert _admit_with_reason(
+            "如果值班表调整，就会改成 #ops-pager") == (False, "non_assertive")
+
+
+def _admit_with_reason(text: str):
+    """门禁的 (admitted, reason) 入口，与 WriteQueue 同一条路径。"""
+    from plugin.memory_governed._sync import external_write_verdict
+    return external_write_verdict(text)

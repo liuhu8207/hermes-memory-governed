@@ -1043,6 +1043,173 @@ def _fact_signal_score(sentence: str, role: str = "",
     return score
 
 
+# ---------------------------------------------------------------------------
+# Non-assertive speech — admission gate
+# ---------------------------------------------------------------------------
+# Why this is separate from `_looks_like_fact`:
+#
+# Everything above measures how much EVIDENCE a sentence carries. None of it
+# asks what the sentence DOES. A conditional long enough to clear the evidence
+# bar passes on its length alone, so
+#     「如果值班表调整，就会改成 #ops-pager」
+# was admitted into L2 as a fact about the pager — measured 2026-10-18,
+# reproduced on the running system with `remember --dry-run`.
+#
+# That is the same class of defect scope-recall (an external Hermes memory
+# provider, 410979729/scope-recall-hermes v3.11.0) spent a release closing:
+# on its recall benchmark, denials that became facts fell from 12 of 21 to 1
+# of 21 once a conditional stopped counting as a correction.
+#
+# The rule here is deliberately narrower than scope-recall's, because HGM has no
+# slot to overwrite: L2 is append-only and every row is written by an agent that
+# was asked to record a fact. So there is no "a denial replaced the value it
+# denied" failure to prevent here — what there IS to prevent is a HYPOTHETICAL
+# or a THIRD PARTY'S WORDS sitting in the recall layer under the owner's
+# authority, because recall presents a row as something the owner holds.
+#
+# Asymmetric cost, as everywhere else in this gate: a dropped real fact is
+# recoverable (the next turn re-offers it); a standing false premise is not
+# (it is injected into every later recall as if it were established).
+#
+# NOT rejected here, deliberately:
+#   * 「不是 A，是 B」 — a clarification, and one of the highest-value facts the
+#     store holds ("判断的是节点在不在，不是端口"). Negation is not the disease.
+#   * 「以后改成 X」 — a stated future change is a plan worth remembering.
+#   * 「我必须…」 / 「不能…」 — modal commitments, still admitted above.
+_HYPOTHETICAL_RE = re.compile(
+    r"(如果|假如|假设|假使|要是|倘若|万一|一旦|设若|果真|"
+    r"\bif\b|\bunless\b|\bsuppose[ds]?\b|\bin\s+case\b|"
+    r"\bhypothetically\b|\bwould\s+(?:be|use|switch|change|become)\b)",
+    re.IGNORECASE,
+)
+
+#: 「…的话」只在它是条件从句时才算假设。
+#: 「出问题的话我不在这」是承诺，「失败的话就是配置错了」是断言。
+_CONDITIONAL_PARTICLE_RE = re.compile(r"的话")
+
+#: 转述与引语 —— 别人说的话不是主人的立场。
+#:
+#: 「名字+说」有两种形态，缺一不可：
+#:     张三说：配色换成了银色        ← 带分隔符的引述标签
+#:     张三说配色换成了银色          ← 句中陈述（首版漏了这条，实测漏判）
+#: 所以竖线两侧都要给，而不是只在分隔符一侧匹配。
+_REPORTED_SPEECH_RE = re.compile(
+    r"(据说|听说|有人说|别人说|据传|转述|"
+    r"他表示|她说|他说|其表示|"
+    r"[一-龥]{2,4}(?:说|表示|提到|认为|讲|建议)[：:，,]|"
+    r"[一-龥]{2,4}(?:说|表示|提到|认为)\s*\S|"
+    r"\baccording to\b|\breportedly\b|\bsays\b|\bsaid\b|"
+    r"\bhe\s+(?:says|said)\b|\bshe\s+(?:says|said)\b)",
+    re.IGNORECASE,
+)
+
+#: 引号内的内容 —— 引述而非陈述。
+#:
+#: DELIBERATELY NARROW, and the first version of this was much too wide: it
+#: matched 「」『』"" and marked 8 of the 54 live facts non-assertive, every one
+#: of them a good fact. Two shapes caused it and both are emphasis or naming,
+#: not speech:
+#:     显示名『Agent Mail 智能体邮箱』          ← naming a UI label
+#:     那"算力跟数据分离"就绕不过去                ← quoting the reader's words
+#: So the pair must be a LONG span (a short one is a label), and the opening
+#: mark must not sit inside parentheses or brackets — a quoted name is almost
+#: always a gloss on the noun next to it.
+_QUOTED_SPAN_RE = re.compile(
+    r"(?:^|[^（(【\[])[「『“\"][^」』”\"]{8,}[」』”\"]")
+_QUOTED_SPAN_INLINE_RE = re.compile(r"[「『“\"][^」』”\"]{8,}[」』”\"]")
+
+
+def _has_real_quotation(text: str) -> bool:
+    """True only when the quotation IS the sentence's claim.
+
+    Two exclusions, both learned from the live store (this first marked 4 of the
+    54 facts, every one of them good):
+
+    * a quote opening right after a bracket is a gloss on the noun beside it —
+      「显示名『Agent Mail 智能体邮箱』」names a UI label, it does not report
+      what anyone said;
+    * a quote with substantive text on BOTH sides is the speaker naming a term
+      while asserting something else — 「对中文查询「ASR 小米 MiMo 转写配置」0
+      命中」 is a measurement whose subject is the recall, not the query.
+
+    So the quotation has to be load-bearing: strip it, and whatever claims
+    remain decide.
+    """
+    spans = [m for m in _QUOTED_SPAN_INLINE_RE.finditer(text)
+             if (text[max(0, m.start() - 1):m.start()] or " ")
+             not in "（(【["]
+    if not spans:
+        return False
+
+    residue = text
+    for m in reversed(spans):
+        residue = residue[:m.start()] + residue[m.end():]
+    return not residue.strip()
+
+
+#: 例词 —— 「比如」「例如」后面跟的是举例，不是既成事实。
+_EXEMPLAR_RE = re.compile(
+    r"(比如|例如|譬如|举个例子|举例来说|"
+    r"\bfor\s+(?:example|instance)\b|\be\.g\.\b|\bsuch\s+as\b)",
+    re.IGNORECASE,
+)
+
+#: 这些词出现时，整句多半是主人自己的记录用语，不按转述处理。
+#: 「我表示…」「更正：」「记住：」「INFO:」「status: …」都是主人或结构的前缀。
+_OWNER_ATTRIBUTION_MARKERS = (
+    "我表示", "我说", "我认为", "我觉得", "我的", "咱们", "我们",
+    "更正", "纠正", "更新", "记住", "注意", "备注",
+    "info", "warn", "error", "debug", "status", "note",
+)
+
+
+def is_non_assertive_speech(text: str) -> bool:
+    """Detect sentences that assert nothing about the world.
+
+    Covers a conditional, reported speech, a quotation and an exemplar — the
+    four shapes that read as declarative to a signal-strength gate while
+    committing the owner to nothing.
+
+    Returns False whenever the sentence also carries the owner's own voice or a
+    structural prefix, because those mark it as the owner's record rather than
+    someone else's claim.
+
+    Examples:
+        >>> is_non_assertive_speech("如果值班表调整，就会改成 #ops-pager")
+        True
+        >>> is_non_assertive_speech("张三说配色换成了银色")
+        True
+        >>> is_non_assertive_speech("值班表调整后会改成 #ops-pager")
+        False
+        >>> is_non_assertive_speech("判断的是节点在不在，不是端口")
+        False
+    """
+    s = (text or "").strip()
+    if not s:
+        return False
+
+    lowered = s.lower()
+    for marker in _OWNER_ATTRIBUTION_MARKERS:
+        if marker in lowered:
+            return False
+
+    if _HYPOTHETICAL_RE.search(s):
+        # 「…的话」needs its conjunction to count; on its own it is a promise
+        # ("出问题的话我不在这") or an assertion ("失败的话就是配置错了").
+        if _CONDITIONAL_PARTICLE_RE.search(s) and not re.search(
+                r"(如果|假如|假设|要是|万一|倘若|一旦|"
+                r"\bif\b|\bunless\b)", s, re.IGNORECASE):
+            pass
+        else:
+            return True
+
+    if _REPORTED_SPEECH_RE.search(s):
+        return True
+    if _has_real_quotation(s):
+        return True
+    return bool(_EXEMPLAR_RE.search(s))
+
+
 def dialogue_fact_admits(text: str, role: str = "") -> bool:
     """The dialogue-path admission gate — ONE definition, THREE consumers.
 
@@ -1171,8 +1338,9 @@ def external_write_verdict(text: str) -> Tuple[bool, str]:
     Returns:
         ``(admitted, reason)``. ``reason`` is ``"ok"`` when admitted; otherwise a
         short machine-readable tag (``empty`` / ``ephemeral`` / ``template`` /
-        ``media`` / ``abs_path`` / ``weak_signal``) that the caller **must**
-        surface to the user. A silent drop here would look identical to success.
+        ``media`` / ``abs_path`` / ``non_assertive`` / ``weak_signal``) that the
+        caller **must** surface to the user. A silent drop here would look
+        identical to success.
     """
     raw = (text or "").strip()
     if not raw:
@@ -1190,6 +1358,11 @@ def external_write_verdict(text: str) -> Tuple[bool, str]:
         return False, "media"
     if _ABS_PATH_RE.match(cleaned):
         return False, "abs_path"
+    # What the sentence DOES, not how much evidence it carries. Checked before
+    # the evidence tests so a long, well-evidenced conditional is refused for
+    # what it is rather than admitted for how much it weighs.
+    if is_non_assertive_speech(cleaned):
+        return False, "non_assertive"
 
     # --- admission: one token is not evidence (see _SELF_SUFFICIENT_SIGNALS) --
     # A genuine modal commitment is a rule in its own right. Checked through
