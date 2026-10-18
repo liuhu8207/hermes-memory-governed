@@ -991,6 +991,174 @@ def _touch_l2_usage(contents: list) -> None:
         pass
 
 
+#: ``l2_lexical_score`` 的饱和上界：``_saturated_rate`` 以 ``min(terms, 3)``
+#: 作分母，命中数达到 ``_L2_TERM_SATURATION`` 后分数不再增长，所以 ``1.0``
+#: 是这个标尺能表达的**最强说法** —— "查询的词项在这条记录里全部出现"。
+#: 用它当救援门槛时它不是又一个相似度阈值，而是该通道值域的端点。
+_L2_LEXICAL_FULL_COVERAGE = 1.0
+
+
+def _l2_lexical_hits(query: str, top_k: int, project: str = "",
+                     floor: float = 0.0,
+                     keep_all: bool = False) -> dict:
+    """Lexical L2 hits for ``query``: full scan, scored by ``l2_lexical_score``.
+
+    抽成函数而不是留在 :func:`recall_l2` 里，是因为它现在有两个调用方：
+    **降级路径**（向量通道不可用或为空）与 **救援路径**
+    (:func:`_l2_rescue_hits`，向量通道有输出但漏了字面全命中的那条)。
+    扫描、project 可见性、打分三者**各留一份** —— 这正是本模块写错过一次的
+    地方：两份过滤迟早给出两个答案。
+
+    ``keep_all`` 打开时不做 ``top_k`` 截断，并把全部候选按分降序放进
+    ``candidates``，供调用方自己筛。
+
+    Returns ``{"ok", "hits", "filtered", "truncated", "candidates", "error"}``
+    并且永不抛出：读 L2 失败必须在 ranking 里被说出来，而不是让 0 命中被当成
+    "从没记住过"。
+
+    它**不写 errors**：怎么处置一次读失败是调用方的事（降级路径把它变成
+    refusal，救援路径把它变成一条静默 skip 加 ranking 里的一句话）。同一件
+    事被两个地方各记一次，读 ``errors`` 的人就会以为失败了两次。
+    """
+    out = {"ok": False, "hits": [], "filtered": 0, "truncated": 0,
+           "candidates": [], "error": ""}
+    try:
+        import lancedb
+    except ImportError as e:
+        out["error"] = (f"lancedb not importable ({e}); "
+                        "run under the project venv")
+        return out
+    try:
+        l2 = Path(hermes_home()) / "memory" / "l2"
+        if not l2.exists():
+            out["error"] = f"l2 directory missing: {l2}"
+            return out
+        db = lancedb.connect(str(l2))
+        names = getattr(db, "list_tables", None)
+        nlist = names() if callable(names) else db.table_names()
+        if not isinstance(nlist, (list, tuple)):
+            nlist = getattr(nlist, "tables", []) or [nlist]
+        tables = [t.name if hasattr(t, "name") else str(t) for t in nlist]
+        if "memories" not in tables:
+            out["error"] = "no 'memories' table"
+            return out
+        table = db.open_table("memories")
+        arr = table.to_arrow()
+        if "content" not in arr.column_names:
+            out["error"] = "'memories' table has no content column"
+            return out
+        contents = arr["content"].to_pylist()
+        agents = (arr["agent"].to_pylist() if "agent" in arr.column_names
+                  else [None] * len(contents))
+        projects = (arr["project"].to_pylist() if "project" in arr.column_names
+                    else [None] * len(contents))
+        scored = []
+        for c, ag, pj in zip(contents, agents, projects):
+            c = str(c or "")
+            if not c:
+                continue
+            pj = str(pj) if pj else ""
+            # A project-scoped query still sees global facts (project IS NULL):
+            # "SecretStore runs on the NAS" is true wherever you ask from. What
+            # it must not see is *another* project's facts.
+            if project and pj and pj != project:
+                continue
+            score = l2_lexical_score(query, c)
+            if score <= 0:
+                continue
+            if score < floor:
+                out["filtered"] += 1
+                continue
+            scored.append((score, c, ag, pj))
+        # Ranked, then cut — the old code took the first top_k in write order
+        # and never said it had dropped anything.
+        scored.sort(key=lambda t: t[0], reverse=True)
+        out["candidates"] = scored
+        kept = scored if keep_all else scored[:max(int(top_k or 0), 0)]
+        out["truncated"] = len(scored) - len(kept)
+        for score, c, ag, pj in kept:
+            hit = {"layer": "l2", "content": c[:600],
+                   "score": round(score, 4),
+                   "score_basis": "lexical-dis-max"}
+            if ag:
+                hit["agent"] = ag
+            if pj:
+                hit["project"] = pj
+            out["hits"].append(hit)
+        _touch_l2_usage([h.get("content", "") for h in out["hits"]])
+        out["ok"] = True
+        return out
+    except Exception as e:  # noqa: BLE001 — reported, never swallowed
+        out["error"] = str(e)[:200]
+        return out
+
+
+def _l2_rescue_hits(query: str, semantic_hits: list, project: str,
+                    floor: float, budget: int, errors: list = None) -> list:
+    """把被语义通道排除、但词法通道完全覆盖的候选作为**证据**带回来。
+
+    为什么需要它（2026-10-18 实测）
+    -----------------------------
+    ``recall_l2`` 在向量通道产出任何命中时就 return —— 这是"二选一"，不是
+    融合，见该函数的文档。后果是一条**字面全命中**的事实可以被一条**擦线通过**
+    的噪声彻底顶掉：
+
+        query  「家庭网络代理节点挂在哪个地址」
+        真答案  0.7588（< floor 0.77，被滤掉，落在 near_miss 第 3 位）
+        实际返回 0.7703 「OpenCode 必须配置 OPENCODE_HOME…」——毫不相关
+
+    两者只差 0.0115。过线与否这个二元判决，取自这样一条扁平的分数带，却被当成
+    了一个可信赖的排序结论。
+
+    触发条件刻意不需要任何新阈值
+    --------------------------
+    * 词法侧要求 **饱和上界** ``_L2_LEXICAL_FULL_COVERAGE``：查询词项在这条记录
+      里全部出现。这是该通道值域的端点，不是又一个校准出来的相似度门槛。
+    * 语义侧只用**它已经做出的决定**：这条不在它的 hits 里（被 floor 排除了）。
+    * 两者同时成立 = 两个通道在这一条上**直接冲突**。冲突不说明谁对，只说明
+      证据不该被丢掉。
+
+    它是**追加**而不是重排
+    ----------------------
+    救援条目排在语义命中**之后**。理由：语义通道对它的判词是"不相关"，我们
+    没有构造出推翻它的理由；字面全命中是证据，不是胜诉证据。这个性质同时让
+    它天然不引入回归 —— 已排好的东西一个都不会移动。反过来，全局改用 RRF
+    融合（见 ``_recall._fuse_l2_channels``）会重排一切：实测 dev 得救 1 题、
+    heldout 反而打输 1 题（"dsh 的记忆插件现在用哪个"从 rank 2 掉到 3，还让
+    一个负例压到答案前面）。所以这里先做"保留证据"，融合留给下一步。
+    """
+    if budget <= 0:
+        return []
+    seen = {str(h.get("content") or "")[:600] for h in semantic_hits}
+    lex = _l2_lexical_hits(query, 0, project, floor, keep_all=True)
+    if not lex["ok"]:
+        # 救援是 best-effort 的附加证据，它挂了不该拖垮一次已经成功的检索；
+        # 但要留下话，否则"这次没救到东西"和"这次没有可救的"长得一样。
+        if errors is not None:
+            errors.append(f"l2: lexical rescue scan failed: {lex['error']}")
+        return []
+    threshold = max(float(floor or 0.0), _L2_LEXICAL_FULL_COVERAGE)
+    out = []
+    # candidates 已按分降序，遇到第一条不达标即可停。
+    for score, c, ag, pj in lex["candidates"]:
+        if score < threshold:
+            break
+        key = c[:600]
+        if key in seen:
+            continue
+        seen.add(key)
+        hit = {"layer": "l2", "content": key, "score": round(score, 4),
+               "score_basis": "lexical-dis-max", "rescued": True}
+        if ag:
+            hit["agent"] = ag
+        if pj:
+            hit["project"] = pj
+        out.append(hit)
+        if len(out) >= budget:
+            break
+    return out
+
+
 def _l2_enforce_capacity(table, cfg, agent: str, cap: int) -> list:
     """同 agent 行数将超 ``cap`` 时，把**最少使用**的事实降级归档。
 
@@ -1454,13 +1622,19 @@ def cmd_bench(config: dict, split: str = "dev", top_k: int = 5,
 
     try:
         report = bench.run_bench(_search, split=split, top_k=top_k,
-                                 engine_name=engine_name)
+                                 engine_name=engine_name,
+                                 locate=bench.default_locate_cli(config))
     except ValueError as e:
         return _refusal(str(e))
 
     out = report.to_dict()
     out["ok"] = True
     out["basis"] = "hard-negative"
+    # 未 grounded 的题单独点名：它们退出分母这件事必须在报告顶层可见，
+    # 否则 "答案不在这一层" 会变成一次没人追问的样本错误。
+    out["ungrounded_items"] = [
+        {"query": i["query"], "answer_found_in": i["answer_found_in"]}
+        for i in out.get("items", []) if not i.get("grounded")]
     out["note"] = ("ok=true 表示评测跑完，不表示检索通过；"
                    "看 answer_at_1 与 clean_pass_rate。")
     return out
@@ -1647,12 +1821,35 @@ def recall_l2(query: str, top_k: int, errors: list = None,
         semantic = _l2_semantic_hits(query, top_k, project, errors)
         # Available AND productive: this is the answer.
         if semantic["available"] and semantic["hits"]:
-            return {"hits": semantic["hits"],
-                    "ranking": _l2_ranking(
-                        True, semantic["floor"], semantic["floor_source"],
-                        filtered=semantic["filtered_out"],
-                        truncated=semantic["truncated"],
-                        basis="semantic-cosine", semantic=semantic)}
+            hits = list(semantic["hits"])
+            # The vector channel said "these, and nothing else" — but a vector
+            # channel that clears its floor by 0.003 has already told us its
+            # ranking is thin. Ask the lexical channel for a second opinion on
+            # the rows the vector one threw away, keeping only FULL-COVERAGE
+            # evidence and staying inside the caller's top_k budget.
+            rescued = _l2_rescue_hits(
+                query, hits, project, floor,
+                max(int(top_k or 0), 0) - len(hits), errors)
+            ranking = _l2_ranking(
+                True, semantic["floor"], semantic["floor_source"],
+                filtered=semantic["filtered_out"],
+                truncated=semantic["truncated"],
+                basis="semantic-cosine", semantic=semantic)
+            if rescued:
+                hits = hits + rescued
+                ranking["rescued"] = len(rescued)
+                # Two channels disagree on these; the score of a rescued row is
+                # a lexical one, so say it — a score without its basis is
+                # unfalsifiable, and these rows carry a different one than the
+                # rows above them.
+                ranking["note"] = ranking["note"] + (
+                    " Appended below them are up to "
+                    f"{len(rescued)} row(s) the vector channel discarded but "
+                    "the lexical channel covers completely (every query term "
+                    "present): they carry 'rescued: true' and a lexical score. "
+                    "They are additional EVIDENCE, not a reordering — nothing "
+                    "the vector channel ranked was moved.")
+            return {"hits": hits, "ranking": ranking}
         # Available but nothing cleared the floor. Returning here gave an agent
         # an empty L2 and no statement that anything had been *seen and
         # rejected* — which reads as "never remembered" and is the one answer
@@ -1678,92 +1875,37 @@ def recall_l2(query: str, top_k: int, errors: list = None,
                                             "'degraded' entry for the reason.",
                                        semantic=semantic)}
 
-    try:
-        import lancedb
-    except ImportError as e:
-        return _fail(f"lancedb not importable ({e}); run under the project venv")
-
-    try:
-        l2 = Path(hermes_home()) / "memory" / "l2"
-        if not l2.exists():
-            return _fail(f"l2 directory missing: {l2}")
-        db = lancedb.connect(str(l2))
-        names = getattr(db, "list_tables", None)
-        nlist = names() if callable(names) else db.table_names()
-        if not isinstance(nlist, (list, tuple)):
-            nlist = getattr(nlist, "tables", []) or [nlist]
-        tables = [t.name if hasattr(t, "name") else str(t) for t in nlist]
-        if "memories" not in tables:
-            return _fail("no 'memories' table")
-        table = db.open_table("memories")
-        arr = table.to_arrow()
-        if "content" not in arr.column_names:
-            return _fail("'memories' table has no content column")
-        contents = arr["content"].to_pylist()
-        agents = (arr["agent"].to_pylist() if "agent" in arr.column_names
-                  else [None] * len(contents))
-        projects = (arr["project"].to_pylist() if "project" in arr.column_names
-                    else [None] * len(contents))
-        if not (l2_query_terms(query) or l2_phrase_terms(query)):
-            return {"hits": [],
-                    "ranking": _l2_ranking(True, floor, floor_source,
-                                           semantic=semantic)}
-        hits, filtered = [], 0
-        for c, ag, pj in zip(contents, agents, projects):
-            c = str(c or "")
-            if not c:
-                continue
-            pj = str(pj) if pj else ""
-            # A project-scoped query still sees global facts (project IS NULL):
-            # "SecretStore runs on the NAS" is true wherever you ask from. What
-            # it must not see is *another* project's facts.
-            if project and pj and pj != project:
-                continue
-            score = l2_lexical_score(query, c)
-            if score <= 0:
-                continue
-            if score < floor:
-                filtered += 1
-                continue
-            hit = {"layer": "l2", "content": c[:600],
-                   "score": round(score, 4),
-                   "score_basis": "lexical-dis-max"}
-            if ag:
-                hit["agent"] = ag
-            if pj:
-                hit["project"] = pj
-            hits.append(hit)
-        # Ranked, then cut — the old code took the first top_k in write order
-        # and never said it had dropped anything.
-        hits.sort(key=lambda h: h["score"], reverse=True)
-        kept = hits[:max(int(top_k or 0), 0)]
-        _touch_l2_usage([h.get("content", "") for h in kept])
-        # A lexical answer reached *after* a working vector channel came back
-        # empty is a degradation, and the ranking has to say so: the caller is
-        # otherwise reading wording-level scores while believing it got a
-        # meaning-level search. `near_miss` rides along for the same reason
-        # `filtered_out` does — the rejected candidates are the evidence for
-        # what the vector channel saw.
-        if semantic is not None and semantic.get("available") \
-                and not semantic.get("hits"):
-            ranking = _l2_ranking(
-                True, floor, floor_source, filtered, len(hits) - len(kept),
-                note=("DEGRADED: the vector channel was available but every "
-                      "candidate fell below its floor "
-                      f"({semantic.get('floor')}), so these hits are lexical. "
-                      "See 'semantic.near_miss' for what the vector channel "
-                      "rejected — do not read an empty L2 as 'nothing was "
-                      "remembered'."),
-                basis="lexical-dis-max", semantic=semantic)
-            if semantic.get("near_miss"):
-                ranking["near_miss"] = semantic["near_miss"]
-            return {"hits": kept, "ranking": ranking}
-        return {"hits": kept,
-                "ranking": _l2_ranking(True, floor, floor_source, filtered,
-                                       len(hits) - len(kept),
+    if not (l2_query_terms(query) or l2_phrase_terms(query)):
+        return {"hits": [],
+                "ranking": _l2_ranking(True, floor, floor_source,
                                        semantic=semantic)}
-    except Exception as e:  # noqa: BLE001
-        return _fail(str(e)[:200])
+    lex = _l2_lexical_hits(query, top_k, project, floor)
+    if not lex["ok"]:
+        return _fail(lex["error"])
+    # A lexical answer reached *after* a working vector channel came back
+    # empty is a degradation, and the ranking has to say so: the caller is
+    # otherwise reading wording-level scores while believing it got a
+    # meaning-level search. `near_miss` rides along for the same reason
+    # `filtered_out` does — the rejected candidates are the evidence for
+    # what the vector channel saw.
+    if semantic is not None and semantic.get("available") \
+            and not semantic.get("hits"):
+        ranking = _l2_ranking(
+            True, floor, floor_source, lex["filtered"], lex["truncated"],
+            note=("DEGRADED: the vector channel was available but every "
+                  "candidate fell below its floor "
+                  f"({semantic.get('floor')}), so these hits are lexical. "
+                  "See 'semantic.near_miss' for what the vector channel "
+                  "rejected — do not read an empty L2 as 'nothing was "
+                  "remembered'."),
+            basis="lexical-dis-max", semantic=semantic)
+        if semantic.get("near_miss"):
+            ranking["near_miss"] = semantic["near_miss"]
+        return {"hits": lex["hits"], "ranking": ranking}
+    return {"hits": lex["hits"],
+            "ranking": _l2_ranking(True, floor, floor_source,
+                                   lex["filtered"], lex["truncated"],
+                                   semantic=semantic)}
 
 
 
