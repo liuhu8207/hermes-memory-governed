@@ -1406,6 +1406,66 @@ def _eval_hit(got: str, expect: str) -> bool:
     return g in e or e in g
 
 
+def cmd_bench(config: dict, split: str = "dev", top_k: int = 5,
+              engine_kind: str = "cli") -> dict:
+    """Hard-negative 检索评测：正确答案旁边埋着像它的错答案，看排序会不会被骗。
+
+    与 :func:`cmd_eval` 的分工——两者测的不是同一件事：
+
+    * ``eval`` 的默认自查询集（问句 = 事实本身）测**通道健康**：分数换算、
+      门槛、通道退化。它测不出分辨力，因为正确答案一定在库里且问句就是它。
+    * ``bench`` 问的是 agent 真正会问的那种句子（「L2 现在多少行」），
+      库里同时存在新旧两个值。它报的是 ``rank_of_answer`` 与
+      ``negatives_ranked_above``，所以 ``hit@k=1.0`` 但答案排在第 6 位的
+      那种情况会被看见——而那正是 top_k 截断会把答案切掉的地方。
+
+    判定口径与实现细节见 ``plugin/memory_governed/_bench.py`` 的模块文档，
+    那里记了两版判定各自测到了什么（第一版按子串匹配，量的是我的措辞
+    而不是检索能力，heldout 因此报了 0.0）。
+
+    Returns:
+        ``{ok, basis, split, answer_at_1, ..., items, notes}``。``ok`` 只表示
+        评测跑完了，**不表示检索通过** —— 分数自己会说话，不设橡皮章门槛。
+    """
+    try:
+        bench = plugin_module("_bench")
+    except Exception as e:  # noqa: BLE001
+        return _refusal(f"bench module unavailable: {type(e).__name__}: {e}")
+
+    engine = None
+    engine_name = "cli-recall_l2"
+    if str(engine_kind).lower() == "plugin":
+        try:
+            engine = plugin_module("_recall").RecallEngine(plugin_config())
+            engine_name = "plugin-recall"
+        except Exception as e:  # noqa: BLE001 — 要报出来，不能静默换引擎
+            return _refusal(
+                f"plugin engine unavailable: {type(e).__name__}: {e}",
+                hint="omit --engine plugin to use the CLI path")
+
+    if engine is None:
+        def _search(query: str, k: int) -> list[str]:
+            res = recall_l2(query, k, [], project="")
+            return [str(h.get("content") or "") for h in res.get("hits", [])]
+    else:
+        def _search(query: str, k: int) -> list[str]:
+            return [str(getattr(r, "content", "") or "")
+                    for r in engine.admitted_l2(query, k)]
+
+    try:
+        report = bench.run_bench(_search, split=split, top_k=top_k,
+                                 engine_name=engine_name)
+    except ValueError as e:
+        return _refusal(str(e))
+
+    out = report.to_dict()
+    out["ok"] = True
+    out["basis"] = "hard-negative"
+    out["note"] = ("ok=true 表示评测跑完，不表示检索通过；"
+                   "看 answer_at_1 与 clean_pass_rate。")
+    return out
+
+
 def cmd_eval(config: dict, qa_file: str = "", top_k: int = 5,
              min_hit: float = 0.0, seed: int = 0,
              engine_kind: str = "cli") -> dict:
@@ -3095,6 +3155,18 @@ def build_parser() -> argparse.ArgumentParser:
                          "recall.l2_fusion). 'plugin' = the plugin engine the "
                          "agent actually runs, which does.")
 
+    bn = sub.add_parser("bench",
+                        help="Hard-negative recall bench: can retrieval tell "
+                             "the right answer from a look-alike wrong one")
+    bn.add_argument("--split", default="dev", choices=("dev", "heldout"),
+                    help="dev = negatives rewritten from the live store; "
+                         "heldout = a separate sample set, so a change that "
+                         "only helps dev is visible here")
+    bn.add_argument("--top-k", type=int, default=5)
+    bn.add_argument("--engine", default="cli", choices=("cli", "plugin"),
+                    help="Which retrieval path to measure (same meaning as "
+                         "eval --engine)")
+
     cz = sub.add_parser("consolidate", parents=[common],
                         help="Merge near-duplicate L2 facts (default dry-run)")
     cz.add_argument("--apply", action="store_true",
@@ -3246,6 +3318,9 @@ def main():
         out = cmd_eval(config, args.qa, args.top_k,
                        min_hit=args.min_hit, seed=args.seed,
                        engine_kind=args.engine)
+    elif args.cmd == "bench":
+        out = cmd_bench(config, split=args.split, top_k=args.top_k,
+                        engine_kind=args.engine)
     elif args.cmd == "transcribe":
         out = cmd_transcribe(config, args.path,
                              getattr(args, "timeout", None),
