@@ -2575,14 +2575,32 @@ def dump_frontmatter(meta: dict) -> str:
     return "\n".join(lines)
 
 
+def _kb_search_includes_archived(config: dict) -> bool:
+    """检索是否纳入归档笔记（``kb.search_archived``，默认排除）。
+
+    与 ``plugin.memory_governed._kb._search_includes_archived`` 同规则：CLI
+    不能依赖插件加载，插件也不反向 import CLI，所以这条判断在两侧各存一份，
+    由 ``tests/test_kb_recall_channel.py`` 钉住一致性。
+
+    这条路径曾经完全没有归档过滤，于是 ``hgm_recall`` 的 KB 通道照样把
+    ``archive/chats/`` 里的旧聊天记录顶到前排 —— 插件侧修了，CLI 侧没修，
+    两条检索路径给出两个答案，而调用方（agent）只看得到 CLI 那条。
+    """
+    return bool(config.get("kb", {}).get("search_archived", False))
+
+
 def cmd_kb_search(config: dict, query: str, top_k: int, section: str,
                   errors: list = None) -> list:
     # No section -> search the whole vault, not a fixed list of sections.
     subdirs = [section] if section else None
     tokens = re.findall(r"[\w\u4e00-\u9fff]+", query)
+    include_archived = _kb_search_includes_archived(config)
     results = []
     for p in iter_notes(config, subdirs, errors):
         meta, body = parse_frontmatter(p.read_text(encoding="utf-8", errors="replace"))
+        if not include_archived and \
+                str(meta.get("status", "") or "").strip().lower() == "archived":
+            continue
         title = meta.get("title") or p.stem
         hay = f"{title} {body}".lower()
         score = sum(1 for t in tokens if t.lower() in hay)

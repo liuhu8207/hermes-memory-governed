@@ -715,3 +715,75 @@ class TestArchivedNotesStayOutOfSearch:
         titles = [r["title"] for r in kb.search("遗忘规则", top_k=10)]
         assert "旧结论" not in titles
         assert "现行结论" in titles
+
+
+# ---------------------------------------------------------------------------
+# The CLI search path must obey the same archive policy (2026-10-18)
+# ---------------------------------------------------------------------------
+
+class TestCliKbSearchObeysArchivePolicy:
+    """``memory_cli.cmd_kb_search`` 是 MCP 两个工具（``hgm_recall`` 的 KB 通道与
+    ``hgm_kb_search``）**唯一**的检索实现。
+
+    它是 CLI 里一份独立的纯词法拷贝，不调用 ``KnowledgeBase.search``，所以插件侧
+    加的 ``search_archived`` 开关对它完全无效。实测后果：插件修好之后，
+    ``hgm_recall("Hermes Gateway 重启方法 schtasks")`` 仍然把
+    ``archive/chats/2026-05-07_....md`` 这类旧聊天记录顶进前 3 条 —— agent 看到
+    的是 CLI 那条路径，于是「已修复」是假的。
+
+    两条路径给出两个答案时，agent 只能看到其中一个，所以这里钉死它们一致。
+    """
+
+    @staticmethod
+    def _vault(tmp_path: Path, notes: dict[str, str]) -> dict:
+        wiki = tmp_path / "wiki"
+        for rel, body in notes.items():
+            p = wiki / rel
+            p.parent.mkdir(parents=True, exist_ok=True)
+            p.write_text(body, encoding="utf-8")
+        return {"wiki_dir": str(wiki), "kb": {"recall_min_kw_score": 0.0}}
+
+    def test_archived_is_excluded_from_the_cli_path(self, tmp_path):
+        import memory_cli
+
+        config = self._vault(tmp_path, {
+            "archive/chats/旧聊天记录.md": _ARCHIVED,
+            "notes/现行结论.md": _LIVE,
+        })
+        titles = [r["title"] for r in memory_cli.cmd_kb_search(
+            config, "遗忘规则", 10, "")]
+        assert "旧结论" not in titles
+        assert "现行结论" in titles
+
+    def test_the_switch_restores_archived_on_the_cli_path(self, tmp_path):
+        import memory_cli
+
+        config = self._vault(tmp_path, {
+            "archive/chats/旧聊天记录.md": _ARCHIVED,
+            "notes/现行结论.md": _LIVE,
+        })
+        config["kb"]["search_archived"] = True
+        titles = [r["title"] for r in memory_cli.cmd_kb_search(
+            config, "遗忘规则", 10, "")]
+        assert "旧结论" in titles
+
+    def test_a_note_without_status_is_still_found(self, tmp_path):
+        # 缺 status 是常态（导入件 / agent 直接写入）。把「读不到 status」
+        # 当成归档，会让清一次索引后的整库笔记集体消失。
+        import memory_cli
+
+        config = self._vault(tmp_path, {
+            "notes/无状态.md": "# 无状态\n\n没有 status 字段的普通笔记。\n"})
+        assert memory_cli.cmd_kb_search(config, "普通笔记", 10, "")
+
+    def test_cli_and_plugin_agree_on_the_policy(self, tmp_path):
+        # 「一个存储一个答案」：两侧默认值与开关语义必须一致，否则修了一边
+        # 只会制造一个新的不一致。
+        import memory_cli
+        from plugin.memory_governed._kb import _search_includes_archived
+
+        cfg = GovernedMemoryConfig()
+        assert memory_cli._kb_search_includes_archived({}) is False
+        assert _search_includes_archived(cfg) is False
+        assert memory_cli._kb_search_includes_archived(
+            {"kb": {"search_archived": True}}) is True
