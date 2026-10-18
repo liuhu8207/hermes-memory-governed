@@ -628,3 +628,90 @@ class TestKbHintTraceTouch:
 
         engine = RecallEngine(cfg, kb=_NoTouch())
         assert len(engine._search_kb("q")) == 1
+
+
+# ---------------------------------------------------------------------------
+# Archived notes must not outrank live ones (2026-10-18)
+# ---------------------------------------------------------------------------
+
+_ARCHIVED = """---
+title: "旧结论"
+status: "archived"
+tags: ["遗忘规则", "阈值"]
+---
+
+遗忘规则与低分遗忘阈值的历史讨论残片，末句断在半句。
+"""
+
+_LIVE = """---
+title: "现行结论"
+status: "curated"
+---
+
+遗忘规则与低分遗忘阈值的现行配置说明。
+"""
+
+
+class TestArchivedNotesStayOutOfSearch:
+    """``status: archived`` 的笔记默认不参与检索。
+
+    修的是排序席位，不是内容：归档笔记此前与在用笔记在同一个索引里平等竞争，
+    实测查「遗忘规则 低分遗忘 阈值」返回的前 3 条全是归档碎片 —— 而那批导入件
+    正文本身就是截断的，关键词密度反而更高，最不完整的内容排在最前。
+    """
+
+    def test_archived_is_excluded_by_default(self, tmp_path):
+        kb = _make_kb(tmp_path, {
+            "archive/旧结论.md": _ARCHIVED,
+            "notes/现行结论.md": _LIVE,
+        })
+        titles = [r["title"] for r in kb.search("遗忘规则", top_k=10)]
+        assert "旧结论" not in titles
+        assert "现行结论" in titles
+
+    def test_the_switch_restores_the_old_behaviour(self, tmp_path):
+        # Excluding is a policy, not a deletion: 「考古」式查询仍要够得着历史。
+        kb = _make_kb(tmp_path, {
+            "archive/旧结论.md": _ARCHIVED,
+            "notes/现行结论.md": _LIVE,
+        })
+        kb._config.kb.search_archived = True
+        titles = [r["title"] for r in kb.search("遗忘规则", top_k=10)]
+        assert "旧结论" in titles
+
+    def test_a_note_without_status_is_not_treated_as_archived(self, tmp_path):
+        # 缺 status 是绝大多数笔记的常态（导入件、agent 直接写入）。若把
+        # 「读不到 status」当成归档，清一次索引就会让整库笔记集体消失。
+        kb = _make_kb(tmp_path, {"notes/无状态.md": "# 无状态\n\n没有 status 字段的普通笔记。\n"})
+        titles = [r["title"] for r in kb.search("普通笔记", top_k=10)]
+        assert titles
+
+    def test_the_semantic_channel_is_gated_too(self, tmp_path):
+        # 语义通道走自己的向量索引，不经过 notes 列表；只过滤关键词通道的话，
+        # 归档笔记换个召回路径就又回来了。两个通道必须是同一把尺子。
+        kb = _make_kb(tmp_path, {
+            "archive/旧结论.md": _ARCHIVED,
+            "notes/现行结论.md": _LIVE,
+        })
+
+        class _Idx:
+            available = True
+
+            def search(self, query, k):
+                return [
+                    {"path": "archive/旧结论.md", "text": "x", "score": 0.95,
+                     "kind": "semantic"},
+                    {"path": "notes/现行结论.md", "text": "y", "score": 0.60,
+                     "kind": "semantic"},
+                ]
+
+            def path_mtimes(self):
+                return {}
+
+            def upsert(self, *a, **kw):
+                return None
+
+        kb._index_get = lambda: _Idx()
+        titles = [r["title"] for r in kb.search("遗忘规则", top_k=10)]
+        assert "旧结论" not in titles
+        assert "现行结论" in titles

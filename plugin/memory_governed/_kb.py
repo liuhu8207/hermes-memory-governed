@@ -323,6 +323,21 @@ def _enrich_note(title: str, body: str, config: Any) -> Dict[str, Any]:
         return {}
 
 
+def _is_archived(note: "_Note") -> bool:
+    """这篇笔记是否标记为归档。
+
+    只认 frontmatter 的 ``status``。目录名（``archive/``）不作为判据：
+    写入路径靠 ``status`` 决定落到哪个区，目录与状态可能因人工整理而
+    暂时不同步，以 ``status`` 为准才不会把在用笔记误判掉。
+    """
+    return str(note.meta.get("status", "") or "").strip().lower() == "archived"
+
+
+def _search_includes_archived(kb_cfg) -> bool:
+    """检索是否纳入归档笔记（``kb.search_archived``，默认排除）。"""
+    return bool(getattr(kb_cfg, "search_archived", False))
+
+
 class _Note:
     """一篇笔记的内存表示。"""
 
@@ -1380,6 +1395,10 @@ class KnowledgeBase:
         top_k = max(1, min(int(top_k), 50))
         status = self._ensure_fresh_index()
         notes = self._iter_notes()
+        archived_rels: set[str] = set()
+        if not _search_includes_archived(self._config.kb):
+            archived_rels = {self._rel(n.path) for n in notes if _is_archived(n)}
+            notes = [n for n in notes if not _is_archived(n)]
         if section:
             notes = [n for n in notes if n.section == section]
 
@@ -1438,6 +1457,12 @@ class KnowledgeBase:
             usage_hits = self._usage_store().hits()
 
         note_by_rel: Dict[str, _Note] = {self._rel(n.path): n for n in notes}
+
+        # 语义通道走自己的向量索引，不经过 ``notes`` 列表，所以上面那道归档
+        # 过滤对它无效 —— 归档笔记仍会经 ``sem_norm`` 流进下面的融合集合。
+        # 用上面记下的 ``archived_rels`` 再卡一次，两个通道才是同一把尺子。
+        if archived_rels:
+            sem_norm = {k: v for k, v in sem_norm.items() if k not in archived_rels}
 
         # 每个返回项都带上同一份索引新鲜度快照。字段只放标量计数，不放
         # ``missing_paths`` 这类长列表，免得把每条结果都撑成一屏。

@@ -27,11 +27,59 @@ logger = setup_logging("scope_recall_bridge")
 
 HERMES_HOME = bootstrap(__file__)
 MEMORY_DIR = env_path("HERMES_MEMORY_DIR", HERMES_HOME / "memory")
-WIKI_DIR = env_path("WIKI_DIR", HERMES_HOME / "wiki")
 CRON_OUTPUT = env_path("CRON_OUTPUT_DIR", HERMES_HOME / "cron" / "output")
 BRIDGE_DIR = env_path("BRIDGE_DIR", CRON_OUTPUT / "scope_recall_bridge")
 BRIDGE_JSONL = env_path("BRIDGE_JSONL", BRIDGE_DIR / "candidates.jsonl")
 BRIDGE_REPORT = env_path("BRIDGE_REPORT", BRIDGE_DIR / "last_export.json")
+
+
+def _configured_wiki_dir() -> Path:
+    """Resolve the wiki root the way the plugin does.
+
+    The plugin reads ``wiki_dir`` out of ``governed_memory.json`` and lets
+    ``GOVERNED_WIKI_DIR`` override it. This script used to fall straight back to
+    ``$HERMES_HOME/wiki`` and read no config at all, so on any install where the
+    vault lives outside the hermes home it pointed at a directory that does not
+    exist — and, because a missing directory yields no candidates rather than an
+    error, the export reported zero on every run without ever looking wrong.
+    Measured 2026-10-18: configured ``wiki_dir`` was ``C:/Users/<user>/wiki``
+    while the bridge looked under ``$HERMES_HOME/wiki``.
+    """
+    val = os.environ.get("GOVERNED_WIKI_DIR") or os.environ.get("WIKI_DIR")
+    if val:
+        return Path(val)
+    cfg = HERMES_HOME / "governed_memory.json"
+    try:
+        if cfg.is_file():
+            data = json.loads(cfg.read_text(encoding="utf-8-sig"))
+            if isinstance(data, dict) and data.get("wiki_dir"):
+                return Path(str(data["wiki_dir"]))
+    except (OSError, ValueError) as exc:
+        logger.warning("wiki_dir unreadable in %s: %s", cfg, exc)
+    return HERMES_HOME / "wiki"
+
+
+WIKI_DIR = _configured_wiki_dir()
+
+#: Wiki subdirectories the bridge reads. Overridable because the wiki layout is a
+#: convention, not a contract: the install guide describes a PARA-style tree
+#: (``knowledge/concepts`` + ``knowledge/categories``) while a working vault that
+#: accumulates notes through daily use ends up with them under ``notes/``. A
+#: hardcoded pair of subdirectories therefore exports zero candidates forever,
+#: and reports success on every run — measured 2026-10-18 on a vault whose 21
+#: notes all sat in ``notes/`` while both configured subdirectories were empty.
+#:
+#: Set ``BRIDGE_WIKI_SUBDIRS`` (comma-separated, wiki-relative) to match your own
+#: layout. Listed deepest-agnostic: order does not matter, missing directories
+#: are skipped. ``archive/`` is deliberately absent — archived notes are history,
+#: not promotion candidates.
+WIKI_BRIDGE_SUBDIRS = tuple(
+    s.strip()
+    for s in os.environ.get(
+        "BRIDGE_WIKI_SUBDIRS", "knowledge/concepts,knowledge/categories,notes,areas,inbox"
+    ).split(",")
+    if s.strip()
+)
 
 SAFE_TARGETS = {"user", "memory", "project", "ops"}
 SECRET_PATTERNS = [
@@ -126,10 +174,31 @@ def stable_id(prefix: str, content: str, source_path: str) -> str:
     return f"{prefix}-{digest.hexdigest()[:24]}"
 
 
+#: Frontmatter keys that carry no reviewable content. They sit between the
+#: opening ``---`` and the closing one, so skipping only the delimiters left
+#: them in the summary: a candidate promoted on that text would carry
+#: ``title: "..." type: "notes" tags: [...]`` into L1 instead of the note body.
+_FM_KEY_SKIP = (
+    "title", "type", "source", "date", "category", "concepts", "tags",
+    "updated", "created", "status", "confidence", "source_path", "输出文件",
+)
+
+
 def compact_summary(text: str, limit: int = 240) -> str:
     lines = []
+    in_frontmatter = False
     for raw in text.splitlines():
-        line = raw.strip().strip("#").strip()
+        line = raw.strip()
+        if line == "---":
+            # The opening delimiter flips the flag; the closing one is skipped
+            # by the branch below because ``in_frontmatter`` is already True.
+            in_frontmatter = not in_frontmatter
+            continue
+        if in_frontmatter:
+            key = line.split(":", 1)[0].strip() if ":" in line else ""
+            if key in _FM_KEY_SKIP or not line:
+                continue
+        line = line.strip("#").strip()
         if not line or line.startswith(("---", "source_path:", "输出文件:")):
             continue
         lines.append(line)
@@ -236,14 +305,12 @@ def collect_candidates() -> list[dict]:
                     candidates.append(rec)
 
     # Wiki knowledge (if exists)
-    knowledge_dir = WIKI_DIR / "knowledge"
-    if knowledge_dir.exists():
-        for subdir in ["concepts", "categories"]:
-            for path in (knowledge_dir / subdir).glob("*.md"):
-                if path.is_file():
-                    rec = source_record(path, "project", "wiki", 0.6)
-                    if rec:
-                        candidates.append(rec)
+    for subdir in WIKI_BRIDGE_SUBDIRS:
+        for path in (WIKI_DIR / subdir).glob("*.md"):
+            if path.is_file():
+                rec = source_record(path, "project", "wiki", 0.6)
+                if rec:
+                    candidates.append(rec)
 
     logger.info("collected %d candidates", len(candidates))
     return candidates
