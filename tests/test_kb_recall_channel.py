@@ -787,3 +787,79 @@ class TestCliKbSearchObeysArchivePolicy:
         assert _search_includes_archived(cfg) is False
         assert memory_cli._kb_search_includes_archived(
             {"kb": {"search_archived": True}}) is True
+
+
+# ---------------------------------------------------------------------------
+# One unreadable note must not take the whole vault walk down (2026-10-18)
+# ---------------------------------------------------------------------------
+
+class TestUnreadableNoteDoesNotSinkTheSearch:
+    """单个读不出来的笔记不能让整次检索抛错。
+
+    ``iter_notes`` 对 ``is_file()`` 抛 OSError 早有兜底，但真正的
+    ``p.read_text()`` 一直是裸的：文件被同步客户端占用、ACL 半恢复、或遍历
+    途中被移走，都会把异常抛出 ``cmd_kb_search``。
+
+    后果不是"少一条结果"而是"整次检索失败"—— ``hgm_recall`` 走协议错误，
+    ``hgm_kb_search`` 什么都不返回。一个坏文件被读成"整个库是空的"。
+    """
+
+    @staticmethod
+    def _vault_with_one_poisoned_note(tmp_path: Path) -> dict:
+        wiki = tmp_path / "wiki"
+        good = wiki / "notes" / "好笔记.md"
+        good.parent.mkdir(parents=True, exist_ok=True)
+        good.write_text(
+            "---\ntitle: \"好笔记\"\n---\n\n统一身份认证的配置说明。\n",
+            encoding="utf-8")
+        bad = wiki / "notes" / "坏笔记.md"
+        bad.write_text("---\ntitle: \"坏笔记\"\n---\n\n读不出来的文件。\n",
+                       encoding="utf-8")
+        return {"wiki_dir": str(wiki), "kb": {"recall_min_kw_score": 0.0}}, bad
+
+    @staticmethod
+    def _poison(path: Path, monkeypatch) -> None:
+        real = Path.read_text
+
+        def fake(self, *a, **kw):
+            if self.name == "坏笔记.md":
+                raise PermissionError(13, "Permission denied")
+            return real(self, *a, **kw)
+
+        monkeypatch.setattr(Path, "read_text", fake)
+
+    def test_kb_search_skips_the_bad_note_and_keeps_going(
+            self, tmp_path, monkeypatch):
+        import memory_cli
+
+        config, _ = self._vault_with_one_poisoned_note(tmp_path)
+        self._poison(Path(config["wiki_dir"]) / "notes" / "坏笔记.md",
+                     monkeypatch)
+        results = memory_cli.cmd_kb_search(config, "统一身份认证", 10, "")
+        assert [r["title"] for r in results] == ["好笔记"]
+
+    def test_the_skip_is_reported_not_silent(self, tmp_path, monkeypatch):
+        # 静默跳过和"库里真没有"对调用方长得一模一样，所以跳过的文件要报出来。
+        import memory_cli
+
+        config, bad = self._vault_with_one_poisoned_note(tmp_path)
+        self._poison(bad, monkeypatch)
+        errors: list = []
+        memory_cli.cmd_kb_search(config, "统一身份认证", 10, "", errors)
+        assert any("坏笔记" in e and "unreadable" in e for e in errors), errors
+
+    def test_kb_get_survives_a_bad_note_elsewhere(self, tmp_path, monkeypatch):
+        import memory_cli
+
+        config, bad = self._vault_with_one_poisoned_note(tmp_path)
+        self._poison(bad, monkeypatch)
+        got = memory_cli.cmd_kb_get(config, "好笔记")
+        assert got["ok"] and got["title"] == "好笔记"
+
+    def test_the_provenance_walk_counts_the_rest(self, tmp_path, monkeypatch):
+        import memory_cli
+
+        config, bad = self._vault_with_one_poisoned_note(tmp_path)
+        self._poison(bad, monkeypatch)
+        report = memory_cli.cmd_agents(config)
+        assert not report.get("kb_error"), report.get("kb_error")

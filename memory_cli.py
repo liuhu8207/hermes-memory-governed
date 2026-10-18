@@ -2211,7 +2211,14 @@ def cmd_agents(config: dict) -> dict:
     # vault notes
     try:
         for p in iter_notes(config):
-            meta, _ = parse_frontmatter(p.read_text(encoding="utf-8", errors="replace"))
+            # Per-note, not per-report: one unreadable file used to abort the
+            # whole provenance walk and land in ``kb_error``, so a single locked
+            # note zeroed out every agent's kb_notes count.
+            try:
+                raw = p.read_text(encoding="utf-8", errors="replace")
+            except OSError:
+                continue
+            meta, _ = parse_frontmatter(raw)
             a = note_agent(meta)
             if not a:
                 out["unattributed"] += 1
@@ -2597,7 +2604,21 @@ def cmd_kb_search(config: dict, query: str, top_k: int, section: str,
     include_archived = _kb_search_includes_archived(config)
     results = []
     for p in iter_notes(config, subdirs, errors):
-        meta, body = parse_frontmatter(p.read_text(encoding="utf-8", errors="replace"))
+        # One unreadable note must not take the whole search down.
+        # ``iter_notes`` already tolerates ``is_file()`` raising OSError, but the
+        # read itself was unguarded: a note held open by a sync client, a
+        # half-restored ACL, or a file vanishing mid-walk raised out of here, so
+        # ``hgm_recall`` returned a protocol error and ``hgm_kb_search`` returned
+        # nothing at all — one bad file read as "the vault is empty".
+        # Skipped notes are named in ``errors`` for the same reason refusals are:
+        # a silent skip and a genuinely empty vault look identical otherwise.
+        try:
+            raw = p.read_text(encoding="utf-8", errors="replace")
+        except OSError as exc:
+            if errors is not None:
+                errors.append(f"skipped: '{p}' unreadable ({type(exc).__name__}: {exc})")
+            continue
+        meta, body = parse_frontmatter(raw)
         if not include_archived and \
                 str(meta.get("status", "") or "").strip().lower() == "archived":
             continue
@@ -2623,7 +2644,14 @@ def cmd_kb_get(config: dict, title: str):
     """
     target = slugify(title).lower()
     for p in iter_notes(config):
-        meta, body = parse_frontmatter(p.read_text(encoding="utf-8", errors="replace"))
+        # An unreadable note must not make a readable one unfindable: the caller
+        # asked for one title, and a locked file elsewhere in the vault is not an
+        # answer to that question.
+        try:
+            raw = p.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            continue
+        meta, body = parse_frontmatter(raw)
         if (meta.get("title") or p.stem).lower() == target or p.stem.lower() == target:
             return {"ok": True, "title": meta.get("title") or p.stem,
                     "path": str(p), "meta": meta, "body": body}
