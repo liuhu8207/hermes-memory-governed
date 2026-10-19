@@ -44,6 +44,65 @@ logger = logging.getLogger(__name__)
 VAULT_SUBDIRS = ["inbox", "notes", "projects", "areas", "resources", "archive",
                  "knowledge"]
 
+#: 受控分类词表（``category`` frontmatter 字段的唯一合法取值）。
+#:
+#: 为什么不在 ``tags`` 上做文章：``tags`` 是自由文本，实测库内中英混写、
+#: 粒度不一（``["nas", "硬件", "飞牛", "i3-N305"]`` 里既有概念又有实例还有
+#: 语言），既不能被人预测，也不能被机器判定归属。分类要可用，取值必须是
+#: **封闭集合**：写的人从里面选，读的人知道会读到什么。
+#:
+#: 社区实践（Obsidian/PKM 圈的长期争论）收敛到同一条：纯文件夹会造出第二套
+#: 与链接结构竞争的并行分类法，纯 tag 又不可预测且无法浏览；可维护的方案是
+#: 「一个受控字段定类目 + 自动 MOC 按类目建索引」。这里就是那个受控字段，
+#: MOC 侧见 ``KnowledgeBase.rebuild_moc``。
+#:
+#: 分类依据**用途**而非主题（"我在拿这条笔记做什么"），主题交给 tags/concepts：
+#: 主题会无限增生，用途不会。新增类目请同步 ``docs/kb-taxonomy.md``。
+KB_CATEGORIES = [
+    "environment",   # 机器/网络/系统环境事实（本机、NAS、服务器、隧道）
+    "user",          # 用户画像与偏好（城市、硬件倾向、工作流习惯）
+    "tooling",       # 工具与服务的配置、选型、排障（Hermes、dsh、browser-skill）
+    "workflow",      # 流程与方法（怎么做事、步骤、约定）
+    "reference",     # 外部资料与规格（API 端点能力、硬件规格表）
+    "project",       # 具体项目的状态与决策
+    "synthesis",     # 跨笔记归纳卡（*_综合归纳）
+    "meta",          # 关于这套记忆系统本身
+]
+
+#: ``type`` frontmatter 的旧值与新 ``category`` 的映射（迁移用）。
+#: 旧值里 ``note``/``notes`` 只是 section 名重复，没有分类信息，不进映射。
+_TYPE_TO_CATEGORY = {
+    "category": "meta",
+    "moc": "meta",
+}
+
+#: 从 tags/concepts/title 推断 category 的关键词表。
+#: 顺序即优先级：先匹配到的赢。每条是 (category, [关键词小写])。
+_CATEGORY_HINTS: List[Tuple[str, List[str]]] = [
+    # 顺序即优先级：先匹配到的赢。顺序经过真实库标定 —— 把强信号放前面，
+    # 弱信号（"api" 这种到处都有的词）放后面，否则一篇讲某工具怎么装的笔记
+    # 会因为正文里出现过 "api" 被判成 reference。
+    ("synthesis", ["综合归纳", "synthesis"]),
+    ("meta", ["hermes", "shared memory", "共享记忆", "hgm", "记忆系统",
+              "governed", "plugin"]),
+    ("reference", ["规格", "spec", "端点", "endpoint", "支持规格", "能力",
+                   "capability", "选型"]),
+    # "配置" 单独出现时不作数：一篇讲 NAS 硬件事实的笔记标题里也有"配置"，
+    # 但它描述的是环境，不是工具怎么配。要判 tooling，得是"某工具的配置"。
+    ("tooling", ["dsh", "browser-skill", "bsk", "zcode", "mimo", "octop",
+                 "api", "config", "troubleshooting", "upgrade",
+                 "provider", "model", "gateway", "安装", "坑", "升级",
+                 "配置：", "配置:", "provider kind", "改配置"]),
+    ("user", ["用户", "偏好", "user", "preference", "工作流偏好",
+              "地理位置", "location"]),
+    ("environment", ["nas", "硬件", "hardware", "pc", "服务器", "server",
+                     "network", "网络", "wireguard", "vpn", "routeros",
+                     "homelab", "linux", "环境", "cpu", "内存", "存储",
+                     "ip", "ssh"]),
+    ("workflow", ["workflow", "工作流", "流程", "方法", "约定", "步骤"]),
+    ("project", ["project", "项目"]),
+]
+
 #: Windows / 通用文件系统非法字符（文件名用）
 _ILLEGAL_FS = re.compile(r'[<>:"/\\|?*\x00-\x1f]')
 
@@ -179,6 +238,45 @@ def parse_frontmatter(text: str) -> Tuple[Dict[str, Any], str]:
             pass
         data[key] = raw_value.strip("'\"")
     return data, body
+
+
+def normalize_category(value: Any) -> str:
+    """把任意输入归一成受控词表里的合法值；不合法/空 → ""。
+
+    大小写与空白都容忍（``" Environment "`` → ``"environment"``）。
+    返回 "" 表示「没有可用分类」，调用方按未分类处理 —— 绝不抛异常，
+    也绝不猜一个塞回去（坏分类比没分类更糟：它会让 MOC 分组说谎）。
+    """
+    if not isinstance(value, str):
+        return ""
+    v = value.strip().lower()
+    return v if v in KB_CATEGORIES else ""
+
+
+def infer_category(title: str, tags: Any, concepts: Any = None,
+                   body: str = "") -> str:
+    """从 title/tags/concepts 推断受控分类。推断不出 → ""（绝不硬猜）。
+
+    关键词全部小写比对，因此中文 tag 原样命中、英文 tag 大小写无关。
+    ``body`` 只在 title/tags/concepts 都没命中时参与，且只取前 400 字 ——
+    分类是导航属性，靠标题和元数据就该能定，正文只是最后的兜底。
+    """
+    def _as_list(v: Any) -> List[str]:
+        if isinstance(v, str):
+            return [v]
+        if isinstance(v, (list, tuple, set)):
+            return [str(x) for x in v]
+        return []
+
+    hay = " ".join(_as_list(tags) + _as_list(concepts) + [title or ""]).lower()
+    if not hay.strip():
+        hay = (body or "")[:400].lower()
+
+    for category, keywords in _CATEGORY_HINTS:
+        for kw in keywords:
+            if kw.lower() in hay:
+                return category
+    return ""
 
 
 def write_note(path: Path, meta: Dict[str, Any], body: str) -> None:

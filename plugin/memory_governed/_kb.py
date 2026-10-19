@@ -1907,6 +1907,7 @@ class KnowledgeBase:
         source: str = "",
         update: bool = False,
         confidence: Optional[float] = None,
+        category: Optional[str] = None,
     ) -> Dict[str, Any]:
         """写入/更新一篇笔记到 vault，并更新向量索引。
 
@@ -1917,6 +1918,10 @@ class KnowledgeBase:
         阈值决定 —— ``>= kb.confidence_threshold`` 进 ``notes``（正库），
         低于阈值进 ``inbox``（frontmatter 标 ``review_required``）；不传则
         按显式 ``section`` 落库（手动场景，行为不变）。
+
+        ``category`` 是受控分类（取值见 ``_vault.KB_CATEGORIES``）。显式传的
+        优先，非法值丢弃后走推断；推断不出则整个键不写。分类是**导航**属性，
+        不影响检索（检索全库扫描，见 ``iter_vault_notes``）。
 
         落库前对 title/body 过密钥闸门（fail-closed）：含密钥一律拒绝，
         绝不写入 vault。
@@ -1982,6 +1987,11 @@ class KnowledgeBase:
                     }
 
         now = time_str()
+        # 受控分类：调用方显式传的优先（非法值丢弃而非硬塞），否则按
+        # title/tags/concepts 推断。推断不出就**不写这个键** —— 空分类
+        # 会让 MOC 分组出现一个名为 "" 的桶，比没有分类更难读。
+        category = _vault.normalize_category(category) or _vault.infer_category(
+            title, tags, concepts, body)
         meta: Dict[str, Any] = {
             "title": title,
             "type": section,
@@ -1992,6 +2002,8 @@ class KnowledgeBase:
             "created": now,
             "updated": now,
         }
+        if category:
+            meta["category"] = category
         # 入库富化（kb.enrich 开启时）：一次 LLM 调用换 summary/questions
         # 进 frontmatter；失败返回 {}，写入照常 —— 富化绝不阻断落库。
         if bool(getattr(self._config.kb, "enrich", False)):
@@ -2299,6 +2311,137 @@ class KnowledgeBase:
             "reason": ("" if usage_available else
                        "no usage data (kb.affinity_enabled off?) — "
                        "archive evaluation skipped (fail-closed)"),
+        }
+
+    def rebuild_moc(self) -> Dict[str, Any]:
+        """按受控 ``category`` 重建根 ``index.md`` 导航（MOC）。
+
+        为什么是 MOC 而不是更多文件夹：文件夹只能表达一个归属，而一篇
+        「飞牛 NAS 硬件配置」同时属于 environment 和 reference；纯 tag 又
+        不可预测、也无法在文件管理器里浏览。MOC 让一篇笔记出现在多个
+        类目下，且整张导航由一个命令重建，不需要人维护。
+
+        归档区（``archive/``）不参与分组 —— 它是淘汰区，不是分类区。
+        未分类的笔记归到 ``Uncategorized`` 组并显式列出，让缺口可见
+        （而不是悄悄消失）。
+
+        返回 ``{ok, path, categories, notes, uncategorized, errors}``。
+        """
+        groups: Dict[str, List[Tuple[str, str]]] = {}
+        uncategorized: List[Tuple[str, str]] = []
+        errors: List[str] = []
+
+        for note in self._iter_notes():
+            # 判据是 frontmatter 的 status，不是目录名：``archive/superseded/``
+            # 下的笔记父目录叫 superseded，``note.section`` 取不到 archive ——
+            # 用目录名判会把归档件混进导航。约定见 ``_is_archived``。
+            if _is_archived(note):
+                continue
+            rel = self._rel(note.path)
+            cat = _vault.normalize_category(note.meta.get("category"))
+            if not cat:
+                # 旧笔记没有 category：按 title/tags/concepts 现推一个用于
+                # 展示，但**不写回 frontmatter**（迁移是显式动作，见
+                # ``migrate_categories``）—— 导航不该偷偷改数据。
+                cat = _vault.infer_category(
+                    note.title, note.tags, note.concepts, note.body)
+            entry = (note.title, rel)
+            if cat:
+                groups.setdefault(cat, []).append(entry)
+            else:
+                uncategorized.append(entry)
+
+        ordered = [c for c in _vault.KB_CATEGORIES if c in groups]
+        ordered += sorted(c for c in groups if c not in _vault.KB_CATEGORIES)
+
+        lines = ["# 知识库导航 (MOC)", ""]
+        lines.append("按受控分类自动生成（`memory_cli kb-moc` 重建）。"
+                     "分类取值见 `_vault.KB_CATEGORIES`。")
+        lines.append("")
+        for cat in ordered:
+            lines.append("## %s" % cat)
+            lines.append("")
+            for title, rel in sorted(groups[cat], key=lambda x: x[0].lower()):
+                lines.append("- [[%s]]" % title)
+            lines.append("")
+        if uncategorized:
+            lines.append("## Uncategorized")
+            lines.append("")
+            lines.append("这些笔记没有受控分类，也推不出来。"
+                         "用 `kb-add --category` 或 `kb-migrate-category` 补上。")
+            lines.append("")
+            for title, rel in sorted(uncategorized, key=lambda x: x[0].lower()):
+                lines.append("- [[%s]]" % title)
+            lines.append("")
+
+        index_path = self._vault / _vault._INDEX_FILENAME
+        try:
+            index_path.write_text("\n".join(lines).rstrip() + "\n",
+                                  encoding="utf-8")
+        except OSError as e:  # silent-ok: already-reported — 失败进返回值的 errors，调用方读得到
+            # _safe_str 而非 %s：异常对象的 __str__ 本身可能抛，那会把一次
+            # 优雅降级变成崩溃（tests/test_no_eager_exception_format.py 钉住）。
+            return {"ok": False,
+                    "error": "index.md write failed: %s" % _safe_str(e),
+                    "errors": [_safe_str(e)]}
+
+        return {
+            "ok": True,
+            "path": self._rel(index_path),
+            "categories": ordered,
+            "notes": sum(len(v) for v in groups.values()),
+            "uncategorized": len(uncategorized),
+            "errors": errors,
+        }
+
+    def migrate_categories(self, apply: bool = False) -> Dict[str, Any]:
+        """给缺 ``category`` 的存量笔记补上受控分类。
+
+        默认 dry-run —— 批量改 frontmatter 之前先报 scope。``--apply`` 才写盘。
+
+        只补**推断得出**的；推断不出的一律留在 ``proposed`` 之外并单独列出，
+        绝不写一个猜的值进去（错分类比缺分类更难发现，因为它看起来是结论）。
+        已有合法 ``category`` 的笔记不动 —— 人的判断压过机器的推断。
+        """
+        proposed: List[Dict[str, Any]] = []
+        skipped: List[Dict[str, Any]] = []
+        written: List[str] = []
+        errors: List[str] = []
+
+        for note in self._iter_notes():
+            if _is_archived(note):
+                continue
+            if _vault.normalize_category(note.meta.get("category")):
+                continue
+            rel = self._rel(note.path)
+            cat = _vault.infer_category(
+                note.title, note.tags, note.concepts, note.body)
+            if not cat:
+                skipped.append({"title": note.title, "path": rel,
+                                "reason": "no category could be inferred"})
+                continue
+            proposed.append({"title": note.title, "path": rel, "category": cat})
+            if apply:
+                try:
+                    meta = dict(note.meta)
+                    meta["category"] = cat
+                    _vault.write_note(note.path, meta, note.body)
+                    self._index_get().upsert(
+                        rel,
+                        _Note(note.path, note.title, meta,
+                              note.body).full_text,
+                        mtime=_file_mtime(note.path))
+                    written.append(rel)
+                except OSError as e:  # silent-ok: already-reported — per-item 失败聚合进返回的 errors，避免逐条 log 污染计数
+                    errors.append(f"write failed: {rel}: {_safe_str(e)}")
+
+        return {
+            "ok": True,
+            "applied": bool(apply),
+            "proposed": proposed,
+            "skipped": skipped,
+            "written": written,
+            "errors": errors,
         }
 
     def stats(self) -> Dict[str, Any]:

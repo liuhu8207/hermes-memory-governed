@@ -2912,6 +2912,76 @@ def slugify(title: str) -> str:
     return (name[:120].strip(" .") or "untitled")
 
 
+# --- 受控分类（与 plugin/memory_governed/_vault.py 同源，CLI 不能依赖插件加载）
+# 词表与关键词表在两侧必须一致：tests/test_kb_governance.py 钉住这一点 ——
+# 一个入口给一种分类，等于同一篇笔记有两个真相。
+KB_CATEGORIES = [
+    "environment", "user", "tooling", "workflow",
+    "reference", "project", "synthesis", "meta",
+]
+
+_CATEGORY_HINTS: List[Tuple[str, List[str]]] = [
+    # 顺序即优先级：先匹配到的赢。顺序经过真实库标定 —— 把强信号放前面，
+    # 弱信号（"api" 这种到处都有的词）放后面，否则一篇讲某工具怎么装的笔记
+    # 会因为正文里出现过 "api" 被判成 reference。
+    ("synthesis", ["综合归纳", "synthesis"]),
+    ("meta", ["hermes", "shared memory", "共享记忆", "hgm", "记忆系统",
+              "governed", "plugin"]),
+    ("reference", ["规格", "spec", "端点", "endpoint", "支持规格", "能力",
+                   "capability", "选型"]),
+    # "配置" 单独出现时不作数：一篇讲 NAS 硬件事实的笔记标题里也有"配置"，
+    # 但它描述的是环境，不是工具怎么配。要判 tooling，得是"某工具的配置"。
+    ("tooling", ["dsh", "browser-skill", "bsk", "zcode", "mimo", "octop",
+                 "api", "config", "troubleshooting", "upgrade",
+                 "provider", "model", "gateway", "安装", "坑", "升级",
+                 "配置：", "配置:", "provider kind", "改配置"]),
+    ("user", ["用户", "偏好", "user", "preference", "工作流偏好",
+              "地理位置", "location"]),
+    ("environment", ["nas", "硬件", "hardware", "pc", "服务器", "server",
+                     "network", "网络", "wireguard", "vpn", "routeros",
+                     "homelab", "linux", "环境", "cpu", "内存", "存储",
+                     "ip", "ssh"]),
+    ("workflow", ["workflow", "工作流", "流程", "方法", "约定", "步骤"]),
+    ("project", ["project", "项目"]),
+]
+
+
+def is_archived(meta):
+    """这篇笔记是否标记为归档。只认 frontmatter 的 ``status``。
+
+    目录名不作为判据：``archive/superseded/`` 下的笔记父目录叫 superseded，
+    取第一段目录名会漏判。与插件侧 ``_kb._is_archived`` 同源。
+    """
+    return str((meta or {}).get("status", "") or "").strip().lower() == "archived"
+
+
+def normalize_category(value):
+    """归一成受控词表里的合法值；不合法/空 → ""（绝不抛、绝不硬猜）。"""
+    if not isinstance(value, str):
+        return ""
+    v = value.strip().lower()
+    return v if v in KB_CATEGORIES else ""
+
+
+def infer_category(title, tags, concepts=None, body=""):
+    """从 title/tags/concepts 推断受控分类；推断不出 → ""。"""
+    def _as_list(v):
+        if isinstance(v, str):
+            return [v]
+        if isinstance(v, (list, tuple, set)):
+            return [str(x) for x in v]
+        return []
+
+    hay = " ".join(_as_list(tags) + _as_list(concepts) + [str(title or "")]).lower()
+    if not hay.strip():
+        hay = str(body or "")[:400].lower()
+    for category, keywords in _CATEGORY_HINTS:
+        for kw in keywords:
+            if kw.lower() in hay:
+                return category
+    return ""
+
+
 def dump_frontmatter(meta: dict) -> str:
     lines = ["---"]
     for k, v in meta.items():
@@ -3127,7 +3197,8 @@ def _normalize_for_dedup(text: str) -> str:
 
 def cmd_kb_add(config: dict, title: str, body: str, section: str,
                tags: list, concepts: list, confidence: float,
-               agent: str = DEFAULT_AGENT, overwrite: bool = False):
+               agent: str = DEFAULT_AGENT, overwrite: bool = False,
+               category: str = ""):
     """Write a governed note into the vault, attributed to ``agent``.
 
     Sharing a vault between agents turns the old "silently overwrite the file
@@ -3234,6 +3305,12 @@ def cmd_kb_add(config: dict, title: str, body: str, section: str,
             "status": _status_for_section(section), "tags": tags,
             "concepts": concepts, "agent": agent, "source": "agent-write",
             "created": created, "updated": now}
+    # 受控分类：与插件侧 KnowledgeBase.add 同一套词表与推断（CLI 不能依赖
+    # 插件加载，因此这里复用 _vault 的纯函数）。非法值丢弃后走推断。
+    category = normalize_category(category) or infer_category(
+        title.strip(), tags, concepts, body)
+    if category:
+        meta["category"] = category
     text = dump_frontmatter(meta) + "\n\n" + body.rstrip() + "\n"
 
     # Atomic write: one agent must never observe a half-written note. Failures
@@ -3306,6 +3383,106 @@ def cmd_kb_govern(config: dict, apply: bool = False) -> dict:
                         hint="check the vault path (wiki_dir) and that the "
                              "plugin imports cleanly (runtime command shows "
                              "the environment)")
+
+
+def cmd_kb_moc(config: dict) -> dict:
+    """按受控分类重建 vault 根 index.md 导航（MOC）。
+
+    分类是导航属性，不是检索属性：检索本来就全库扫描，MOC 只是让人和
+    文件管理器能按类目浏览。归档区不参与分组（淘汰区 ≠ 分类区）。
+    """
+    vault = wiki_dir(config)
+    groups = {}
+    uncategorized = []
+    for path in iter_notes(config):
+        try:
+            meta, body = parse_frontmatter(
+                path.read_text(encoding="utf-8", errors="replace"))
+        except OSError:
+            continue
+        title = meta.get("title") or path.stem
+        rel = str(path.relative_to(vault)).replace("\\", "/")
+        if is_archived(meta):
+            continue
+        cat = normalize_category(meta.get("category")) or infer_category(
+            title, meta.get("tags"), meta.get("concepts"), body)
+        if cat:
+            groups.setdefault(cat, []).append((title, rel))
+        else:
+            uncategorized.append((title, rel))
+
+    ordered = [c for c in KB_CATEGORIES if c in groups]
+    ordered += sorted(c for c in groups if c not in KB_CATEGORIES)
+
+    lines = ["# 知识库导航 (MOC)", "",
+             "按受控分类自动生成（`memory_cli kb-moc` 重建）。"
+             "分类取值见 `_vault.KB_CATEGORIES`。", ""]
+    for cat in ordered:
+        lines.append("## %s" % cat)
+        lines.append("")
+        for title, _rel in sorted(groups[cat], key=lambda x: x[0].lower()):
+            lines.append("- [[%s]]" % title)
+        lines.append("")
+    if uncategorized:
+        lines += ["## Uncategorized", "",
+                  "这些笔记没有受控分类，也推不出来。"
+                  "用 `kb-add --category` 或 `kb-migrate-category` 补上。", ""]
+        for title, _rel in sorted(uncategorized, key=lambda x: x[0].lower()):
+            lines.append("- [[%s]]" % title)
+        lines.append("")
+
+    index_path = vault / "index.md"
+    try:
+        index_path.write_text("\n".join(lines).rstrip() + "\n",
+                              encoding="utf-8")
+    except OSError as e:
+        return _refusal(f"cannot write index.md: {type(e).__name__}: {e}")
+
+    return {"ok": True, "path": str(index_path),
+            "categories": ordered,
+            "notes": sum(len(v) for v in groups.values()),
+            "uncategorized": len(uncategorized)}
+
+
+def cmd_kb_migrate_category(config: dict, apply: bool = False) -> dict:
+    """给缺受控分类的存量笔记补 category（默认 dry-run）。
+
+    只补推断得出的；已有合法分类的不动（人的判断压过机器的推断）；
+    推断不出的单独列出，绝不写一个猜的值 —— 错分类比缺分类更难发现。
+    """
+    proposed, skipped, written, errors = [], [], [], []
+    for path in iter_notes(config):
+        try:
+            meta, body = parse_frontmatter(
+                path.read_text(encoding="utf-8", errors="replace"))
+        except OSError:
+            continue
+        rel = str(path.relative_to(wiki_dir(config))).replace("\\", "/")
+        if is_archived(meta):
+            continue
+        if normalize_category(meta.get("category")):
+            continue
+        title = meta.get("title") or path.stem
+        cat = infer_category(title, meta.get("tags"), meta.get("concepts"), body)
+        if not cat:
+            skipped.append({"title": title, "path": rel,
+                            "reason": "no category could be inferred"})
+            continue
+        proposed.append({"title": title, "path": rel, "category": cat})
+        if apply:
+            try:
+                meta["category"] = cat
+                text = dump_frontmatter(meta) + "\n\n" + body.rstrip() + "\n"
+                fd, tmp = tempfile.mkstemp(dir=str(path.parent), suffix=".tmp")
+                with os.fdopen(fd, "w", encoding="utf-8") as f:
+                    f.write(text)
+                os.replace(tmp, path)
+                written.append(rel)
+            except OSError as e:
+                errors.append(f"write failed: {rel}: {type(e).__name__}: {e}")
+
+    return {"ok": True, "applied": bool(apply), "proposed": proposed,
+            "skipped": skipped, "written": written, "errors": errors}
 
 
 def _l2_threshold_drift() -> dict:
@@ -3482,6 +3659,24 @@ def build_parser() -> argparse.ArgumentParser:
     ka.add_argument("--overwrite", action="store_true",
                     help="Take over a note currently owned by another agent")
 
+    ka.add_argument("--category", default="",
+                    help="Controlled category (see _vault.KB_CATEGORIES); "
+                         "inferred from title/tags when omitted")
+
+    kmoc = sub.add_parser("kb-moc", parents=[common],
+                          help="Rebuild the vault index.md navigation (MOC) "
+                               "grouped by controlled category")
+    kmoc.add_argument("--yes", action="store_true",
+                      help="Confirm writing index.md (exit 10 without it)")
+
+    kmc = sub.add_parser("kb-migrate-category", parents=[common],
+                         help="Backfill the controlled category on notes that "
+                              "lack one (default dry-run)")
+    kmc.add_argument("--apply", action="store_true",
+                     help="Actually write frontmatter (default: report only)")
+    kmc.add_argument("--yes", action="store_true",
+                     help="Confirm the --apply (exit 10 without it)")
+
     kgo = sub.add_parser("kb-govern", parents=[common],
                          help="KB 治理巡检：晋升建议 + 自动归档（默认 dry-run）")
     kgo.add_argument("--apply", action="store_true",
@@ -3618,7 +3813,10 @@ def main():
     destructive = ((args.cmd == "retract" and not args.dry_run)
                    or (args.cmd == "kb-govern" and getattr(args, "apply", False))
                    or (args.cmd == "consolidate"
-                       and getattr(args, "apply", False)))
+                       and getattr(args, "apply", False))
+                   or (args.cmd == "kb-migrate-category"
+                       and getattr(args, "apply", False))
+                   or args.cmd == "kb-moc")
     if destructive and not getattr(args, "yes", False):
         out = {"ok": False,
                "error": "refusing a destructive action without --yes",
@@ -3688,7 +3886,12 @@ def main():
     elif args.cmd == "kb-add":
         out = cmd_kb_add(config, args.title, args.body, args.section,
                          args.tags, args.concepts, args.confidence,
-                         agent=agent, overwrite=args.overwrite)
+                         agent=agent, overwrite=args.overwrite,
+                         category=getattr(args, "category", ""))
+    elif args.cmd == "kb-moc":
+        out = cmd_kb_moc(config)
+    elif args.cmd == "kb-migrate-category":
+        out = cmd_kb_migrate_category(config, apply=args.apply)
     elif args.cmd == "kb-govern":
         out = cmd_kb_govern(config, apply=args.apply)
     elif args.cmd == "remember":

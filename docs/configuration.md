@@ -221,17 +221,86 @@ Format and normalisation:
 | LLM_BASE_URL | LLM base URL |
 | LLM_MODEL | LLM model name |
 
-## Remaining Config Sections — Field Inventory
+## Knowledge Base Config (`kb`)
 
-This is a field inventory awaiting a proper write-up: names and defaults are
-taken mechanically from `_config.py`, with no behavioural interpretation, and
-`—` marks a value with no default visible in code.
+The vault side of the system. Every key below is read from `_config.py`; the
+defaults shown are the code defaults, and a deployment is free to override any
+of them in `$HERMES_HOME/governed_memory.json`.
 
-| Section | Fields (`name = default`) |
-|---------|---------------------------|
-| `kb` | `top_k=10`, `min_score=0.0`, `semantic_enabled=True`, `keyword_enabled=True`, `confidence_threshold=0.7`, `autolink_related=True`, `recall_hint_enabled=True`, `recall_min_score=0.0`, `recall_min_kw_score=0.0`, `recall_max_notes=3` |
-| `reranking` | `enabled=False`（总开关，**默认关**）, `provider=""`, `api_key_env=""`, `base_url=""`, `model=""`, `top_n=10` |
-| `synthesis` | `enabled=False`, `provider=""`, `base_url=""`, `api_key_env=""`, `model=""`, `max_candidates=5`, `require_durable_signal=True` |
-| `tencent_extract` | `enabled=False`, `confidence_threshold=0.5`, `max_candidates_per_turn=5`, `llm_api_key=""`, `llm_base_url=""`, `llm_model=""` |
-| `persona` | `incremental=True`, `full_refresh_cron="0 9 * * *"`, `incremental_interval_minutes=30` |
-| `mermaid_compress` | `enabled=False`, `canvas_max_tokens=500` |
+| Key | Default | Description |
+|-----|---------|-------------|
+| top_k | 10 | Max notes returned per KB query. |
+| min_score | 0.0 | Legacy combined-score floor. Kept for compatibility; the two per-channel gates below are what actually filter. |
+| semantic_enabled | true | Semantic (embedding) channel on. |
+| keyword_enabled | true | Keyword channel on. |
+| semantic_min_score | 0.0 | Cosine floor for the semantic channel. **Off by default.** Calibration on the real vault (bge-m3, 21 notes) put relevant hits at 0.41-0.84 and irrelevant ones at 0.31-0.49 — the bands overlap, so there is no usable cosine threshold. Kept for a deployment that wants a hard cosine cut. |
+| rerank_min_score | 0.05 | Floor on the reranker score. This is the real filter: with bge-m3 + bge-reranker-v2-m3 irrelevant queries scored <=0.027 and relevant ones 0.6-0.99. Set to 0.0 to disable. Separate from `semantic_min_score` because the two are on different scales — sharing one threshold once emptied every result below 0.4. |
+| rerank_trace | false | Log candidate/kept/dropped counts and the floor for KB rerank. |
+| confidence_threshold | 0.7 | Semi-automatic routing: confidence >= threshold goes to `notes/`, below it goes to `inbox/` with `review_required`. |
+| autolink_related | true | Add reciprocal `[[wikilink]]`s between a new note and existing notes sharing concepts/tags. |
+| recall_hint_enabled | true | Let the KB emit a one-line "related note exists" hint during recall. |
+| recall_min_score | 0.0 | Fusion-score gate for the hint channel. **Off by default** (code default does not change behaviour). Calibration on the real vault: irrelevant top-1 fusion 0.4054-0.4666, relevant 0.4709-0.8934. |
+| recall_min_kw_score | 0.0 | Keyword gate for the same channel. The hint fires when `keyword >= recall_min_kw_score` **OR** `fusion >= recall_min_score`. The keyword path needs its own gate because the fusion formula caps pure-keyword at 0.4, which can never reach a 0.45 fusion gate. |
+| recall_max_notes | 3 | Max notes named in one hint line. |
+| fusion | "linear" | `linear` (weighted raw scores) or `rrf` (rank fusion, k=60). RRF combines by rank because keyword and semantic scores are on different scales. Both modes keep the same normalised ceilings (keyword <=0.4, semantic <=0.6, top of both = 1.0), so the two gates above mean the same thing either way. An unknown value falls back to `linear` with a warning. |
+| mmr_lambda | 0.0 | MMR redundancy penalty (0 = off, 0.7 suggested). Similarity is bigram Jaccard over title+snippet, so it only drops near-duplicates. |
+| affinity_enabled | false | Usage-affinity ranking and hit counting. `false` = zero side effects. When on, ranking is multiplied by `1 + 0.15*log1p(hits)/log1p(8)` (capped at x1.15) — a slow nudge, not a feedback loop. |
+| promote_hits | 3 | Inbox notes hit this many times get flagged `promote_suggest`. |
+| auto_archive_days | 45 | Auto-zone notes with zero hits and no update for this long are suggested for `archive/`. The sweep **skips archiving when there is no usage data at all** (fail-closed: "no data" is not "unused"). |
+| search_archived | false | Whether `status: "archived"` notes take part in retrieval. |
+| enrich | false | On `add`, use the LLM to write a one-line `summary` plus 2-3 `questions` into frontmatter, feeding the keyword channel. One call at write time, failure never blocks the write. |
+
+## Reranking Config
+
+| Key | Default | Description |
+|-----|---------|-------------|
+| enabled | false | Master switch. **Off by default.** |
+| provider | "" | Label for logs. |
+| api_key_env | "" | **Name** of the environment variable holding the key, not the key. Name-first lookup: process environment wins, then the same name in `$HERMES_HOME/.env`. Never logged. |
+| base_url | "" | Service root of the rerank endpoint. |
+| model | "" | Reranker model name, e.g. `BAAI/bge-reranker-v2-m3`. |
+| top_n | 10 | Candidates kept after rerank. |
+
+## Recall Config Additions
+
+`recall.l2_min_score` and `recall.l2_fusion` are documented in
+[`_config.py`](plugin/memory_governed/_config.py) but were missing here:
+
+| Key | Default | Description |
+|-----|---------|-------------|
+| l2_min_score | 0.0 | Floor on L2 native score. **Off by default** — the code default does not change behaviour; a deployment turns it on explicitly. Measured L2 relevant and irrelevant bands overlap, which is why it ships off. |
+| l2_fusion | false | Cross-layer L2/L3 rank fusion. |
+| cross_layer_fusion | false | Same family as `l2_fusion`; see the fusion notes in the architecture doc. |
+
+## Synthesis Config
+
+| Key | Default | Description |
+|-----|---------|-------------|
+| enabled | false | Session synthesis (conversation to knowledge cards). Off by default. |
+| provider | "" | Empty = inherit `model.provider` from `config.yaml`. |
+| base_url | "" | Empty = inherit from `config.yaml`. |
+| api_key_env | "" | Empty = derived from provider as `{PROVIDER}_API_KEY`. |
+| model | "" | Empty = inherit the agent's own chat model. |
+| max_candidates | 5 | Cards synthesised per run. |
+| require_durable_signal | true | Skip the run entirely when the session holds no durable signal (preference / decision / config intent). Saves an LLM call on reasoning models. |
+
+## Sync Config Additions
+
+| Key | Default | Description |
+|-----|---------|-------------|
+| l2_max_facts_per_turn | 15 | Facts extracted per turn before the rest is dropped. |
+| l2_max_items | 0 | Hard cap on L2 rows (0 = unlimited). |
+
+## Persona / Mermaid / Tencent Extraction
+
+| Section | Key | Default | Description |
+|---------|-----|---------|-------------|
+| `persona` | incremental | true | Incremental persona refresh. |
+| | full_refresh_cron | "0 9 * * *" | Full refresh schedule. |
+| | incremental_interval_minutes | 30 | Minimum gap between incremental refreshes. |
+| `mermaid_compress` | enabled | false | Compress Mermaid canvas content. |
+| | canvas_max_tokens | 500 | Token ceiling for a compressed canvas. |
+| `tencent_extract` | enabled | false | Tencent extraction path. |
+| | confidence_threshold | 0.5 | Minimum confidence to keep an extracted fact. |
+| | max_candidates_per_turn | 5 | Candidates considered per turn. |
+| | llm_api_key / llm_base_url / llm_model | "" | Endpoint used by this path. |

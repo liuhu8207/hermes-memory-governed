@@ -7,21 +7,32 @@
     "prefetch_ttl_seconds": 30,
     "l3_time_decay_hours": 168,
     "parallel_timeout_seconds": 2.0,
-    "l2_fusion": false
+    "l2_fusion": false,
+    "l2_min_score": 0.0,
+    "l3_max_results": 20,
+    "l2_max_results": 15,
+    "cross_layer_fusion": false
   },
   "sync": {
     "l3_write": "sync",
     "l2_write": "async",
     "extract_async": true,
-    "l2_max_items": 0
+    "l2_max_items": 0,
+    "l2_max_facts_per_turn": 15,
+    "write_queue_maxsize": 100
   },
   "persona": {
     "incremental": true,
-    "incremental_interval_minutes": 30
+    "incremental_interval_minutes": 30,
+    "full_refresh_cron": "0 9 * * *"
   },
   "tencent_extract": {
     "enabled": false,
-    "confidence_threshold": 0.5
+    "confidence_threshold": 0.5,
+    "max_candidates_per_turn": 5,
+    "llm_api_key": "",
+    "llm_base_url": "",
+    "llm_model": ""
   },
   "mermaid_compress": {
     "enabled": false,
@@ -44,7 +55,8 @@
     "api_key_env": "SILICONFLOW_API_KEY",
     "base_url": "https://api.siliconflow.cn/v1",
     "model": "BAAI/bge-reranker-v2-m3",
-    "top_n": 10
+    "top_n": 10,
+    "enabled": false
   },
   "kb": {
     "top_k": 10,
@@ -56,7 +68,17 @@
     "fusion": "linear",
     "mmr_lambda": 0.0,
     "affinity_enabled": false,
-    "enrich": false
+    "enrich": false,
+    "semantic_min_score": 0.0,
+    "rerank_min_score": 0.05,
+    "recall_min_score": 0.0,
+    "recall_min_kw_score": 0.0,
+    "recall_max_notes": 3,
+    "recall_hint_enabled": true,
+    "search_archived": false,
+    "promote_hits": 3,
+    "auto_archive_days": 45,
+    "rerank_trace": false
   },
   "asr": {
     "provider": "siliconflow",
