@@ -22,6 +22,7 @@ from ._persona import persona_only
 
 from ._config import GovernedMemoryConfig
 from ._embedding import EmbeddingService
+from ._rerank import Reranker
 from ._lifecycle import resolve_memory_dir, usage_touch
 
 try:  # pragma: no cover - _diag.py 由另一位工程师并行新建
@@ -483,6 +484,9 @@ class RecallEngine:
         self._embed_fn = None  # Lazy-loaded embedding function
         self._embed_model = None  # Lazy-loaded SentenceTransformer
         self._embed_service: Optional[EmbeddingService] = None
+        #: API reranker（``config.reranking``）。惰性构造：密钥解析一次，
+        #: 避免每次召回都读 ``.env``。未配置 / 开关关时永不被 touch。
+        self._reranker: Optional[Reranker] = None
         # L2 懒初始化：无锁会导致冷启动并发重复加载嵌入模型（内存翻倍）
         self._l2_lock = threading.Lock()
         # 已尝试过初始化（无论成败）。失败后不再重试，避免每次查询都 import lancedb
@@ -1111,6 +1115,118 @@ class RecallEngine:
 
     # -- Merge and rank ----------------------------------------------------
 
+    def _get_reranker(self) -> Reranker:
+        """进程内复用同一个 Reranker（构造期解析一次密钥，避免每次读 .env）。
+
+        配置变化（测试 / 热切换）需要新的 RecallEngine —— 与
+        ``EmbeddingService`` 的单例指纹重建相比这里是刻意从简：reranker 无
+        探测成本，而引擎实例本就随 provider.initialize 每会话一个。
+        """
+        if self._reranker is None:
+            self._reranker = Reranker(getattr(self._config, "reranking", None))
+        return self._reranker
+
+    def _rerank_l2(self, query: str,
+                   results: List[RecallResult]) -> List[RecallResult]:
+        """对 L2 候选做一次 API 重排（``reranking.enabled`` 开启且可用时）。
+
+        范围刻意只选 **L2 事实**：数量少（``recall.l2_max_results``，默认
+        15）、语义密集、排名直接影响注入内容。KB / L3 不接 —— 一次只动一层。
+
+        三条硬约束（本项目"拿 A 的尺子量 B 的门槛"烧过两次的教训）：
+
+        1. **只改顺序，不改准入**：重排前把当前分数落袋为
+           ``metadata["native_score"]``（融合命中已有时不覆盖），
+           ``format_recall`` 的 ``_l2_admitted`` / ``_passes_floor`` 照旧看
+           原生分 —— 与 ``recall.l2_fusion`` 的"排序用融合分、准入看原生分"
+           同一契约。
+        2. **不改层间量纲**：重排后的分数在 L2 原分数带 ``[lo, hi]`` 内按名次
+           线性重映射，L2 与 L3 混排时的相对行为不变（L2 是 ``(1+cos)/2``
+           标尺、L3 是 FTS5 原始分，两者不同源，禁止跨标尺比较）。
+        3. **不丢条目 / 读路径永不见异常**：重排返回的必须是同一批元素；本方法
+           的 try **整包住** ``reranker.rerank(...)`` 调用，所以入参畸形
+           （``items=None``、``content.__str__()`` 抛）引发的异常也在这里被
+           吸收成直通（记 ``rerank::rerank_raised``）。返回值为 ``None`` 或
+           数量不符（契约违规）同样直通。**绝不因重排失败而丢条目或让读路径抛。**
+        """
+        rer_cfg = getattr(self._config, "reranking", None)
+        if rer_cfg is None or not bool(getattr(rer_cfg, "enabled", False)):
+            return results  # 默认关：直通（无 degraded 计数）
+        reranker = self._get_reranker()
+        if not reranker.available:
+            return results  # 未配置 / 密钥缺失：直通（无 degraded 计数）
+
+        l2_items = [r for r in results if r.layer == "l2"]
+        if len(l2_items) < 2:
+            return results  # 只有一个候选时重排没有意义
+
+        try:
+            reranked = reranker.rerank(query, l2_items)
+        except Exception as e:  # noqa: BLE001 — 读路径绝不见异常（兜底网）
+            # 兜底网（2026-10-19 QA 复核核实覆盖面）：本 try **整包住**
+            # rerank() 调用本身，因此它的 materialization（list(items)、
+            # documents 推导）**也在网内** —— 入参畸形（items=None、某个元素
+            # 的 content.__str__() 抛）时 rerank() 抛出的 TypeError /
+            # RuntimeError 到这里被吸收成直通，条目一条不少。
+            # 记 rerank::rerank_raised 而非 call_failed：从 rerank() 逃出来的
+            # 异常**按定义不是 API 调用失败**（那些已在它内部记过
+            # rerank::call_failed）—— 标错 reason 会把人引去查网络与端点。
+            log_degraded("rerank", "rerank_raised", exc=e)
+            return results
+
+        if reranked is None or len(reranked) != len(l2_items):
+            # Reranker 的契约是"同批元素换序"；None / 数量不符 = 契约违规。
+            # `reranked is None` 必须短路在前：否则 len(None) 自己会抛，且
+            # **抛在这层 try 之外** —— 那正是兜底网漏掉的那一类逃逸。
+            log_degraded("rerank", "bad_response",
+                         detail="reranked candidate count mismatch")
+            return results
+        if all(a is b for a, b in zip(reranked, l2_items)):
+            return results  # 顺序未变（失败直传 / 重排赞同原序）：不动分数
+
+        return self._rebuild_with_reranked_l2(results, l2_items, reranked)
+
+    def _rebuild_with_reranked_l2(self, results: List[RecallResult],
+                                  l2_items: List[RecallResult],
+                                  reranked: List[RecallResult]) -> List[RecallResult]:
+        """把重排后的 L2 放回结果列表，并按名次在原分数带内重映射分数。
+
+        分数策略（约束 1+2 的落地）：先给每个 L2 候选落袋
+        ``native_score``（准入依据，融合命中不覆盖），再把 ``score``
+        （排序依据）按重排名次在 ``[lo, hi]`` 内线性重映射 —— 第 1 名取
+        ``hi``、末名取 ``lo``。于是 ``format_recall`` 的排序天然跟随重排
+        顺序，而准入门槛仍量原生分；L2 的分数带不变，与 L3 混排的相对
+        行为也不变。
+        """
+        scores = [r.score for r in l2_items]
+        lo = min(scores)
+        hi = max(scores)
+        span = hi - lo
+        if span <= 0.0:
+            # 全同分退化：仍按名次给出严格降序的极小展幅，不依赖排序稳定性
+            span = 1e-6
+        n = len(reranked)
+
+        # ① 准入依据先落袋（必须在改写 score 之前）：native_score 缺省才写，
+        #    不覆盖 l2_fusion 已存的原生分（那条路径的准入依据是余弦/子串分）。
+        for item in l2_items:
+            meta = dict(item.metadata or {})
+            meta.setdefault("native_score", item.score)
+            item.metadata = meta
+        # ② 按重排名次在原分数带内线性重映射 + 记诊断名次
+        for position, item in enumerate(reranked):
+            item.score = hi - span * (position / (n - 1)) if n > 1 else hi
+            meta = dict(item.metadata or {})
+            meta["rerank_rank"] = position + 1
+            item.metadata = meta
+
+        # ③ 放回原列表的 L2 位次，再按新分数整体排序（L4 score=1.0 仍居首，
+        #    L2 带不变 ⇒ 与 L3 的相对位置不变）
+        reranked_iter = iter(reranked)
+        rebuilt = [next(reranked_iter) if r.layer == "l2" else r for r in results]
+        rebuilt.sort(key=lambda r: r.score, reverse=True)
+        return rebuilt
+
     def parallel_recall(self, query: str) -> List[RecallResult]:
         """Run L2 + L3 + L4 in parallel, merge results by score.
 
@@ -1176,7 +1292,9 @@ class RecallEngine:
             pool.shutdown(wait=False)
 
         results.sort(key=lambda r: r.score, reverse=True)
-        return results
+        # L2 候选重排（reranking.enabled 开启且可用时）：只改顺序、不改门槛。
+        # 排在 sort 之后 —— Reranker 的 top_n 截取需要分数有序的候选。
+        return self._rerank_l2(query, results)
 
     def _sequential_recall(self, query: str) -> List[RecallResult]:
         """Fallback sequential recall when thread pool is unavailable."""
@@ -1197,7 +1315,9 @@ class RecallEngine:
             except Exception as e:
                 log_degraded("recall", "sequential_layer_failed", exc=e)
         results.sort(key=lambda r: r.score, reverse=True)
-        return results
+        # 与 parallel_recall 同一接入点：顺序召回路径也走重排（两条路径必须
+        # 给出同一个顺序，否则"关池"与"开池"会是两个答案）。
+        return self._rerank_l2(query, results)
 
     def l2_scope(self) -> Optional[str]:
         """当前生效的 L2 项目作用域（``config.recall.project_scope``）。

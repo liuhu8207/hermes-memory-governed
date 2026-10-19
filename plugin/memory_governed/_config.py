@@ -160,7 +160,17 @@ class EmbeddingConfig:
 
 @dataclass
 class RerankingConfig:
-    """Reranking provider config for result reordering."""
+    """Reranking provider config for result reordering.
+
+    ``provider`` / ``api_key_env`` / ``base_url`` / ``model`` / ``top_n`` 是
+    早前留好的设计位（当时全仓库无实现读取）；P2 起由 ``_rerank.Reranker``
+    接通，接入点在 ``_recall.RecallEngine._rerank_l2``（只重排 L2 候选，
+    默认关）。
+    """
+    #: 总开关。**默认 False = 现行为**：与本文件其它新行为同一约定 —— 代码
+    #: 默认不改行为，部署侧在 ``governed_memory.json`` 里显式开启。关闭时
+    #: 召回路径完全不构造 / 不调用 reranker（零开销、零网络）。
+    enabled: bool = False
     provider: str = ""            # "siliconflow", "cohere", "jina"
     api_key_env: str = ""         # env var name for API key
     base_url: str = ""
@@ -557,6 +567,7 @@ _NUMERIC_FIELDS = {
     "kb": ["top_k", "min_score", "recall_min_score", "recall_min_kw_score",
            "recall_max_notes", "mmr_lambda"],
     "asr": ["timeout_seconds", "chunk_minutes", "max_encoded_bytes"],
+    "reranking": ["top_n"],
 }
 
 #: 必须为正的数值字段（超时 / 拆段阈值 / base64 上限）。0 或负数不是「关闭功能」

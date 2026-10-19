@@ -170,15 +170,18 @@ class TestConsolidateCommand:
         assert out["ok"] is True and out["applied"] is True
         assert out["errors"] == [] and out["skipped"] == []
         assert len(out["merged"]) == 1
+        # P3：merged 项带 confidence 与 evidence（成员数）—— 有定义且被用起来
+        assert out["merged"][0]["evidence"] == 2
+        assert out["merged"][0]["confidence"] == pytest.approx(2 / 3)
 
         remaining = _table_contents(store)
         assert _NEAR_A not in remaining and _NEAR_B not in remaining
         assert merged in remaining and _UNRELATED in remaining
 
         records = _archive_records(store)
-        assert len(records) == 2
-        assert all(r["state"] == "superseded" for r in records)
-        assert all(r["reason"] == "consolidated" for r in records)
+        superseded = [r for r in records if r["state"] == "superseded"]
+        assert len(superseded) == 2
+        assert all(r["reason"] == "consolidated" for r in superseded)
 
     def test_apply_declined_keeps_originals(self, store, monkeypatch):
         pytest.importorskip("lancedb")
@@ -187,7 +190,9 @@ class TestConsolidateCommand:
         _patch_llm(monkeypatch, "   ")  # 空输出 = 模型拒绝合并
 
         out = cli.cmd_consolidate({}, apply=True)
-        assert out["skipped"] == [{"cluster": 0, "reason": "declined"}]
+        assert len(out["skipped"]) == 1
+        assert out["skipped"][0]["cluster"] == 0
+        assert out["skipped"][0]["reason"] == "declined"
         assert out["merged"] == []
         assert len(_table_contents(store)) == 3
         assert _archive_records(store) == []
@@ -200,7 +205,9 @@ class TestConsolidateCommand:
         _patch_llm(monkeypatch, None)
 
         out = cli.cmd_consolidate({}, apply=True)
-        assert out["skipped"] == [{"cluster": 0, "reason": "llm_unavailable"}]
+        assert len(out["skipped"]) == 1
+        assert out["skipped"][0]["cluster"] == 0
+        assert out["skipped"][0]["reason"] == "llm_unavailable"
         assert len(_table_contents(store)) == 3
 
     def test_apply_without_embedding_refuses_entire_round(

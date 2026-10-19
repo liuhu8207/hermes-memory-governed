@@ -1405,6 +1405,32 @@ def _cons_clusters(rows: list) -> list:
     return clusters
 
 
+def _cons_confidence(size: int) -> float:
+    """簇的合并置信度：**只**由证据数（簇大小）决定，单调映射到 (0, 1)。
+
+    定义：``size / (size + 1)`` —— size=2 → 2/3 ≈ 0.67；size=5（单簇上限
+    ``CONS_MAX_CLUSTER``）→ 5/6 ≈ 0.83。证据越多，互证的近重复越多，这一簇
+    「讲的是同一件事」越可信。
+
+    为什么只用证据数、不引入任何模型分数：LLM 合并在 temp=0 下也不吐
+    logprob，任何「模型自信度」都是编出来的数字；而簇大小是现成、可解释、
+    不依赖外部标定的唯一证据强度信号。
+
+    这个数**不是门禁**：没有标定数据，「confidence < X 就不合并」就是拿一
+    把没校准的尺子量东西（本项目因「拿 A 的尺子量 B」烧过两次）。它只用于
+    人工审候选时的排序（高置信的簇先看）与报告里每簇的证据计数 —— 合并
+    决策本身仍只由 ``CONS_*`` 双门槛决定。
+
+    Args:
+        size: 簇内成员数（调用方保证 ≥ 2；此处对入参做防御性下限，保定义域）。
+
+    Returns:
+        (0, 1) 内的浮点，随 size 单调不减。
+    """
+    n = max(2, int(size))
+    return n / (n + 1)
+
+
 def cmd_consolidate(config: dict, apply: bool = False,
                     agent: str = DEFAULT_AGENT) -> dict:
     """巩固：近重复事实聚簇 → LLM 合并（WeKnora consolidation 的 CLI 落地）。
@@ -1417,6 +1443,19 @@ def cmd_consolidate(config: dict, apply: bool = False,
     （state=superseded, reason=consolidated）+ 内容指纹墓碑（防旧表述
     被重新抽取复活）→ 插入合并后的单条。任何一步失败都保留原条目并如实
     记录 —— 合并宁可不发生，不可发生一半。
+
+    **证据链**（双向可追溯，P3）：归档记录带 ``merged_from``（同簇其它成员
+    的摘要 + 内容指纹）与 ``merged_into``（合并后单条的摘要 + 指纹）；合并
+    成功后再补一条 ``state=merged`` 的归档记录，其 ``merged_from`` 列出全部
+    原条 —— 从归档 JSONL 任一条出发都能看出「它被谁取代 / 它由谁合并而来 /
+    同簇还有谁」。不改 L2 表结构：链条只走已有的 archive JSONL 与
+    ``content_fp``（墓碑/查重同一份指纹实现）。
+
+    **置信度**（P3）：``_cons_confidence(size)`` 只按簇内证据数单调映射到
+    (0,1)（无模型分数、无外部标定）。它是**排序辅助不是门禁**：候选文件与
+    ``--apply`` 的处理顺序都按它降序（人工审先看高置信簇），``merged`` /
+    ``skipped`` / ``errors`` 每项带 ``confidence`` 与 ``evidence``（成员数）。
+    合并决策本身仍只由 ``CONS_*`` 决定，不因置信度高低跳过任何簇。
 
     ``demoted``/``expired`` 不在本命令里：降级归容量（``l2_max_items``）、
     过期归时间衰减（L3），各管各的管道，不在此重复报告。
@@ -1442,6 +1481,10 @@ def cmd_consolidate(config: dict, apply: bool = False,
         return _refusal("l2_read_failed", detail=str(e)[:300])
 
     clusters = _cons_clusters(rows)
+    # 按置信度降序（_cons_confidence 只随 size 单调递增，即证据多的簇先审）。
+    # 稳定排序保同尺寸簇的发现序；候选文件、stdout 与 --apply 的处理顺序
+    # 因此一致 —— 人工审的时候先看证据最多的簇。合并决策不受排序影响。
+    clusters.sort(key=lambda c: -_cons_confidence(len(c)))
     base = {"ok": True, "applied": False, "clusters": len(clusters),
             "candidates": [[str(rows[i].get("content") or "")[:80]
                             for i in c] for c in clusters],
@@ -1458,8 +1501,15 @@ def cmd_consolidate(config: dict, apply: bool = False,
                 "thresholds": {"jaccard_min": CONS_JACCARD_MIN,
                                "cosine_min": CONS_COSINE_MIN,
                                "max_cluster": CONS_MAX_CLUSTER},
+                # 定义写进文件本身：审候选的人有权知道这个数是什么、不是什么。
+                "confidence_note": (
+                    "confidence = evidence/(evidence+1)：只按簇内证据数"
+                    "（成员数）单调映射，无模型分数、无外部标定；仅用于"
+                    "排序（高置信的簇先审），不是合并门禁。"),
                 "clusters": [
                     {"size": len(c),
+                     "confidence": _cons_confidence(len(c)),
+                     "evidence": len(c),
                      "members": [{"index": int(i),
                                   "category": rows[i].get("category"),
                                   "agent": rows[i].get("agent"),
@@ -1502,6 +1552,10 @@ def cmd_consolidate(config: dict, apply: bool = False,
 
     for cidx, members in enumerate(clusters):
         items = [rows[i] for i in members]
+        # 每簇的置信度与证据数（定义见 _cons_confidence）：merged / skipped /
+        # errors 三项都带，审报告的人不用回去数成员。
+        confidence = _cons_confidence(len(items))
+        evidence = len(items)
         prompt_lines = "\n".join(
             f"{n + 1}. {str(it.get('content') or '')}"
             for n, it in enumerate(items))
@@ -1516,29 +1570,45 @@ def cmd_consolidate(config: dict, apply: bool = False,
             ],
             cfg, temperature=0.0, max_tokens=300, timeout=60.0)
         if resp is None:
-            base["skipped"].append({"cluster": cidx, "reason": "llm_unavailable"})
+            base["skipped"].append({"cluster": cidx, "reason": "llm_unavailable",
+                                    "confidence": confidence,
+                                    "evidence": evidence})
             continue
         merged_text = str(resp).strip().strip("`\"'")
         if not merged_text:
             # 空输出 = 模型拒绝合并，不是错误：原条目保留，原因说出来。
-            base["skipped"].append({"cluster": cidx, "reason": "declined"})
+            base["skipped"].append({"cluster": cidx, "reason": "declined",
+                                    "confidence": confidence,
+                                    "evidence": evidence})
             continue
         vec = embedding.embed_one(merged_text)
         if vec is None:
-            base["skipped"].append({"cluster": cidx, "reason": "embedding_failed"})
+            base["skipped"].append({"cluster": cidx,
+                                    "reason": "embedding_failed",
+                                    "confidence": confidence,
+                                    "evidence": evidence})
             continue
         originals = [str(it.get("content") or "") for it in items]
         merged_fp = life.content_fp(merged_text)
+        # 证据链（双向可追溯，P3）：指纹一律走 _lifecycle.content_fp ——
+        # 与墓碑、查重同一份实现，不引入新哈希。
+        #   merged_from —— 同簇其它成员的摘要 + 指纹（这条和谁一起被合并）
+        #   merged_into —— 合并后单条的摘要 + 指纹（取代这条的是哪条）
+        orig_fps = [life.content_fp(c) for c in originals]
+        member_refs = [{"content": c[:80], "fp": fp}
+                       for c, fp in zip(originals, orig_fps)]
         try:
             # 归档 + 墓碑先于删除（宁可重复归档，不可丢失）。
-            for it in items:
-                content = str(it.get("content") or "")
+            for it, content, fp in zip(items, originals, orig_fps):
                 life.archive_append(mem_dir, {
                     "state": "superseded", "reason": "consolidated",
                     "ts": now, "content": content,
                     "agent": it.get("agent"), "category": it.get("category"),
-                    "timestamp": it.get("timestamp"), "merged_into": merged_fp})
-                life.add_tombstone(mem_dir, life.content_fp(content), {
+                    "timestamp": it.get("timestamp"),
+                    "merged_from": [r for r in member_refs if r["fp"] != fp],
+                    "merged_into": {"fp": merged_fp,
+                                    "content": merged_text[:80]}})
+                life.add_tombstone(mem_dir, fp, {
                     "content_prefix": content[:80],
                     "reason": "consolidated", "retracted_by": agent, "ts": now})
             for content in originals:
@@ -1550,10 +1620,32 @@ def cmd_consolidate(config: dict, apply: bool = False,
                 "source_rowid": None, "role": "agent", "agent": agent,
                 "project": items[0].get("project"),
             }])
+            # 合并后单条也留一条归档记录：不改 L2 表结构的前提下，archive
+            # JSONL 是唯一能把「新条 ← 旧条」串起来的链 —— 从这一条就能找到
+            # 它由哪几条合并而来，与各原条的 merged_into 互为对应。
+            life.archive_append(mem_dir, {
+                "state": "merged", "reason": "consolidated",
+                "ts": now, "content": merged_text, "fp": merged_fp,
+                "agent": agent,
+                "category": str(items[0].get("category") or "other"),
+                "timestamp": now, "merged_from": member_refs})
             base["merged"].append({"into": merged_text[:200],
-                                   "from": [o[:80] for o in originals]})
+                                   "from": [o[:80] for o in originals],
+                                   "confidence": confidence,
+                                   "evidence": evidence})
         except Exception as e:  # noqa: BLE001 — 部分失败如实上报
-            base["errors"].append(f"cluster {cidx}: {str(e)[:160]}")
+            # 异常文本绝不在此急切求值（f"...{e}"）：__str__ 自身抛错会把
+            # "如实上报"变成二次崩溃（全包已修 17 处同类缺陷）。完整细节走
+            # _diag.log_degraded（exc= 惰性格式化，合同永不抛），JSON 里只留
+            # 类型名 + 簇号。
+            try:
+                plugin_module("_diag").log_degraded(
+                    "consolidate", "cluster_failed", exc=e)
+            except Exception:  # noqa: S110,BLE001 — 诊断不可用也不能拦住上报
+                pass
+            base["errors"].append({"cluster": cidx, "confidence": confidence,
+                                   "evidence": evidence,
+                                   "error": type(e).__name__})
 
     if base["merged"]:
         snap = cmd_snapshot(config)

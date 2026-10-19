@@ -230,7 +230,7 @@ taken mechanically from `_config.py`, with no behavioural interpretation, and
 | Section | Fields (`name = default`) |
 |---------|---------------------------|
 | `kb` | `top_k=10`, `min_score=0.0`, `semantic_enabled=True`, `keyword_enabled=True`, `confidence_threshold=0.7`, `autolink_related=True`, `recall_hint_enabled=True`, `recall_min_score=0.0`, `recall_min_kw_score=0.0`, `recall_max_notes=3` |
-| `reranking` | `provider=""`, `api_key_env=""`, `base_url=""`, `model=""`, `top_n=10` |
+| `reranking` | `enabled=False`（总开关，**默认关**）, `provider=""`, `api_key_env=""`, `base_url=""`, `model=""`, `top_n=10` |
 | `synthesis` | `enabled=False`, `provider=""`, `base_url=""`, `api_key_env=""`, `model=""`, `max_candidates=5`, `require_durable_signal=True` |
 | `tencent_extract` | `enabled=False`, `confidence_threshold=0.5`, `max_candidates_per_turn=5`, `llm_api_key=""`, `llm_base_url=""`, `llm_model=""` |
 | `persona` | `incremental=True`, `full_refresh_cron="0 9 * * *"`, `incremental_interval_minutes=30` |
