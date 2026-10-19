@@ -300,3 +300,23 @@ class TestTheRoundTrip:
             proc.wait(timeout=30)
         assert "10.8.8.8" in out, f"另一个 agent 读不到刚写的: {out}"
         assert "write-test" in out, f"读到内容但署名丢了: {out}"
+
+    def test_another_agent_can_recall_the_l3_conversation_archive(self, box):
+        marker = "archivemark7203"
+        user = f"用户询问 {marker} 的归档验证"
+        assistant = f"这是 {marker} 的共享会话记录"
+        text, is_error = box.call(
+            "hgm_sync_turn", {"user": user, "assistant": assistant,
+                             "session_id": "archive-roundtrip"})
+        assert not is_error, text
+        assert json.loads(text).get("ok") is True, text
+
+        reader = Sandbox(box.root, agent="agent-two")
+        try:
+            out, is_error = reader.call(
+                "hgm_recall", {"query": marker, "top_k": 5})
+        finally:
+            reader.close()
+        assert not is_error, out
+        assert "L3 archive messages: 2 hit(s)" in out, out
+        assert user in out and assistant in out, out

@@ -199,6 +199,10 @@ LLM 归纳（与 agent 对话模型同款）
 | `governed_kb_read_file` | KB | 读取本地文件 → 文本 |
 | `governed_kb_transcribe` | KB | 音频转写（ASR；长音频自动切分） |
 
+其它 agent 使用的独立七工具 stdio MCP 接口见[接入说明](docs/attach-agents.md)。
+MCP 写入工具可在提供本轮对话文本时自动归档到 L3；没有记忆/知识写入的轮次，
+应调用 `hgm_sync_turn`，以保持会话归档完整。
+
 ## 模块地图
 
 | 模块 | 职责 |

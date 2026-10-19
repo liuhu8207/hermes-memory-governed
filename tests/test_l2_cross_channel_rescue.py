@@ -50,7 +50,7 @@ def _seed(home: Path, texts) -> None:
     l2 = home / "memory" / "l2"
     l2.mkdir(parents=True, exist_ok=True)
     db = lancedb.connect(str(l2))
-    if "memories" in db.table_names():
+    if "memories" in db.list_tables().tables:
         db.drop_table("memories")
     rows = []
     for i, item in enumerate(texts):

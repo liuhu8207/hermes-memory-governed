@@ -40,6 +40,7 @@ import json
 import os
 import subprocess
 import sys
+import time
 import traceback
 from pathlib import Path
 
@@ -134,6 +135,15 @@ TOOLS = [
                 "category": {"type": "string", "description": "Free-form label (default: other)."},
                 "dry_run": {"type": "boolean",
                             "description": "Run the gate and report the verdict without writing."},
+                "session_id": {"type": "string",
+                               "description": "Stable session ID for auto-archiving the turn into L3. "
+                                              "Consecutive calls in the same conversation should share it."},
+                "turn_user": {"type": "string",
+                              "description": "The user's message this turn, so the turn can be archived. "
+                                             "Omit to skip auto-archive (the fact is still written)."},
+                "turn_assistant": {"type": "string",
+                                   "description": "Your reply this turn, so the turn can be archived. "
+                                                  "Omit to skip auto-archive."},
             },
             ["fact"],
         ),
@@ -160,6 +170,12 @@ TOOLS = [
                 "title": {"type": "string"},
                 "body": {"type": "string"},
                 "section": {"type": "string", "description": "Vault subdirectory (default notes)."},
+                "session_id": {"type": "string",
+                               "description": "Stable session ID for auto-archiving the turn into L3."},
+                "turn_user": {"type": "string",
+                              "description": "The user's message this turn, so the turn can be archived."},
+                "turn_assistant": {"type": "string",
+                                   "description": "Your reply this turn, so the turn can be archived."},
             },
             ["title", "body"],
         ),
@@ -194,6 +210,32 @@ TOOLS = [
                         "came from another agent or was never claimed by anyone."),
         "inputSchema": _schema({}, []),
     },
+    {
+        "name": "hgm_sync_turn",
+        "description": (
+            "Archive one conversation turn (user message + assistant reply) into L3, "
+            "the complete conversation archive. This is the entry point that makes a "
+            "non-Hermes agent's conversation part of the shared record: without it, "
+            "only facts (hgm_remember) and notes (hgm_kb_add) reach the shared store, "
+            "and the turn itself is lost. Call it once per turn. L3 is the source of "
+            "truth for later provenance drill-down (L2 facts reference L3 rowids). "
+            "The content is redacted for secrets before persistence, so never use "
+            "this to store credentials — they are stripped, not archived."),
+        "inputSchema": _schema(
+            {
+                "user": {"type": "string",
+                         "description": "The user's message for this turn. Already-redacted "
+                                        "text is fine; the writer redacts again defensively."},
+                "assistant": {"type": "string",
+                              "description": "The assistant's reply for this turn."},
+                "session_id": {"type": "string",
+                               "description": "Stable session identifier, e.g. "
+                                              "<agent>_<YYYYMMDD>_<HHMMSS>. Omit to derive "
+                                              "one from the agent name and current time."},
+            },
+            ["user", "assistant"],
+        ),
+    },
 ]
 
 
@@ -208,6 +250,61 @@ def _agent() -> str:
     return _cli().resolve_agent("")
 
 
+def _provider():
+    """Build a ``GovernedMemoryProvider`` pointed at the shared store.
+
+    Fresh per call so a resident MCP server does not mix ``session_id`` and
+    L2 provenance across different MCP clients. ``hermes_home`` is read from
+    the environment (the MCP config sets it), falling back to the plugin's own
+    default so a bare test run still works.
+    """
+    import os  # noqa: PLC0415
+
+    from plugin.memory_governed import GovernedMemoryProvider  # noqa: PLC0415
+
+    provider = GovernedMemoryProvider()
+    provider.initialize(_agent() + "-session", hermes_home=os.environ.get("HERMES_HOME"))
+    return provider
+
+
+def _auto_archive_turn(args: dict, tool_name: str, output: str) -> None:
+    """Archive the turn into L3 in the background after a write tool runs.
+
+    ``hgm_sync_turn`` is the explicit archive entry, but no agent can be
+    trusted to remember to call it: the MiMo config has no instruction file to
+    hold such a rule, and a rule that an agent may forget is not a rule. So
+    every write tool (``hgm_remember`` / ``hgm_kb_add``) also archives the turn
+    it came from, driven by two optional arguments the caller can pass:
+
+    * ``session_id`` -- stable per conversation. Omit to derive one from the
+      agent name and the current hour, so consecutive calls in the same hour
+      land in the same session.
+    * ``turn_user`` / ``turn_assistant`` -- the turn's messages. Omit both and
+      nothing is archived: a write tool cannot invent what it was not told.
+
+    This is a **silent archive**, not a silent write: it stores the turn, not
+    a fact. The fact/notes already went through their own gates. Archive
+    failures are logged but never fail the write call -- losing one turn is
+    better than failing an admitted fact.
+    """
+    user = str(args.get("turn_user") or "")
+    assistant = str(args.get("turn_assistant") or "")
+    if not user.strip() and not assistant.strip():
+        return
+    session_id = str(args.get("session_id") or "").strip()
+    if not session_id:
+        import time  # noqa: PLC0415
+        session_id = f"{_agent()}_{time.strftime('%Y%m%d_%H')}"
+    try:
+        provider = _provider()
+        provider.sync_turn(
+            _ensure_utf8(user), _ensure_utf8(assistant), session_id=session_id)
+    except Exception as exc:  # noqa: BLE001 -- archive must never fail a write
+        _cli()._safe_log(
+            "hgm_mcp", "auto_archive_failed",
+            detail=f"tool={tool_name} session={session_id}", exc=exc)
+
+
 def tool_recall(args: dict) -> str:
     cli = _cli()
     query = _ensure_utf8(str(args.get("query") or "").strip())
@@ -219,6 +316,7 @@ def tool_recall(args: dict) -> str:
     errors: list = []
     l2 = cli.recall_l2(query, top_k, errors, project=project) if project else \
         cli.recall_l2(query, top_k, errors)
+    l3 = cli.search_l3(query, top_k, errors)
     kb_refused: list = []
     kb = cli.cmd_kb_search(cli.load_config(), query, top_k, "", kb_refused)
 
@@ -260,6 +358,15 @@ def tool_recall(args: dict) -> str:
         for c in near:
             lines.append(f"    - ({c.get('score'):.4f}) {c.get('content')}")
 
+    lines.append(f"L3 archive messages: {len(l3)} hit(s)")
+    for message in l3:
+        timestamp = message.get("timestamp")
+        when = (time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(timestamp))
+                if isinstance(timestamp, (int, float)) else "unknown time")
+        role = message.get("role") or "unknown role"
+        content = " ".join(str(message.get("content") or "").splitlines())
+        lines.append(f"  - [{when}] {role}: {content}")
+
     lines.append(f"KB notes: {len(kb)} hit(s)")
     for note in kb:
         lines.append(f"  - {note.get('title')}  ({note.get('path')})")
@@ -289,7 +396,10 @@ def tool_remember(args: dict) -> str:
     result = cli.cmd_remember(cli.load_config(), fact,
                               _agent(), args.get("category") or "other",
                               bool(args.get("dry_run")), project)
-    return json.dumps(result, ensure_ascii=False, indent=2)
+    out = json.dumps(result, ensure_ascii=False, indent=2)
+    if result.get("admitted"):
+        _auto_archive_turn(args, "hgm_remember", out)
+    return out
 
 
 def tool_kb_search(args: dict) -> str:
@@ -319,7 +429,10 @@ def tool_kb_add(args: dict) -> str:
         raise ValueError("title and body are required")
     result = cli.cmd_kb_add(cli.load_config(), title, body,
                             args.get("section") or "notes", [], [], None, _agent())
-    return json.dumps(result, ensure_ascii=False, indent=2)
+    out = json.dumps(result, ensure_ascii=False, indent=2)
+    if result.get("ok"):
+        _auto_archive_turn(args, "hgm_kb_add", out)
+    return out
 
 
 def tool_transcribe(args: dict) -> str:
@@ -337,6 +450,45 @@ def tool_agents(_args: dict) -> str:
                       ensure_ascii=False, indent=2)
 
 
+def tool_sync_turn(args: dict) -> str:
+    """Archive one conversation turn into L3 via the provider's ``sync_turn``.
+
+    L3 is the only layer that records the *turn* rather than a distilled fact,
+    and ``sync_turn`` is its only writer. The MCP surface previously exposed
+    no path to it, so every non-Hermes agent's conversation was lost from the
+    archive even though its facts were shared.
+
+    The provider is built per call rather than kept as a server-wide singleton:
+    the server is a resident process shared by all MCP clients, and a shared
+    ``WriteQueue`` would mix turns from different agents into one L2 pipeline.
+    ``sync_turn`` is cheap and non-blocking (L3 <10ms, L2 queued), so this
+    costs little and keeps each call's session_id and provenance self-contained.
+    """
+    cli = _cli()
+    user = _ensure_utf8(str(args.get("user") or ""))
+    assistant = _ensure_utf8(str(args.get("assistant") or ""))
+    if not user.strip() and not assistant.strip():
+        raise ValueError("user or assistant is required")
+    session_id = str(args.get("session_id") or "").strip()
+    if not session_id:
+        import time  # noqa: PLC0415
+        session_id = f"{_agent()}_{time.strftime('%Y%m%d_%H%M%S')}"
+
+    provider = _provider()
+    try:
+        provider.sync_turn(user, assistant, session_id=session_id)
+    except Exception as exc:  # noqa: BLE001 — the caller needs a verdict, not a traceback
+        return json.dumps({"ok": False,
+                           "error": f"sync_turn failed: {type(exc).__name__}: {exc}",
+                           "session_id": session_id},
+                          ensure_ascii=False, indent=2)
+    return json.dumps({"ok": True, "session_id": session_id,
+                       "agent": _agent(),
+                       "user_chars": len(user),
+                       "assistant_chars": len(assistant)},
+                      ensure_ascii=False, indent=2)
+
+
 HANDLERS = {
     "hgm_recall": tool_recall,
     "hgm_remember": tool_remember,
@@ -344,6 +496,7 @@ HANDLERS = {
     "hgm_kb_add": tool_kb_add,
     "hgm_transcribe": tool_transcribe,
     "hgm_agents": tool_agents,
+    "hgm_sync_turn": tool_sync_turn,
 }
 
 

@@ -31,6 +31,7 @@ CRON_OUTPUT = env_path("CRON_OUTPUT_DIR", HERMES_HOME / "cron" / "output")
 BRIDGE_DIR = env_path("BRIDGE_DIR", CRON_OUTPUT / "scope_recall_bridge")
 BRIDGE_JSONL = env_path("BRIDGE_JSONL", BRIDGE_DIR / "candidates.jsonl")
 BRIDGE_REPORT = env_path("BRIDGE_REPORT", BRIDGE_DIR / "last_export.json")
+L1_MEMORY = env_path("L1_MEMORY_PATH", HERMES_HOME / "memory" / "MEMORY.md")
 
 
 def _configured_wiki_dir() -> Path:
@@ -316,12 +317,53 @@ def collect_candidates() -> list[dict]:
     return candidates
 
 
+def reviewed_ids() -> set[str]:
+    """IDs already imported into L1 or explicitly dismissed.
+
+    Without this, every daily export rewrites the feed from the vault and the
+    same knowledge notes return as ``review-required`` forever. Dismissed rows
+    are kept in ``candidates.dismissed.*.jsonl`` for audit; imported rows stay
+    in ``candidates.jsonl`` with ``imported: true``.
+    """
+    ids: set[str] = set()
+    # The active feed is rewritten on every export, so an imported row may no
+    # longer be present there. L1 keeps the durable bridge comment — read it.
+    if L1_MEMORY.exists():
+        try:
+            text = L1_MEMORY.read_text(encoding="utf-8", errors="replace")
+            ids.update(re.findall(r"bridge:imported id=([^\s]+)", text))
+        except OSError as exc:
+            logger.warning("cannot read L1 for imported bridge IDs: %s", exc)
+    paths = [BRIDGE_JSONL]
+    paths.extend(sorted(BRIDGE_DIR.glob("candidates.dismissed.*.jsonl")))
+    for path in paths:
+        if not path.exists():
+            continue
+        try:
+            for line in path.read_text(encoding="utf-8").splitlines():
+                if not line.strip():
+                    continue
+                row = json.loads(line)
+                if row.get("imported") or row.get("dismissed"):
+                    rid = row.get("id")
+                    if rid:
+                        ids.add(str(rid))
+        except (OSError, ValueError) as exc:
+            logger.warning("cannot read reviewed feed %s: %s", path, exc)
+    return ids
+
+
 def cmd_export(args):
     dry_run = getattr(args, "dry_run", False)
     candidates = collect_candidates()
+    already_reviewed = reviewed_ids()
+    before = len(candidates)
+    candidates = [c for c in candidates if str(c.get("id")) not in already_reviewed]
+    skipped_reviewed = before - len(candidates)
 
     if dry_run:
-        print(f"[dry-run] Would export {len(candidates)} candidates:")
+        print(f"[dry-run] Would export {len(candidates)} candidates "
+              f"(skipped {skipped_reviewed} already reviewed):")
         for c in candidates:
             print(f"  - {c['target']}: {c['summary'][:60]}...")
         return 0
@@ -337,6 +379,7 @@ def cmd_export(args):
         "timestamp": datetime.now().isoformat(),
         "candidates_total": len(candidates),
         "written": written,
+        "skipped_reviewed": skipped_reviewed,
         "jsonl_path": str(BRIDGE_JSONL),
     }
     BRIDGE_REPORT.write_text(json.dumps(report, indent=2, ensure_ascii=False), encoding="utf-8")

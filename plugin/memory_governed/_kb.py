@@ -37,13 +37,14 @@ from ._embedding import EmbeddingService
 from ._bridge import has_secret_like_text
 from ._llm import chat_completion
 from ._recall import row_to_score
+from ._rerank import Reranker
 from ._text import DEDUP_MIN_CHARS, normalize_for_match
 from . import _vault
 
 logger = logging.getLogger(__name__)
 
 try:  # pragma: no cover - _diag.py 尚未落地时的兼容回退（与 _recall.py 同一套）
-    from ._diag import _safe_str, log_degraded
+    from ._diag import _safe_str, log_degraded, record_metric
 except Exception:  # noqa: BLE001
     def _safe_str(value: object) -> str:
         """Fallback: 无 _diag.py 时的安全字符串化（绝不抛出）。"""
@@ -58,11 +59,24 @@ except Exception:  # noqa: BLE001
         logger.warning("[degraded] %s: %s %s", component, reason, detail,
                        exc_info=exc)
 
+    def record_metric(name: str, value: int) -> None:
+        """Fallback: 无 _diag.py 时丢弃计数器（诊断缺项，不影响读路径）。"""
+        return None
+
 #: [[Title]] / [[Title|alias]] / [[dir/Title]] / [[Title#heading]]
 _LINK_RE = re.compile(r"\[\[([^\]\|#]+)(?:\|[^\]]*)?\]\]")
 
 #: 索引表名（LanceDB）
 _TABLE_NAME = "kb_notes"
+
+
+def _list_table_names(db) -> List[str]:
+    """List tables using LanceDB's current API, with support for older clients."""
+    lister = getattr(db, "list_tables", None)
+    listing = lister() if callable(lister) else db.table_names()
+    if not isinstance(listing, (list, tuple)):
+        listing = getattr(listing, "tables", []) or [listing]
+    return [t.name if hasattr(t, "name") else str(t) for t in listing]
 
 #: 关键词分归一化分母（见 ``_keyword_score_norm``）。
 _KEYWORD_SCORE_DENOM = 5.0
@@ -484,7 +498,7 @@ class KBIndex:
         try:
             self._db_path.mkdir(parents=True, exist_ok=True)
             db = lancedb.connect(str(self._db_path))
-            names = db.table_names()
+            names = _list_table_names(db)
             if _TABLE_NAME in names:
                 self._store = db.open_table(_TABLE_NAME)
                 # 旧 schema（无 mtime）无法做增量同步，且索引只是**投影**、
@@ -596,7 +610,7 @@ class KBIndex:
         import lancedb  # noqa: F401
         try:
             db = lancedb.connect(str(self._db_path))
-            if _TABLE_NAME in db.table_names():
+            if _TABLE_NAME in _list_table_names(db):
                 db.drop_table(_TABLE_NAME)
         except Exception as e:  # noqa: BLE001
             logger.debug("kb index drop failed: %s", e)
@@ -878,6 +892,9 @@ class KnowledgeBase:
         # 独立向量库目录（与 L2 记忆的 l2/ 分开）
         self._index_db = Path(config.l2_db_path).parent / "kb_index"
         self._index: Optional[KBIndex] = None
+        # retrieve-then-rerank：与 L2 共用同一个 reranker 配置，但这里是
+        # KB 自己的实例（进程内单例，构造期解析一次密钥）
+        self._reranker: Optional[Reranker] = None
         # 使用度表（亲和度数据源）。与 kb_index 同级目录，懒加载 ——
         # affinity 关闭时这张表永远不会被创建（读路径零副作用）。
         self._usage_db = Path(config.l2_db_path).parent / "kb_usage.db"
@@ -1132,6 +1149,36 @@ class KnowledgeBase:
             self._index = KBIndex(self._config, self._index_db)
         return self._index
 
+    def _get_reranker(self) -> Reranker:
+        """进程内单例，与 L2 共用同一份 ``reranking`` 配置。"""
+        if self._reranker is None:
+            self._reranker = Reranker(getattr(self._config, "reranking", None))
+        return self._reranker
+
+    def _rel_body(self, rel: str) -> str:
+        """``rel``（vault 相对路径）对应笔记的正文；读不到时返回空串。
+
+        重排器判的是**文档**，所以需要正文而不是路径。这里刻意从 vault 正本
+        读，而不是从索引投影读 —— 那份投影为了便宜而存，不是为了被读。
+        """
+        try:
+            path = Path(self._vault, rel)
+            if not path.is_file():
+                return ""
+            text = path.read_text(encoding="utf-8", errors="replace")
+        except OSError:  # silent-ok: value-fallback — 单篇读失败 → 无文本可重排，per-note
+            return ""
+        _meta, body = _vault.parse_frontmatter(text)
+        # The TITLE is the strongest relevance signal, and the reranker scores
+        # it as such: the same note scored 0.99 with its title and 0.013
+        # without it, which the floor then discarded. Body alone is not the
+        # document the query is asking about.
+        note = next((n for n in self._iter_notes()
+                     if self._rel(n.path) == rel), None)
+        title = str((note.title if note else "") or "").strip()
+        body_text = str(body or "").strip()
+        return (title + "\n" + body_text).strip() if title else body_text
+
     @property
     def index_available(self) -> bool:
         return self._index_get().available
@@ -1217,6 +1264,11 @@ class KnowledgeBase:
         # 只读差异部分的内容：批量重建（reindex）才需要读全库，
         # 一次自愈通常只有 1~2 篇是新的，没必要把 27 篇全 parse 一遍。
         for rel in added + updated:
+            # Each note must carry ITS OWN mtime. Using the loop variable from
+            # the previous ``for rel, mt in vault.items()`` loop gave every
+            # updated row the last vault item's mtime, so the next sync saw
+            # them as stale again (and re-embedded them every day).
+            mt = vault.get(rel, 0.0)
             path = paths.get(rel)
             if path is None:
                 errors += 1
@@ -1266,15 +1318,31 @@ class KnowledgeBase:
     # -- 读取 --------------------------------------------------------
 
     def _iter_notes(self) -> List[_Note]:
+        # An unreadable note and a missing note look identical to every caller,
+        # so each skip is recorded rather than dropped. ``last_read_failures``
+        # hands them to the CLI, which reports them as errors.
+        self._read_failures: list = []
         notes: List[_Note] = []
         for path in self._walk():  # 与索引同步侧共用同一份遍历规则
             try:
                 text = path.read_text(encoding="utf-8", errors="replace")
-            except OSError:  # silent-ok: value-fallback — 单篇读失败 → 跳过该笔记，per-note
+            except OSError as exc:
+                self._read_failures.append(
+                    "skipped: " + str(path) + " unreadable ("
+                    + type(exc).__name__ + ": " + _safe_str(exc) + ")")
+                # One note must not sink the walk, but the skip must not be
+                # silent either: an empty result and a skipped note read the
+                # same to a caller unless something records it.
+                log_degraded("kb", "note_unreadable", detail=str(path), exc=exc)
                 continue
             meta, body = _vault.parse_frontmatter(text)
             notes.append(_Note(path, _vault.note_title(path), meta, body))
         return notes
+
+    @property
+    def last_read_failures(self) -> list:
+        """Unreadable notes from the most recent walk (see :meth:`_iter_notes`)."""
+        return list(getattr(self, "_read_failures", []))
 
     def _rel(self, path: Path) -> str:
         try:
@@ -1426,8 +1494,84 @@ class KnowledgeBase:
         sem_norm: Dict[str, float] = {}
         idx = self._index_get()
         if semantic_on and idx.available:
+            # 空正文（或近乎空）的笔记没有可匹配的含义，向量索引却会给它
+            # 打出高分 —— 33 字节的脚手架文件（notes.md / 智能分类.md /
+            # CachyOS.md）就曾霸占无关查询的第一名。在语义通道提议它们之前
+            # 先剔掉。
+            empty_rels = {self._rel(n.path) for n in notes
+                          if not str(n.body).strip()}
+            # 向量库永远返回 ``limit`` 条最近邻，于是任何查询都会填满
+            # top_k。地板分（默认 0.0 = 关闭）是唯一能区分「没命中」与
+            # 「这是全部里最相近的几条」的东西。
+            sem_floor = float(getattr(kb_cfg, "semantic_min_score", 0.0) or 0.0)
             for r in idx.search(query, sem_fetch):
-                sem_norm[r["path"]] = float(r.get("score", 0.0) or 0.0)
+                score = float(r.get("score", 0.0) or 0.0)
+                if r["path"] in empty_rels:
+                    continue
+                if sem_floor > 0.0 and score < sem_floor:
+                    continue
+                sem_norm[r["path"]] = score
+
+        # ---- retrieve-then-rerank ------------------------------------------
+        # 实测：相关查询余弦 0.41~0.84，无关查询 0.31~0.49 —— 两带**重叠**，
+        # embedding 侧任何地板分都分不开。重排器是另一把更锐的尺子：无关全部
+        # 塌到 <=0.03，相关稳在 0.6~0.99，差两个数量级。
+        #
+        # 只在「配了 reranking 且设了 rerank_min_score」时跑。没设地板分时它只改
+        # 顺序，而这里要的是**筛掉** —— 调用方读前几行，一堆无关笔记内部
+        # 换个顺序仍然是噪声。
+        rer_cfg = getattr(self._config, "reranking", None)
+        kb_rerank_on = bool(rer_cfg and getattr(rer_cfg, "enabled", False))
+        # reranker 筛选用**自己的**门槛（``kb.rerank_min_score``），与
+        # ``semantic_min_score`` 分开：两者量纲不同（前者是 rerank 相关度，
+        # 后者是余弦）。共用一个阈值正是 0.4 把全部结果清空的原因。
+        rerank_floor = float(getattr(kb_cfg, "rerank_min_score", 0.0) or 0.0)
+        rerank_state = "not_applied"
+        # Archived notes are excluded BEFORE the reranker sees them. Doing it
+        # after let an archived duplicate win the rerank (they carry near-
+        # identical text), which consumed the whole top_k and left the live
+        # canonical note with nothing — a search for the NAS note returned
+        # only its archived copies, then the post-hoc filter emptied them.
+        candidates = (set(kw_norm) | set(sem_norm)) - set(archived_rels)
+        if candidates and kb_rerank_on and rerank_floor > 0.0:
+            rer = self._get_reranker()
+            if rer.available:
+                try:
+                    rels = sorted(candidates)
+                    texts = [self._rel_body(rel) or rel for rel in rels]
+                    scores = rer.scores(query, texts, top_n=None)
+                    scored = {rels[i]: s for i, s in scores.items()
+                              if i < len(rels)}
+                except Exception as e:  # noqa: BLE001 — 读路径永不抛
+                    log_degraded("kb", "rerank_raised", exc=e)
+                    scored = None
+                if scored:
+                    # The reranker is the ONE ruler that separates the
+                    # two bands, so it screens BOTH channels. Keyword
+                    # coverage and embedding cosine each overlap between
+                    # relevant and unrelated queries (measured: kw
+                    # 0.07-0.58 vs 0.00-0.15, cos 0.41-0.84 vs 0.31-0.49)
+                    # - neither can gate alone.
+                    survivors = {rel for rel, s in scored.items()
+                                 if s >= rerank_floor}
+                    dropped = len(candidates) - len(survivors)
+                    sem_norm = {k: v for k, v in sem_norm.items()
+                                if k in survivors}
+                    kw_norm = {k: v for k, v in kw_norm.items()
+                               if k in survivors}
+                    kept = len(survivors)
+                    rerank_state = "reranked"
+                    if dropped:
+                        record_metric("kb_rerank_dropped", dropped)
+                    if getattr(kb_cfg, "rerank_trace", False):
+                        logger.debug(
+                            "kb rerank: candidates=%d kept=%d dropped=%d floor=%.2f",
+                            len(scored), kept, dropped, rerank_floor)
+                    elif scored is None:
+                        # 调用失败：保留 embedding 分，别把通道清空
+                        rerank_state = "rerank_unavailable"
+                else:
+                    rerank_state = "rerank_no_scores"
 
         # 权重按「实际启用的通道」重新归一化，避免关掉一路后总分整体缩水
         active_kw = _KB_KW_WEIGHT if keyword_on else 0.0
@@ -1486,6 +1630,10 @@ class KnowledgeBase:
             "pre_sync_missing": status.get("pre_sync_missing", 0),
             "pre_sync_stale": status.get("pre_sync_stale", 0),
             "pre_sync_orphaned": status.get("pre_sync_orphaned", 0),
+            # retrieve-then-rerank 的结局：reranked / rerank_unavailable /
+            # rerank_no_scores / not_applied。三者必须可区分 —— "筛过了"
+            # 和"没筛成"对调用方是两回事。
+            "rerank": rerank_state,
         }
 
         scored: Dict[str, Dict[str, Any]] = {}

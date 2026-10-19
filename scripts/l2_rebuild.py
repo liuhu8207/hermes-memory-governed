@@ -223,7 +223,10 @@ def extract_facts(messages: list[dict[str, Any]], *,
 
 def _table_names(db) -> List[str]:
     """List table names across the two lancedb listing APIs."""
-    listing = db.list_tables().tables if hasattr(db, "list_tables") else db.table_names()
+    lister = getattr(db, "list_tables", None)
+    listing = lister() if callable(lister) else db.table_names()
+    if not isinstance(listing, (list, tuple)):
+        listing = getattr(listing, "tables", []) or [listing]
     return [t.name if hasattr(t, "name") else str(t) for t in listing]
 
 

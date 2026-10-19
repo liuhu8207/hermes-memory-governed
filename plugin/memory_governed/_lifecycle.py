@@ -55,6 +55,40 @@ def content_fp(text: str) -> str:
     return hashlib.sha256(norm.encode("utf-8")).hexdigest()
 
 
+#: Minimum shared prefix for treating a rewritten fact as the retracted one.
+#: The tombstone stores the first 80 normalized characters; 40 is long enough
+#: to be specific while still catching the common "same sentence + extra
+#: recommendation" rewrite that exact hashing misses.
+_TOMBSTONE_PREFIX_MIN = 40
+
+
+def is_tombstoned(text: str, tombstones: Dict[str, Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+    """Return the matching tombstone record, or ``None``.
+
+    Two checks, in order:
+
+    1. exact normalized fingerprint (the documented contract);
+    2. a long shared prefix. Exact hashing alone let a retracted fact come
+       back twelve seconds later as "the same sentence plus one more clause".
+       A 40+ character normalized prefix is specific enough to treat as the
+       same fact, and it is deliberately symmetric so truncation cannot evade
+       it.
+    """
+    if not tombstones:
+        return None
+    fp = content_fp(text)
+    if fp in tombstones:
+        return tombstones[fp]
+    norm = normalize_for_match(text or "")
+    for record in tombstones.values():
+        prefix = normalize_for_match(str(record.get("content_prefix", "") or ""))
+        if len(prefix) < _TOMBSTONE_PREFIX_MIN:
+            continue
+        if norm.startswith(prefix) or prefix.startswith(norm):
+            return record
+    return None
+
+
 def tombstones_path(memory_dir: Path) -> Path:
     return Path(memory_dir) / _TOMBSTONES_NAME
 
@@ -244,6 +278,70 @@ def usage_count(memory_dir: Path) -> int:
 def sql_quote(value: str) -> str:
     """LanceDB delete 谓词用的字符串字面量（单引号翻倍）。"""
     return "'" + str(value).replace("'", "''") + "'"
+
+
+def enforce_capacity(table, memory_dir: Path, cap: int,
+                     *, agent: Optional[str] = None,
+                     incoming: int = 0) -> List[str]:
+    """Archive the least-used rows until ``cap`` is respected.
+
+    This is a **sweep**, not a per-write hook. Running it from the daily job
+    keeps the Hermes turn path free of table scans, backups and deletes; a
+    burst of automatic extraction can temporarily exceed the cap, and the next
+    sweep brings it back. The CLI still enforces the same rule before a manual
+    write, so a manual write never overshoots.
+
+    ``agent=None`` applies the cap globally; passing an agent preserves the
+    CLI's historical per-agent behaviour.
+    """
+    cap = int(cap or 0)
+    if cap <= 0:
+        return []
+    try:
+        rows = table.to_arrow().to_pylist()
+    except Exception as e:  # noqa: BLE001
+        log_degraded("l2_capacity", "read_failed", exc=e)
+        return []
+
+    scope = [r for r in rows
+             if agent is None or str(r.get("agent") or "") == str(agent)]
+    over = len(scope) + max(0, int(incoming)) - cap
+    if over <= 0:
+        return []
+
+    usage = usage_last_used(memory_dir)
+
+    def _victim_key(row):
+        content = str(row.get("content") or "")
+        return (usage.get(content_fp(content), 0.0),
+                str(row.get("timestamp") or ""))
+
+    victims = sorted(scope, key=_victim_key)[:over]
+    if not victims:
+        return []
+    l2_db_path = Path(memory_dir) / "l2"
+    if backup_table(l2_db_path, tag="capacity", memory_dir=memory_dir) is None:
+        logger.error("capacity sweep skipped: cannot back up the L2 table")
+        return []
+
+    now = datetime.now().strftime("%Y-%m-%dT%H:%M:%S")
+    demoted: List[str] = []
+    for row in victims:
+        content = str(row.get("content") or "")
+        if not content:
+            continue
+        try:
+            archive_append(memory_dir, {
+                "state": "archived", "reason": "capacity-demoted",
+                "ts": now, "content": content,
+                "agent": row.get("agent"), "timestamp": row.get("timestamp"),
+                "cap": cap,
+            })
+            table.delete("content = " + sql_quote(content))
+            demoted.append(content[:200])
+        except Exception as e:  # noqa: BLE001
+            log_degraded("l2_capacity", "demote_failed", detail=content[:80], exc=e)
+    return demoted
 
 
 def lifecycle_counts(memory_dir: Path) -> Dict[str, int]:

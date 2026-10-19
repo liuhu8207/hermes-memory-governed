@@ -82,7 +82,7 @@ def _seed_with_categories(home, items) -> None:
     l2 = home / "memory" / "l2"
     l2.mkdir(parents=True, exist_ok=True)
     db = lancedb.connect(str(l2))
-    if "memories" in db.table_names():
+    if "memories" in db.list_tables().tables:
         db.drop_table("memories")
     db.create_table("memories", data=[{
         "content": t, "category": cat, "source": "test",

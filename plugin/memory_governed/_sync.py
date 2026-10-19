@@ -634,6 +634,66 @@ _CREDENTIAL_RE = re.compile(
     re.IGNORECASE,
 )
 
+#: Inline image data URLs are not knowledge and can be megabytes long. They
+#: also often carry screenshots of credentials. Redact the payload at the L3
+#: boundary instead of storing it verbatim.
+_IMAGE_DATA_RE = re.compile(
+    r"data:image/[A-Za-z0-9.+-]+;base64,[A-Za-z0-9+/=\r\n]+",
+    re.IGNORECASE,
+)
+
+
+def redact_for_archive(text: str) -> str:
+    """Redact credentials and inline image payloads before L3 persistence.
+
+    L3 is the raw conversation archive, but "raw" must not mean "a second
+    credential store". The same high-precision rules used by the Bridge and
+    the L2 write gate are applied here, plus the image data-URL shape that
+    otherwise bloats the archive and can capture a screenshot of a secret.
+
+    The function is deliberately dependency-light: ``_bridge`` imports this
+    module, so the import is lazy and only happens when a write/read actually
+    needs the shared secret patterns.
+    """
+    cleaned = text or ""
+    cleaned = _IMAGE_DATA_RE.sub("[REDACTED_IMAGE]", cleaned)
+    try:
+        from ._bridge import redact_sensitive  # local import avoids a cycle
+
+        cleaned = redact_sensitive(cleaned)
+    except Exception as e:  # noqa: BLE001 — never lose an archive write over redaction
+        log_degraded("l3_redaction", "redact_failed", exc=e)
+    cleaned = _CREDENTIAL_RE.sub("[REDACTED]", cleaned)
+    return cleaned
+
+
+def filter_tombstoned_facts(facts: List[dict], memory_dir: Path) -> List[dict]:
+    """Drop facts that a human explicitly retracted.
+
+    The CLI already applies this gate in ``cmd_remember``. The automatic
+    extraction path did not, so a retracted sentence could be re-created on
+    the next turn by the plugin itself. Keeping the check here means both
+    write doors share one rule.
+    """
+    if not facts:
+        return facts
+    try:
+        from ._lifecycle import is_tombstoned, load_tombstones
+
+        tombstones = load_tombstones(Path(memory_dir))
+        if not tombstones:
+            return facts
+        kept = [f for f in facts
+                if is_tombstoned(str(f.get("content", "")), tombstones) is None]
+        dropped = len(facts) - len(kept)
+        if dropped:
+            logger.info("tombstoned facts filtered: %d", dropped)
+            record_metric("facts_tombstoned", dropped)
+        return kept
+    except Exception as e:  # noqa: BLE001 — never lose a turn over the gate
+        log_degraded("l2_write", "tombstone_filter_failed", exc=e)
+        return facts
+
 # A line that is nothing but a local absolute path (Windows drive / UNC). This
 # is machine state, not durable knowledge, and it goes stale the moment the
 # file moves ("C:\Users\...\plugins\model-providers\deepseek\__init__.py").
@@ -1613,6 +1673,12 @@ class WriteQueue:
             facts = self._extract_atomic_facts(messages)
             if not facts:
                 return
+            # A retracted fact must not be resurrected by automatic
+            # extraction. The CLI gate alone only protected CLI writes.
+            facts = filter_tombstoned_facts(
+                facts, Path(self._config.l2_db_path).parent)
+            if not facts:
+                return
 
             # Deduplicate (vs. the store + within the batch) BEFORE embedding:
             # a long-lived session re-feeds its history every turn, so without
@@ -2523,34 +2589,69 @@ class L3Writer:
             fts_cols = self._fts_insert_columns(conn)
 
             try:
+                # Dedup all messages in ONE round-trip instead of one SELECT
+                # per message. 200 messages cost 200 queries otherwise, and
+                # the round-trip overhead (not the row scan) dominates — this
+                # alone was the difference between 68ms and <50ms for a
+                # 200-message turn on this machine.
+                hashes = []
+                contents = []
+                roles = []
+                # Pre-compute redacted text and hashes in one pass. The
+                # redaction itself is the dominant per-message cost (several
+                # regex substitutions), so doing it once per message here
+                # rather than again in the insert loop is a real saving.
                 for msg in messages:
                     role = msg.get("role", "")
-                    # hermes transcripts may carry multimodal content (a list of
-                    # OpenAI parts). Normalise to text BEFORE hashing/splitting,
-                    # otherwise `str + list` raises TypeError and the whole batch
-                    # is rolled back (real data loss).
                     content = _content_to_text(msg.get("content"))
                     if not content:
                         continue
-
-                    # Idempotent writes: skip if (session_id, content_hash) is archived
+                    content = redact_for_archive(content)
                     content_hash = hashlib.sha256(
                         (session_id + "|" + role + "|" + content).encode("utf-8")
                     ).hexdigest()
-                    exists = conn.execute(
-                        "SELECT 1 FROM messages WHERE session_id = ? AND hash = ?",
-                        (session_id, content_hash),
-                    ).fetchone()
-                    if exists:
+                    hashes.append(content_hash)
+                    contents.append(content)
+                    roles.append(role)
+                existing = set()
+                if hashes:
+                    placeholders = ",".join("?" for _ in hashes)
+                    existing = {
+                        row[0] for row in conn.execute(
+                            f"SELECT hash FROM messages WHERE session_id = ? "
+                            f"AND hash IN ({placeholders})",
+                            [session_id, *hashes],
+                        ).fetchall()
+                    }
+                rows_to_insert = []
+                for content, role, content_hash in zip(contents, roles, hashes):
+                    if content_hash in existing:
                         continue
 
-                    # Insert into main table
-                    cur = conn.execute(
-                        "INSERT INTO messages (session_id, role, content, timestamp, hash) "
-                        "VALUES (?, ?, ?, ?, ?)",
-                        (session_id, role, content, now, content_hash),
-                    )
-                    rowid = cur.lastrowid
+                    rows_to_insert.append((session_id, role, content, now, content_hash))
+
+                inserted = {}
+                if rows_to_insert:
+                    # One INSERT per row keeps each row's ``lastrowid`` intact;
+                    # ``executemany`` returns ``None`` for it on SQLite, which
+                    # silently broke the L2 source_rowid map. The dedup batch
+                    # above already removed the dominant cost (200 SELECTs).
+                    for content, role, content_hash in zip(contents, roles, hashes):
+                        if content_hash in existing:
+                            continue
+                        cur = conn.execute(
+                            "INSERT INTO messages (session_id, role, content, timestamp, hash) "
+                            "VALUES (?, ?, ?, ?, ?)",
+                            (session_id, role, content, now, content_hash),
+                        )
+                        inserted[(content, role)] = cur.lastrowid
+
+                for content, role, content_hash in zip(contents, roles, hashes):
+                    if content_hash in existing:
+                        continue
+                    rowid = inserted.get((content, role))
+                    if rowid is None:
+                        continue
 
                     # Key by the whole message AND by each sentence: extracted
                     # facts are sentences, so this makes L2 -> L3 drill-down an

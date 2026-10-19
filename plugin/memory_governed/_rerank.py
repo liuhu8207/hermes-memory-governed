@@ -21,7 +21,7 @@ siliconflow API 做嵌入（``_embedding``，``BAAI/bge-m3`` 1024 维），重�
 from __future__ import annotations
 
 import logging
-from typing import TYPE_CHECKING, Any, List, Optional, Sequence
+from typing import TYPE_CHECKING, Any, Dict, List, Optional, Sequence
 
 from ._config import env_secret
 from ._diag import log_degraded
@@ -217,6 +217,53 @@ class Reranker:
         ranked_idx = sorted(scored, key=lambda i: (-scored[i], i))
         unscored = [i for i in range(len(head)) if i not in scored]
         return [head[i] for i in ranked_idx + unscored]
+
+    def scores(self, query: str, items: Sequence[Any],
+               top_n: Optional[int] = None) -> Dict[int, float]:
+        """Relevance score per candidate index, or ``{}`` when unavailable.
+
+        ``rerank`` only reorders, so it cannot answer "is this hit any good?".
+        The KB channel needs the score itself: it wants to DROP irrelevant
+        notes rather than reorder them, and only the reranker's score can tell
+        the two apart (the embedding channel's cosine cannot — measured on the
+        live vault, relevant and unrelated queries overlap at 0.41-0.49).
+
+        Same posture as :meth:`rerank`: never raises on well-formed input, and
+        an empty dict means "could not score" rather than "all zero". The
+        caller decides what an unscored candidate means.
+        """
+        if not self._enabled or not self._available:
+            return {}
+        materialized = list(items)
+        if not materialized or not str(query or "").strip():
+            return {}
+
+        limit = self._resolve_limit(top_n, len(materialized))
+        documents = [self._content_of(item) for item in materialized[:limit]]
+
+        try:
+            payload = self._post(query, documents)
+        except Exception as e:  # noqa: BLE001 — a read path never raises
+            log_degraded("rerank", "scores_call_failed", exc=e)
+            logger.debug("rerank scores call failed: %s", e)
+            return {}
+
+        out: Dict[int, float] = {}
+        if isinstance(payload, dict):
+            for entry in payload.get("results") or []:
+                if not isinstance(entry, dict):
+                    continue
+                index = entry.get("index")
+                score = entry.get("relevance_score")
+                if isinstance(index, int) and not isinstance(index, bool) \
+                        and isinstance(score, (int, float)) \
+                        and not isinstance(score, bool) \
+                        and 0 <= index < len(documents) and index not in out:
+                    out[index] = float(score)
+        if not out:
+            log_degraded("rerank", "scores_bad_response",
+                         detail="no usable 'results' with index/relevance_score")
+        return out
 
     # -- 工具 ------------------------------------------------------------
 

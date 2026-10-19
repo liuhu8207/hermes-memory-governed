@@ -222,7 +222,7 @@ memory:
 pip install httpx
 
 # Full (with L2 vector search)
-pip install lancedb sentence-transformers
+pip install lancedb pyarrow sentence-transformers
 ```
 
 ### 8. Verify
@@ -235,6 +235,34 @@ python "$HERMES_HOME/scripts/memory_cli.py" health
 ```
 
 ## 4. Upgrade
+
+### Source deployment (repository checkout)
+
+When Hermes loads the plugin from `$HERMES_HOME/plugins/governed` and its helper
+scripts from `$HERMES_HOME/scripts`, upgrade from a repository checkout. Do not
+copy the live data directories or replace `governed_memory.json`, `MEMORY.md`,
+`USER.md`, or the vault. Back up the code directories first, then copy only the
+plugin and Python scripts:
+
+```powershell
+$repo = (Resolve-Path .).Path
+$hermesHome = $env:LOCALAPPDATA + '\hermes' # replace if this installation uses another HERMES_HOME
+$stamp = Get-Date -Format 'yyyyMMdd-HHmmss'
+Copy-Item "$hermesHome\plugins\governed" "$hermesHome\plugins\governed.backup-$stamp" -Recurse
+Copy-Item "$hermesHome\scripts" "$hermesHome\scripts.backup-$stamp" -Recurse
+Copy-Item "$repo\plugin\memory_governed\*.py" "$hermesHome\plugins\governed" -Force
+Copy-Item "$repo\scripts\*.py" "$hermesHome\scripts" -Force
+Copy-Item "$repo\memory_cli.py" "$hermesHome\scripts\memory_cli.py" -Force
+```
+
+On Unix, use the equivalent `cp` operations after making timestamped backups.
+Never delete the destination directories wholesale: they may contain local
+files not shipped by the repository. Verify copied files by comparing SHA-256
+hashes, run the health check, and restart Hermes through its normal service
+manager so the running process loads the new code. Keep the backup until a
+cross-layer recall and write/read-back check succeeds.
+
+### PyPI deployment
 
 ```bash
 pip install --upgrade hermes-memory-governed

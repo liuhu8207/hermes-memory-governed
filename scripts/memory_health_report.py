@@ -102,7 +102,10 @@ def check_l2(h: HealthCheck):
         else:
             h.check_warning("L2 memories table", "not created yet")
     except ImportError:
-        h.check_warning("L2 LanceDB", "lancedb not installed")
+        # A monitor that reports "OK" while it cannot read the layer is worse
+        # than no monitor. This used to be a warning, which let the daily
+        # report show 11/11 OK while L2 was never checked at all.
+        h.check("L2 LanceDB", False, "lancedb not installed")
     except Exception as e:
         h.check("L2 LanceDB", False, str(e))
 

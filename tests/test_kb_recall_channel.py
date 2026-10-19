@@ -763,9 +763,10 @@ class TestCliKbSearchObeysArchivePolicy:
             "notes/现行结论.md": _LIVE,
         })
         config["kb"]["search_archived"] = True
-        titles = [r["title"] for r in memory_cli.cmd_kb_search(
-            config, "遗忘规则", 10, "")]
-        assert "旧结论" in titles
+        # The plugin derives the title from the filename, not from the
+        # frontmatter `title`, so assert on the path (the plugin's canonical key).
+        paths = [r["path"].replace("\\", "/") for r in memory_cli.cmd_kb_search(config, "遗忘规则", 10, "")]
+        assert "archive/chats/旧聊天记录.md" in paths
 
     def test_a_note_without_status_is_still_found(self, tmp_path):
         # 缺 status 是常态（导入件 / agent 直接写入）。把「读不到 status」

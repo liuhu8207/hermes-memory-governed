@@ -199,6 +199,10 @@ The plugin registers **10 tools** (3 memory + 7 KB):
 | `governed_kb_read_file` | KB | Read a local file → text |
 | `governed_kb_transcribe` | KB | Transcribe audio → text (ASR; long audio auto-split) |
 
+For the separate seven-tool stdio MCP interface used by other agents, see
+[Attaching another agent](docs/attach-agents.md). MCP write calls can archive
+their supplied turn text to L3; turns without a write use `hgm_sync_turn`.
+
 ## Module map
 
 | Module | Responsibility |

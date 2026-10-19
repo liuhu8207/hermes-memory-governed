@@ -18,7 +18,10 @@ Steps (in order)
 1. bridge  — ``scope_recall_bridge.py export``   Bridge candidate export
 2. persona — ``memory_pipeline.py persona``       L4 persona rebuild
 3. promote — ``memory_promote.py``                L3 recurring → Bridge
-4. health  — ``memory_health_report.py``          health report
+4. consolidate — ``memory_consolidate.py``        L2 near-duplicate report
+5. kb-index — ``kb_reindex.py``                   KB vector index sync
+6. l2-capacity — ``l2_capacity.py``                global L2 cap sweep
+7. health  — ``memory_health_report.py``          health report
 
 Each step is failure-isolated: a failing step is reported but the remaining
 steps still run.  The wrapper exits non-zero if any step failed (so the cron
@@ -53,6 +56,11 @@ ENV_PRESET: Dict[str, str] = {
     "HF_HUB_DISABLE_XET": "1",
 }
 
+#: When this file lives in the repository, point the KB step at that checkout.
+_REPO_ROOT = SCRIPTS_DIR.parent
+if (_REPO_ROOT / "plugin" / "memory_governed" / "_kb.py").exists():
+    ENV_PRESET.setdefault("HGM_REPO", str(_REPO_ROOT))
+
 #: Per-step hard timeout in seconds (mirrors memory_pipeline.run_script).
 STEP_TIMEOUT_SECONDS: int = 900
 
@@ -77,6 +85,9 @@ STEPS: List[Step] = [
     Step("bridge", "scope_recall_bridge.py", ("export",), supports_dry_run=True),
     Step("persona", "memory_pipeline.py", ("persona",), supports_dry_run=True),
     Step("promote", "memory_promote.py", (), supports_dry_run=True),
+    Step("consolidate", "memory_consolidate.py", (), supports_dry_run=True),
+    Step("kb-index", "kb_reindex.py", (), supports_dry_run=True),
+    Step("l2-capacity", "l2_capacity.py", (), supports_dry_run=True),
     Step("health", "memory_health_report.py", (), supports_dry_run=False),
 ]
 
@@ -101,6 +112,25 @@ def _build_env() -> Dict[str, str]:
     return env
 
 
+def _python_executable() -> str:
+    """Prefer the project venv so every step can import lancedb.
+
+    Hermes launches cron with a bare interpreter. Running the health step
+    there made ``lancedb`` look missing, so the report could not inspect L2
+    even though the store was healthy. The venv is the interpreter the
+    plugin actually uses.
+    """
+    repo = os.environ.get("HGM_REPO") or ENV_PRESET.get("HGM_REPO") \
+        or str(SCRIPTS_DIR.parent)
+    for candidate in (
+        Path(repo) / ".venv" / "Scripts" / "python.exe",
+        Path(repo) / ".venv" / "bin" / "python",
+    ):
+        if candidate.is_file():
+            return str(candidate)
+    return sys.executable
+
+
 def _run_step(step: Step, dry_run: bool, env: Dict[str, str]) -> StepOutcome:
     """Run one step as an isolated subprocess.  Never raises."""
     script_path = SCRIPTS_DIR / step.script
@@ -121,7 +151,7 @@ def _run_step(step: Step, dry_run: bool, env: Dict[str, str]) -> StepOutcome:
                 duration=0.0, stdout="(dry-run: step has no --dry-run flag, skipped)",
             )
 
-    cmd = [sys.executable, str(script_path), *args]
+    cmd = [_python_executable(), str(script_path), *args]
     started = time.monotonic()
     try:
         result = subprocess.run(

@@ -203,6 +203,29 @@ class KnowledgeConfig:
     """Knowledge base (Obsidian vault) settings."""
     top_k: int = 10
     min_score: float = 0.0
+    #: 语义通道的地板分（余弦标尺，[0,1]）。**默认 0.0 = 关闭**。
+    #:
+    #: 必须有它：向量索引的 ``search`` 没有分数线，LanceDB 永远返回
+    #: ``limit`` 条最近邻 —— 于是任何查询（包括与库内内容毫无关系的）都会
+    #: 填满 top_k，语义分 0.74~0.41 也能排进来。关键词通道的低估至少被
+    #: ``kw_norm == 0`` 挡住，语义通道没有任何东西挡。
+    #:
+    #: 与 ``recall.l2_semantic_min_score`` 同一约定：代码默认不改行为，
+    #: 部署侧显式开启。L2 侧实测相关带与噪声带重叠，故其默认仍关；KB 侧
+    #: 库容小、查询更杂，可按实测值保守开启（见 reports 的标定）。
+    #:
+    #: ⚠️ 实测（2026-10-19，30 条查询）相关带 0.41~0.84 与无关带 0.31~0.49
+    #: **重叠**，余弦侧没有可用阈值。真正的筛子是 reranker；要开 KB 过滤请设
+    #: :data:`rerank_min_score`。本字段保留给「想按余弦硬截」的部署。
+    semantic_min_score: float = 0.0
+    #: reranker 筛选地板分（``reranking.enabled=true`` 才生效）。
+    #: **默认 0.0 = 关闭**。标定（bge-m3 + bge-reranker-v2-m3，21 篇真实
+    #: 笔记）：无关查询全部 <=0.027，相关查询 0.6~0.99。取 0.05 挡掉全部
+    #: 无关且不漏相关。与 ``semantic_min_score`` 分开，因为两者量纲不同 ——
+    #: 共用一个阈值曾让 0.4 下的全部结果被清空。
+    rerank_min_score: float = 0.0
+    #: 打 KB rerank 调试日志（候选数 / 保留数 / 丢弃数 / 地板分）。默认关。
+    rerank_trace: bool = False
     semantic_enabled: bool = True
     keyword_enabled: bool = True
     #: 半自动沉淀的置信分流阈值：confidence >= 阈值 → notes（正库），
@@ -565,7 +588,8 @@ _NUMERIC_FIELDS = {
     "vector": ["dim"],
     "embedding": ["dimensions"],
     "kb": ["top_k", "min_score", "recall_min_score", "recall_min_kw_score",
-           "recall_max_notes", "mmr_lambda"],
+           "recall_max_notes", "mmr_lambda", "semantic_min_score",
+           "rerank_min_score"],
     "asr": ["timeout_seconds", "chunk_minutes", "max_encoded_bytes"],
     "reranking": ["top_n"],
 }

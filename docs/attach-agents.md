@@ -33,7 +33,7 @@ agent may use more than one.
 | Surface | How it reaches the store | Good for |
 |---|---|---|
 | **CLI** | `python memory_cli.py <cmd>` | Any agent that can run a command. The lowest common denominator. |
-| **MCP tools** | A stdio MCP server exposing six tools | Hosts with MCP support. **~10× faster per call** than the CLI (see below). |
+| **MCP tools** | A stdio MCP server exposing seven tools | Hosts with MCP support. **~10× faster per call** than the CLI (see below). |
 | **Host hooks** | `SessionStart` / `UserPromptSubmit` / `PreToolUse` | Automating *when* memory is consulted and injected, so the agent does not have to remember to. |
 
 ### Why MCP is worth preferring
@@ -55,10 +55,15 @@ python memory_cli.py agents                 # who wrote what
 
 ### MCP tools
 
-Run the server as a stdio MCP server and register it with the host. The six
+Run the server as a stdio MCP server and register it with the host. The seven
 tools are `hgm_recall`, `hgm_remember`, `hgm_kb_search`, `hgm_kb_add`,
-`hgm_agents` and `hgm_transcribe`; `memory_cli.py` is their only implementation,
-so the gate and the provenance rules are identical to the CLI's.
+`hgm_agents`, `hgm_transcribe` and `hgm_sync_turn`. `hgm_recall` searches L2,
+the L3 conversation archive and the knowledge base. Most tools delegate to
+`memory_cli.py`; `hgm_sync_turn` writes through the provider's `sync_turn` path.
+`hgm_remember` and `hgm_kb_add` can also accept `turn_user` and
+`turn_assistant`; when supplied, the turn is automatically archived to L3.
+Use `hgm_sync_turn` when a turn has no memory or knowledge write, so the
+conversation archive remains complete.
 
 ⚠️ **The MCP surface is narrower than the CLI.** `hgm_kb_add` takes only
 `title` / `body` / `section` — tags, concepts, confidence and the source line are
@@ -302,7 +307,7 @@ actually attached for.** Do 4 as well.
    name**. Measured: an agent reported "proves cross-agent visibility" from two
    `agent=None` rows — the check looked passed and had tested nothing.
 5. If hooks are wired: start a fresh session and confirm the injection arrived
-6. If MCP is wired: confirm the host lists the six tools, then confirm a call
+6. If MCP is wired: confirm the host lists the seven tools, then confirm a call
    actually happens — a tool that is *listed* and never *called* is the common
    failure, and it is invisible without a log
 

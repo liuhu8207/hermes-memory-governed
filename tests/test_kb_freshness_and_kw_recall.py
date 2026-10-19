@@ -441,3 +441,21 @@ class TestKeywordRecallChannel:
         engine._config.kb.recall_min_score = 0.45
         engine._config.kb.recall_min_kw_score = min_kw
         assert len(engine._search_kb("q")) == 1
+
+
+def test_sync_index_writes_each_notes_own_mtime(tmp_path):
+    """Every updated row must get its own mtime, not the last loop item's."""
+    kb = _make_kb(tmp_path, {"notes/a.md": NOTE_A, "notes/b.md": NOTE_B})
+    idx = _install(kb, _SemanticIndex())
+    kb.sync_index()
+
+    a = tmp_path / "wiki" / "notes" / "a.md"
+    b = tmp_path / "wiki" / "notes" / "b.md"
+    old = time.time() - 100
+    new = time.time()
+    os.utime(a, (old, old))
+    os.utime(b, (new, new))
+
+    kb.sync_index()
+    assert idx.rows["notes/a.md"][1] == pytest.approx(old, abs=1)
+    assert idx.rows["notes/b.md"][1] == pytest.approx(new, abs=1)

@@ -318,11 +318,25 @@ def plugin_module(name: str):
     """
     if name in _PLUGIN_CACHE:
         return _PLUGIN_CACHE[name]
-    repo = Path(__file__).resolve().parent
-    if str(repo) not in sys.path:
-        sys.path.insert(0, str(repo))
     import importlib
-    mod = importlib.import_module(f"plugin.memory_governed.{name}")
+    repo = Path(__file__).resolve().parent
+    source_package = repo / "plugin" / "memory_governed"
+    if source_package.is_dir():
+        if str(repo) not in sys.path:
+            sys.path.insert(0, str(repo))
+        module_name = f"plugin.memory_governed.{name}"
+    else:
+        # The Windows/Unix installers copy the package files into
+        # HERMES_HOME/plugins/governed rather than installing the repository's
+        # ``plugin.memory_governed`` namespace package.
+        installed_plugins = Path(hermes_home()) / "plugins"
+        if not (installed_plugins / "governed" / "__init__.py").is_file():
+            raise ModuleNotFoundError(
+                "plugin.memory_governed is unavailable from this installation")
+        if str(installed_plugins) not in sys.path:
+            sys.path.insert(0, str(installed_plugins))
+        module_name = f"governed.{name}"
+    mod = importlib.import_module(module_name)
     _PLUGIN_CACHE[name] = mod
     return mod
 
@@ -464,11 +478,38 @@ def cmd_l1():
 
 
 # -- L3: SQLite FTS5 (read-only, WAL-safe) ----------------------------------
+_L3_IMAGE_DATA_RE = re.compile(
+    r"data:image/[A-Za-z0-9.+-]+;base64,[A-Za-z0-9+/=\r\n]+",
+    re.IGNORECASE,
+)
+
+
+def _redact_l3_fallback(text: str) -> str:
+    """CLI-side redaction used when the plugin module cannot be imported."""
+    cleaned = _L3_IMAGE_DATA_RE.sub("[REDACTED_IMAGE]", text or "")
+    for pat in SECRET_PATTERNS:
+        cleaned = pat.sub(
+            lambda m: f"{m.group(1)}=[REDACTED]" if m.lastindex == 2 else "[REDACTED]",
+            cleaned,
+        )
+    return cleaned
+
+
+def _l3_redactor():
+    """Use the one archive-redaction implementation when available."""
+    try:
+        return plugin_module("_sync").redact_for_archive
+    except Exception:  # noqa: BLE001 — a read must still answer on a bare runtime
+        return _redact_l3_fallback
+
+
 def open_l3_ro():
     db = Path(hermes_home()) / "memory" / "l3" / "l3.db"
     if not db.exists():
         return None
-    uri = "file:" + str(db).replace("\\", "/") + "?mode=ro&immutable=1"
+    # Keep SQLite's normal read-only WAL handling. ``immutable=1`` skips WAL
+    # discovery, hiding recently committed messages that have not checkpointed.
+    uri = "file:" + str(db).replace("\\", "/") + "?mode=ro"
     import sqlite3
     return sqlite3.connect(uri, uri=True)
 
@@ -480,10 +521,18 @@ def search_l3(query: str, top_k: int, errors: list = None) -> list:
             errors.append("l3: archive database not found or unreadable")
         return []
     try:
+        tables = {row[0] for row in conn.execute(
+            "select name from sqlite_master where type='table'").fetchall()}
+        if "messages" not in tables:
+            if errors is not None:
+                errors.append("l3: archive table is not initialized")
+            return []
         tokens = re.findall(r"[\w\u4e00-\u9fff]+", query)
         if not tokens:
             return []
+        redact = _l3_redactor()
         results = []
+        seen = set()
         # 1) ranked FTS5 (helps English term/prefix matching)
         try:
             fts = " ".join('"%s"' % t for t in tokens)
@@ -491,7 +540,6 @@ def search_l3(query: str, top_k: int, errors: list = None) -> list:
                 "select rowid from messages_fts where messages_fts match ? limit ?",
                 (fts, max(top_k * 2, 10)),
             ).fetchall()
-            seen = set()
             for (rid,) in rows:
                 if rid in seen:
                     continue
@@ -502,7 +550,7 @@ def search_l3(query: str, top_k: int, errors: list = None) -> list:
                 ).fetchone()
                 if row:
                     results.append({"layer": "l3", "role": row[0],
-                                    "content": (row[1] or "")[:600],
+                                    "content": redact(row[1] or "")[:600],
                                     "timestamp": row[2], "score": 1.0})
                 if len(results) >= top_k:
                     return results
@@ -513,13 +561,19 @@ def search_l3(query: str, top_k: int, errors: list = None) -> list:
             where = " OR ".join("content LIKE ?" for t in tokens)
             like = [f"%{t}%" for t in tokens]
             rows = conn.execute(
-                f"select role, content, timestamp from messages where {where} "
+                f"select rowid, role, content, timestamp from messages where {where} "
                 "order by id desc limit ?",
-                [*like, top_k],
+                [*like, max(top_k * 2, 10)],
             ).fetchall()
-            for role, content, ts in rows:
-                results.append({"layer": "l3", "role": role, "content": (content or "")[:600],
+            for rid, role, content, ts in rows:
+                if rid in seen:
+                    continue
+                seen.add(rid)
+                results.append({"layer": "l3", "role": role,
+                                "content": redact(content or "")[:600],
                                 "timestamp": ts, "score": 0.8})
+                if len(results) >= top_k:
+                    break
         return results
     finally:
         try:
@@ -2215,7 +2269,7 @@ def cmd_remember(config: dict, text: str, agent: str,
     life = plugin_module("_lifecycle")
     mem_dir = life.resolve_memory_dir(cfg)
     if mem_dir is not None:
-        tomb = life.load_tombstones(mem_dir).get(life.content_fp(cleaned))
+        tomb = life.is_tombstoned(cleaned, life.load_tombstones(mem_dir))
         if tomb is not None:
             base.update(_refusal(
                 "tombstoned",
@@ -2889,9 +2943,102 @@ def _kb_search_includes_archived(config: dict) -> bool:
     """
     return bool(config.get("kb", {}).get("search_archived", False))
 
-
 def cmd_kb_search(config: dict, query: str, top_k: int, section: str,
                   errors: list = None) -> list:
+    """Search the knowledge base through the plugin's hybrid ranker.
+
+    The CLI used to carry its own keyword-only scan here. One store then
+    answered the same query in two ways: the plugin ranked ``0.6*semantic +
+    0.4*keyword`` while this path ranked by raw term coverage, so an obvious
+    note could lose first place to one that merely mentioned more words.
+    Measured on the live vault: a query naming the NAS hardware note pushed
+    ``飞牛 NAS 硬件配置`` lost the top spot to ``entity_综合归纳``.
+
+    Ranking is therefore delegated, not reimplemented: ``KnowledgeBase.search``
+    is the same object the plugin and ``hgm_recall`` use, which also means
+    ``kb.semantic_enabled`` / ``keyword_enabled`` / ``search_archived`` apply
+    here at last. The pure-keyword scan stays as the fallback for a bare
+    interpreter (no lancedb, no embeddings), where the plugin path raises
+    instead of answering with fewer results.
+    """
+    hits = _kb_hybrid_search(config, query, top_k, section, errors)
+    if hits is not None:
+        return hits
+    return _kb_keyword_search(config, query, top_k, section, errors)
+
+
+def _kb_hybrid_search(config: dict, query: str, top_k: int, section: str,
+                      errors: list):
+    """Run the plugin's hybrid search, or ``None`` when it cannot run.
+
+    Returning ``None`` (not ``[]``) is what separates "the hybrid channel
+    decided nothing matched" from "the hybrid channel is unavailable": the
+    caller falls back to keyword search only in the second case, so a genuine
+    empty answer is never mistaken for a degradation.
+    """
+    # The shared section validator must run before anything else. Delegating
+    # straight to the plugin skipped it, so ``--section ../memory`` and the
+    # other malformed names the write path refuses were accepted by kb-search
+    # and returned as "no results" - the exact ambiguity the validator exists
+    # to remove.
+    try:
+        if section:
+            split_vault_section(section)
+    except VaultPathEscape as exc:
+        if errors is not None:
+            errors.append(str(exc))
+        return []
+
+    try:
+        cfg_obj = plugin_config()
+        # The caller's ``config`` names the vault to search. Ignoring it here
+        # made every caller silently search the live HERMES_HOME vault instead
+        # of the one they passed - visible in tests that build a sandbox vault,
+        # and fatal anywhere the caller points at another vault.
+        caller_wiki = str((config or {}).get("wiki_dir") or "")
+        if caller_wiki:
+            cfg_obj.wiki_dir = caller_wiki
+        # ``kb.*`` switches are CLI-facing too (search_archived is what the
+        # archive-policy tests pin). The plugin reads them off its own object.
+        for key, value in ((config or {}).get("kb") or {}).items():
+            if hasattr(cfg_obj.kb, key):
+                setattr(cfg_obj.kb, key, value)
+        kb = plugin_module("_kb").KnowledgeBase(cfg_obj)
+        out = kb.search(query, top_k=top_k, section=section or "")
+        results = [{
+                "title": r.get("title") or r.get("path", ""),
+                "path": str(r.get("path", "")),
+                "section": r.get("section", ""),
+                # ``score`` is the relevance WITHOUT the usage bonus;
+                # ``rank_key`` (what ordered the list) multiplies it by up to
+                # 1.15, which flattens the top rows and hides the difference
+                # the caller is reading.
+                "score": round(float(r.get("score", 0.0) or 0.0), 4),
+                "snippet": re.sub(r"\s+", " ", str(r.get("snippet", "")))[:200],
+                "kind": r.get("kind", "hybrid"),
+                "keyword_score": r.get("keyword_score", 0.0),
+                "semantic_score": r.get("semantic_score", 0.0),
+            } for r in out]
+        # A silent skip and a genuinely empty vault look identical, so the notes
+        # that could not be read are named here too. The plugin ranks from the
+        # vector index, so it is the one that has to record this: a note indexed
+        # before its permissions changed still comes back as a hit.
+        if errors is not None:
+            for failure in (getattr(kb, "last_read_failures", None) or []):
+                errors.append(failure)
+            for refusal in (getattr(kb, "last_walk_refusals", None) or []):
+                errors.append(refusal)
+        return results
+    except Exception as exc:  # noqa: BLE001 - fall back, but say why
+        if errors is not None:
+            errors.append(
+                f"kb search degraded to keyword scan: {type(exc).__name__}: {exc}")
+        return None
+
+
+def _kb_keyword_search(config: dict, query: str, top_k: int, section: str,
+                       errors: list) -> list:
+    """Dependency-light keyword scan: the CLI's original behaviour."""
     # No section -> search the whole vault, not a fixed list of sections.
     subdirs = [section] if section else None
     tokens = re.findall(r"[\w\u4e00-\u9fff]+", query)
@@ -2900,10 +3047,10 @@ def cmd_kb_search(config: dict, query: str, top_k: int, section: str,
     for p in iter_notes(config, subdirs, errors):
         # One unreadable note must not take the whole search down.
         # ``iter_notes`` already tolerates ``is_file()`` raising OSError, but the
-        # read itself was unguarded: a note held open by a sync client, a
+        # read itself was unguarded: a file held open by a sync client, a
         # half-restored ACL, or a file vanishing mid-walk raised out of here, so
         # ``hgm_recall`` returned a protocol error and ``hgm_kb_search`` returned
-        # nothing at all — one bad file read as "the vault is empty".
+        # nothing at all, one bad file read as "the vault is empty".
         # Skipped notes are named in ``errors`` for the same reason refusals are:
         # a silent skip and a genuinely empty vault look identical otherwise.
         try:
@@ -2913,6 +3060,11 @@ def cmd_kb_search(config: dict, query: str, top_k: int, section: str,
                 errors.append(f"skipped: '{p}' unreadable ({type(exc).__name__}: {exc})")
             continue
         meta, body = parse_frontmatter(raw)
+        # An empty body is a scaffold file, not knowledge: it matches nothing
+        # on the keyword channel yet the vector index proposes it for any
+        # query. Skipping it keeps the two channels on the same rule.
+        if not str(body).strip():
+            continue
         if not include_archived and \
                 str(meta.get("status", "") or "").strip().lower() == "archived":
             continue
