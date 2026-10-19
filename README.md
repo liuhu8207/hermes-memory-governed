@@ -149,8 +149,34 @@ projects/   PARA — projects with deliverables
 areas/      PARA — long-term responsibilities
 resources/  PARA — external references
 archive/    PARA — archived items
-index.md    MOC navigation entry
+index.md    MOC navigation entry (generated from the controlled categories)
 ```
+
+### Controlled categories
+
+Every note carries a `category` field drawn from a closed set
+(`environment` / `user` / `tooling` / `workflow` / `reference` / `project` /
+`synthesis` / `meta`). It classifies by **purpose, not subject** — the subject
+lives in `tags`/`concepts`, while `category` answers "what do I use this note
+for".
+
+The set is closed because the field has to be usable: free-form labels can be
+neither predicted by a person nor decided by a machine. `index.md` is
+generated from the categories, so finding something no longer means searching
+the whole vault:
+
+```bash
+python memory_cli.py kb-moc --yes                              # rebuild the MOC
+python memory_cli.py kb-migrate-category --apply --yes         # backfill existing notes
+python memory_cli.py kb-search "config" --category tooling     # filter by category
+python memory_cli.py kb-add "Title" "Body" --category tooling  # set it at write time
+```
+
+Without `--category` the value is inferred from the title and tags; when
+nothing can be inferred the key is simply not written — a missing category is
+better than a wrong one, because a wrong one looks like a conclusion. The full
+vocabulary and the decision rules are in
+[`docs/kb-taxonomy.md`](docs/kb-taxonomy.md).
 
 ### Three pipelines
 
@@ -184,7 +210,7 @@ Key architectural decision: distillation uses the **same model id and endpoint**
 
 ## Tools
 
-The plugin registers **10 tools** (3 memory + 7 KB):
+The plugin registers **11 tools** (3 memory + 8 KB):
 
 | Tool | Category | Purpose |
 |------|----------|---------|
@@ -195,6 +221,7 @@ The plugin registers **10 tools** (3 memory + 7 KB):
 | `governed_kb_add` | KB | Write/update a note (with governance) |
 | `governed_kb_get` | KB | Fetch a note's full body |
 | `governed_kb_review` | KB | Approve/reject inbox candidates |
+| `governed_kb_govern` | KB | Governance sweep: promotion + auto-archive |
 | `governed_kb_fetch` | KB | Fetch a URL → text |
 | `governed_kb_read_file` | KB | Read a local file → text |
 | `governed_kb_transcribe` | KB | Transcribe audio → text (ASR; long audio auto-split) |
@@ -336,7 +363,7 @@ python scripts/scope_recall_bridge.py validate        # validate candidates
 
 ## Testing & CI
 
-- Local full suite: `python -m pytest tests/ -q` → **1327 passed** (2026-09-18).
+- Local full suite: `python -m pytest tests/ -q` → **1832 passed** (2026-10-19).
 - CI (`[.github/workflows/ci.yml](.github/workflows/ci.yml)`) runs a **4-dimension matrix** — `py3.10` / `py3.13` × `core` / `vector`:
   - `core` installs `.[dev]` only (no vector backend → exercises the degradation path).
   - `vector` installs the lightweight backend (`lancedb` + `pyarrow` + `fastembed`, **not** `sentence-transformers`, which would pull ~2GB of torch).
@@ -346,6 +373,7 @@ python scripts/scope_recall_bridge.py validate        # validate candidates
 - [docs/architecture.md](docs/architecture.md) — full architecture
 - [docs/hybrid-architecture.md](docs/hybrid-architecture.md) — cloud + local hybrid deployment design
 - [docs/phase3-design.md](docs/phase3-design.md) — knowledge distillation design
+- [docs/kb-taxonomy.md](docs/kb-taxonomy.md) — controlled KB category vocabulary
 - [docs/configuration.md](docs/configuration.md) — all config options
 - [docs/install.md](docs/install.md) — installation guide (start at §0: already installed?)
 - [docs/attach-agents.md](docs/attach-agents.md) — attaching a second agent: CLI, MCP tools, host hooks

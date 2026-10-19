@@ -65,11 +65,21 @@ the L3 conversation archive and the knowledge base. Most tools delegate to
 Use `hgm_sync_turn` when a turn has no memory or knowledge write, so the
 conversation archive remains complete.
 
-⚠️ **The MCP surface is narrower than the CLI.** `hgm_kb_add` takes only
-`title` / `body` / `section` — tags, concepts, confidence and the source line are
-neither exposed nor accepted, and are discarded if a client sends them. There is
-also no `kb-get` over MCP, so an agent on this surface can search the knowledge
-base but cannot read a full note back. Use the CLI for those.
+⚠️ **The MCP surface is narrower than the CLI.** `hgm_kb_add` takes
+`title` / `body` / `section` / `category` / `tags` / `concepts` — **confidence
+and the source line are neither exposed nor accepted**, and are discarded if a
+client sends them. Tags and concepts may arrive as a JSON array or as a
+comma-separated string; both are normalised. There is also no `kb-get` over
+MCP, so an agent on this surface can search the knowledge base but cannot read a
+full note back. Use the CLI for those.
+
+Pass `category` when you know it — it is the only field that makes a note
+findable by kind rather than by keyword. Values are a closed set
+(`environment` / `user` / `tooling` / `workflow` / `reference` / `project` /
+`synthesis` / `meta`); an unknown value is discarded and the category is
+inferred from the title and tags instead, so a wrong guess never lands in the
+vault. Without it the note is still written, just harder to browse. See
+[`kb-taxonomy.md`](kb-taxonomy.md).
 
 The one ingest path that **is** on this surface is audio: `hgm_transcribe` turns a
 recording into text — see *Bringing in a recording* below.
@@ -211,7 +221,7 @@ stages, and the store only owns the first:
   `kb-add`. The note is the durable summary, not a transcript: keep identifiers,
   paths, hostnames, versions, parameters and constraints. Put the source — URL,
   file path, date — **in the body**; there is no `--source` flag, and over MCP
-  `hgm_kb_add` accepts only `title` / `body` / `section` and ignores the rest.
+  `hgm_kb_add` has no source field and ignores one if a client sends it.
 
 Storing documents directly is **not implemented** — ingestion lives with the
 agent, not with the store. Do not assume otherwise without checking.

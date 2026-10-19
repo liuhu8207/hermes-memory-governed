@@ -149,8 +149,29 @@ projects/   PARA — 有明确产出的项目
 areas/      PARA — 长期负责的领域
 resources/  PARA — 外部资料/参考
 archive/    PARA — 归档
-index.md    MOC 导航入口
+index.md    MOC 导航入口（按受控分类自动生成）
 ```
+
+### 受控分类
+
+每篇笔记带一个 `category` 字段，取值封闭（`environment` / `user` /
+`tooling` / `workflow` / `reference` / `project` / `synthesis` / `meta`）。
+**分类依据用途而非主题**——主题写在 `tags`/`concepts` 里，`category` 管
+"我拿这条笔记做什么"。
+
+分类是受控的，因为它要能用：自由文本标签既不能被人预测，也不能被机器
+判定归属。`index.md` 的 MOC 按类目自动生成，找东西不必全库搜索：
+
+```bash
+python memory_cli.py kb-moc --yes                              # 重建导航
+python memory_cli.py kb-migrate-category --apply --yes         # 给存量笔记补分类
+python memory_cli.py kb-search "配置" --category tooling       # 按类目检索
+python memory_cli.py kb-add "标题" "正文" --category tooling   # 写入时指定
+```
+
+不传 `--category` 时按标题与标签推断；推断不出就不写这个键（宁可缺
+分类，也不要一个看起来像结论的错分类）。完整词表与判定规则见
+[`docs/kb-taxonomy.md`](docs/kb-taxonomy.md)。
 
 ### 三条链路
 
@@ -184,7 +205,7 @@ LLM 归纳（与 agent 对话模型同款）
 
 ## 工具清单
 
-插件注册 **10 个工具**（3 记忆 + 7 KB）：
+插件注册 **11 个工具**（3 记忆 + 8 KB）：
 
 | 工具 | 类别 | 用途 |
 |------|------|------|
@@ -195,6 +216,7 @@ LLM 归纳（与 agent 对话模型同款）
 | `governed_kb_add` | KB | 写入/更新笔记（带治理） |
 | `governed_kb_get` | KB | 读取笔记完整正文 |
 | `governed_kb_review` | KB | 审核 inbox 候选（approve/reject） |
+| `governed_kb_govern` | KB | 治理巡检：晋升建议 + 自动归档 |
 | `governed_kb_fetch` | KB | 抓取 URL → 文本 |
 | `governed_kb_read_file` | KB | 读取本地文件 → 文本 |
 | `governed_kb_transcribe` | KB | 音频转写（ASR；长音频自动切分） |
@@ -334,7 +356,7 @@ python scripts/scope_recall_bridge.py validate        # 校验候选
 
 ## 测试与 CI
 
-- 本地全量测试：`python -m pytest tests/ -q` → **1327 passed**（2026-09-18）。
+- 本地全量测试：`python -m pytest tests/ -q` → **1832 passed**（2026-10-19）。
 - CI（[`.github/workflows/ci.yml`](.github/workflows/ci.yml)）跑 **4 维矩阵**——`py3.10` / `py3.13` × `core` / `vector`：
   - `core` 只装 `.[dev]`（无向量后端 → 验证降级路径）。
   - `vector` 装轻量后端（`lancedb` + `pyarrow` + `fastembed`，**不装** `sentence-transformers`，避免拖 ~2GB 的 torch）。
@@ -344,6 +366,7 @@ python scripts/scope_recall_bridge.py validate        # 校验候选
 - [docs/architecture.md](docs/architecture.md) — 完整架构
 - [docs/hybrid-architecture.md](docs/hybrid-architecture.md) — 云端 + 本地混合部署设计
 - [docs/phase3-design.md](docs/phase3-design.md) — 知识蒸馏设计
+- [docs/kb-taxonomy.md](docs/kb-taxonomy.md) — 知识库受控分类词表
 - [docs/configuration.md](docs/configuration.md) — 配置项
 - [docs/install.md](docs/install.md) — 安装指南
 - [docs/operations.md](docs/operations.md) — cron 顺序和运维
