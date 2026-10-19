@@ -170,6 +170,15 @@ TOOLS = [
                 "title": {"type": "string"},
                 "body": {"type": "string"},
                 "section": {"type": "string", "description": "Vault subdirectory (default notes)."},
+                "category": {"type": "string",
+                             "description": ("Controlled category: environment / user / "
+                                             "tooling / workflow / reference / project / "
+                                             "synthesis / meta. Optional — inferred from "
+                                             "title and tags when omitted.")},
+                "tags": {"type": "array", "items": {"type": "string"},
+                         "description": "Free-form topic tags."},
+                "concepts": {"type": "array", "items": {"type": "string"},
+                             "description": "Concepts to link via [[wikilink]]."},
                 "session_id": {"type": "string",
                                "description": "Stable session ID for auto-archiving the turn into L3."},
                 "turn_user": {"type": "string",
@@ -248,6 +257,22 @@ def _cli():
 
 def _agent() -> str:
     return _cli().resolve_agent("")
+
+
+def _str_list(value) -> list:
+    """把 MCP 参数里的 tags/concepts 归一成 ``list[str]``。
+
+    不同 agent 传法不一致：有的给 list，有的给逗号分隔字符串，有的给
+    null。全部收敛成 list[str]，空的/坏的产出空 list —— 写路径本来就容忍
+    缺失，不该因为参数形状不对就抛给调用方。
+    """
+    if value is None:
+        return []
+    if isinstance(value, str):
+        return [p.strip() for p in value.split(",") if p.strip()]
+    if isinstance(value, (list, tuple)):
+        return [str(v).strip() for v in value if str(v).strip()]
+    return [str(value).strip()]
 
 
 def _provider():
@@ -428,7 +453,11 @@ def tool_kb_add(args: dict) -> str:
     if not title or not body:
         raise ValueError("title and body are required")
     result = cli.cmd_kb_add(cli.load_config(), title, body,
-                            args.get("section") or "notes", [], [], None, _agent())
+                            args.get("section") or "notes",
+                            _str_list(args.get("tags")),
+                            _str_list(args.get("concepts")),
+                            None, _agent(),
+                            category=str(args.get("category") or ""))
     out = json.dumps(result, ensure_ascii=False, indent=2)
     if result.get("ok"):
         _auto_archive_turn(args, "hgm_kb_add", out)

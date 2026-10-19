@@ -44,65 +44,6 @@ logger = logging.getLogger(__name__)
 VAULT_SUBDIRS = ["inbox", "notes", "projects", "areas", "resources", "archive",
                  "knowledge"]
 
-#: 受控分类词表（``category`` frontmatter 字段的唯一合法取值）。
-#:
-#: 为什么不在 ``tags`` 上做文章：``tags`` 是自由文本，实测库内中英混写、
-#: 粒度不一（``["nas", "硬件", "飞牛", "i3-N305"]`` 里既有概念又有实例还有
-#: 语言），既不能被人预测，也不能被机器判定归属。分类要可用，取值必须是
-#: **封闭集合**：写的人从里面选，读的人知道会读到什么。
-#:
-#: 社区实践（Obsidian/PKM 圈的长期争论）收敛到同一条：纯文件夹会造出第二套
-#: 与链接结构竞争的并行分类法，纯 tag 又不可预测且无法浏览；可维护的方案是
-#: 「一个受控字段定类目 + 自动 MOC 按类目建索引」。这里就是那个受控字段，
-#: MOC 侧见 ``KnowledgeBase.rebuild_moc``。
-#:
-#: 分类依据**用途**而非主题（"我在拿这条笔记做什么"），主题交给 tags/concepts：
-#: 主题会无限增生，用途不会。新增类目请同步 ``docs/kb-taxonomy.md``。
-KB_CATEGORIES = [
-    "environment",   # 机器/网络/系统环境事实（本机、NAS、服务器、隧道）
-    "user",          # 用户画像与偏好（城市、硬件倾向、工作流习惯）
-    "tooling",       # 工具与服务的配置、选型、排障（Hermes、dsh、browser-skill）
-    "workflow",      # 流程与方法（怎么做事、步骤、约定）
-    "reference",     # 外部资料与规格（API 端点能力、硬件规格表）
-    "project",       # 具体项目的状态与决策
-    "synthesis",     # 跨笔记归纳卡（*_综合归纳）
-    "meta",          # 关于这套记忆系统本身
-]
-
-#: ``type`` frontmatter 的旧值与新 ``category`` 的映射（迁移用）。
-#: 旧值里 ``note``/``notes`` 只是 section 名重复，没有分类信息，不进映射。
-_TYPE_TO_CATEGORY = {
-    "category": "meta",
-    "moc": "meta",
-}
-
-#: 从 tags/concepts/title 推断 category 的关键词表。
-#: 顺序即优先级：先匹配到的赢。每条是 (category, [关键词小写])。
-_CATEGORY_HINTS: List[Tuple[str, List[str]]] = [
-    # 顺序即优先级：先匹配到的赢。顺序经过真实库标定 —— 把强信号放前面，
-    # 弱信号（"api" 这种到处都有的词）放后面，否则一篇讲某工具怎么装的笔记
-    # 会因为正文里出现过 "api" 被判成 reference。
-    ("synthesis", ["综合归纳", "synthesis"]),
-    ("meta", ["hermes", "shared memory", "共享记忆", "hgm", "记忆系统",
-              "governed", "plugin"]),
-    ("reference", ["规格", "spec", "端点", "endpoint", "支持规格", "能力",
-                   "capability", "选型"]),
-    # "配置" 单独出现时不作数：一篇讲 NAS 硬件事实的笔记标题里也有"配置"，
-    # 但它描述的是环境，不是工具怎么配。要判 tooling，得是"某工具的配置"。
-    ("tooling", ["dsh", "browser-skill", "bsk", "zcode", "mimo", "octop",
-                 "api", "config", "troubleshooting", "upgrade",
-                 "provider", "model", "gateway", "安装", "坑", "升级",
-                 "配置：", "配置:", "provider kind", "改配置"]),
-    ("user", ["用户", "偏好", "user", "preference", "工作流偏好",
-              "地理位置", "location"]),
-    ("environment", ["nas", "硬件", "hardware", "pc", "服务器", "server",
-                     "network", "网络", "wireguard", "vpn", "routeros",
-                     "homelab", "linux", "环境", "cpu", "内存", "存储",
-                     "ip", "ssh"]),
-    ("workflow", ["workflow", "工作流", "流程", "方法", "约定", "步骤"]),
-    ("project", ["project", "项目"]),
-]
-
 #: Windows / 通用文件系统非法字符（文件名用）
 _ILLEGAL_FS = re.compile(r'[<>:"/\\|?*\x00-\x1f]')
 
@@ -240,6 +181,115 @@ def parse_frontmatter(text: str) -> Tuple[Dict[str, Any], str]:
     return data, body
 
 
+#: 受控分类词表（``category`` frontmatter 字段的唯一合法取值）。
+#:
+#: 为什么不在 ``tags`` 上做文章：``tags`` 是自由文本，实测库内中英混写、
+#: 粒度不一（``["nas", "硬件", "飞牛", "i3-N305"]`` 里既有概念又有实例还有
+#: 语言），既不能被人预测，也不能被机器判定归属。分类要可用，取值必须是
+#: **封闭集合**：写的人从里面选，读的人知道会读到什么。
+#:
+#: 社区实践（Obsidian/PKM 圈的长期争论）收敛到同一条：纯文件夹会造出第二套
+#: 与链接结构竞争的并行分类法，纯 tag 又不可预测且无法浏览；可维护的方案是
+#: 「一个受控字段定类目 + 自动 MOC 按类目建索引」。这里就是那个受控字段，
+#: MOC 侧见 ``KnowledgeBase.rebuild_moc``。
+#:
+#: 分类依据**用途**而非主题（"我在拿这条笔记做什么"），主题交给 tags/concepts：
+#: 主题会无限增生，用途不会。新增类目请同步 ``docs/kb-taxonomy.md``。
+KB_CATEGORIES = [
+    "environment",   # 机器/网络/系统环境事实（本机、NAS、服务器、隧道）
+    "user",          # 用户画像与偏好（城市、硬件倾向、工作流习惯）
+    "tooling",       # 工具与服务的配置、选型、排障（Hermes、dsh、browser-skill）
+    "workflow",      # 流程与方法（怎么做事、步骤、约定）
+    "reference",     # 外部资料与规格（API 端点能力、硬件规格表）
+    "project",       # 具体项目的状态与决策
+    "synthesis",     # 跨笔记归纳卡（*_综合归纳）
+    "meta",          # 关于这套记忆系统本身
+]
+
+#: ``type`` frontmatter 的旧值与新 ``category`` 的映射（迁移用）。
+#: 旧值里 ``note``/``notes`` 只是 section 名重复，没有分类信息，不进映射。
+_TYPE_TO_CATEGORY = {
+    "category": "meta",
+    "moc": "meta",
+}
+
+#: 从 tags/concepts/title 推断 category 的关键词表。
+#: 顺序即优先级：先匹配到的赢。每条是 (category, [关键词小写])。
+#: 受控分类的关键词证据表。
+#:
+#: 匹配规则分两种（见 :func:`_keyword_pattern`）：
+#: * **ASCII 关键词**（``api`` / ``ip`` / ``nas``）走**词边界**匹配。
+#:   裸子串匹配会让 ``script`` / ``recipe`` / ``skip`` / ``pipeline`` /
+#:   ``shipping`` 全部因为含 "ip" 被判成 environment，``capital`` /
+#:   ``apiary`` 因为含 "api" 被判成 tooling —— 英文笔记会大面积误分类。
+#: * **CJK 关键词**（``硬件`` / ``配置``）走子串匹配：中文没有词边界，
+#:   按词切分会漏掉「内存」这类词内命中。
+_CATEGORY_HINTS: List[Tuple[str, List[str]]] = [
+    ("synthesis", ["综合归纳"]),
+    ("meta", ["hermes", "shared memory", "共享记忆", "hgm", "记忆系统",
+              "governed", "plugin"]),
+    ("reference", ["规格", "spec", "端点", "endpoint", "capability"]),
+    # "配置" 单独出现时不作数：一篇讲 NAS 硬件事实的笔记标题里也有"配置"，
+    # 但它描述的是环境，不是工具怎么配。要判 tooling，得是"某工具的配置"。
+    ("tooling", ["dsh", "browser-skill", "bsk", "zcode", "mimo", "octop",
+                 "api", "config", "troubleshooting", "upgrade",
+                 "provider", "model", "gateway", "安装", "坑", "升级"]),
+    ("user", ["用户", "偏好", "user", "preference", "location"]),
+    ("environment", ["nas", "硬件", "hardware", "pc", "服务器", "server",
+                     "network", "网络", "wireguard", "vpn", "routeros",
+                     "homelab", "linux", "环境", "cpu", "内存", "存储",
+                     "ip", "ssh"]),
+    ("workflow", ["workflow", "流程", "方法", "约定", "步骤"]),
+    ("project", ["project", "项目"]),
+]
+
+#: **标题标志词** —— 中文笔记标题是 ``<主体>_<属性>`` 结构，结尾的属性词说明
+#: 这篇笔记**是什么类型**，而不是它讲什么。这比"哪个关键词更强"更接近真
+#: 实判据：同一批词摆在不同位置含义完全不同 ——
+#: ``hermes_综合归纳`` 结尾的「综合归纳」是类型（synthesis），
+#: ``ZCode provider kind 配置`` 结尾的「配置」也是类型（tooling），
+#: ``飞牛 NAS 硬件配置`` 结尾的「配置」却是内容（environment），
+#: 区别在于它被「硬件」修饰成了「硬件配置」这个整体。
+#:
+#: 所以匹配规则是**最长匹配优先**：``硬件配置``(4 字) 先于 ``配置``(2 字)
+#: 命中，于是前一篇落进 environment、后一篇落进 tooling —— 无需任何权重。
+#:
+#: 第一组是**无歧义**标志词（标题任意位置出现即可）；
+#: 第二组是**歧义**标志词（只有位于标题**结尾**才算），因为它们在句中
+#: 常常只是内容描述而非类型声明。
+_TITLE_MARKERS: List[Tuple[str, str, bool]] = [
+    # (标志词, 类目, 是否必须位于标题结尾)
+    ("综合归纳", "synthesis", False),
+    ("共享记忆", "meta", False),
+    ("记忆系统", "meta", False),
+    ("重启验证", "meta", False),
+    ("支持规格", "reference", False),
+    ("配套规格", "reference", False),
+    ("端点能力", "reference", False),
+    ("知识库选型", "reference", False),
+    ("硬件配置", "environment", False),
+    ("系统环境", "environment", False),
+    ("隧道拓扑", "environment", False),
+    ("升级坑", "tooling", False),
+    ("工作流偏好", "user", False),
+    # 以下歧义：只在标题结尾才算类型声明
+    ("配置", "tooling", True),
+    ("安装", "tooling", True),
+    ("升级", "tooling", True),
+    ("开通", "meta", True),
+    ("规格", "reference", True),
+    ("选型", "reference", True),
+]
+
+#: 标题标志词按长度降序（最长匹配优先）。模块级常量，建一次即可。
+_TITLE_MARKERS_SORTED = sorted(
+    _TITLE_MARKERS, key=lambda m: -len(m[0]))
+
+#: ASCII 关键词的词边界匹配缓存：``keyword -> compiled_pattern``（None = CJK）。
+#: 关键词表是模块级常量，编译一次即可，不必每次推断都重编。
+_KEYWORD_PATTERNS: Dict[str, Optional["re.Pattern[str]"]] = {}
+
+
 def normalize_category(value: Any) -> str:
     """把任意输入归一成受控词表里的合法值；不合法/空 → ""。
 
@@ -253,12 +303,112 @@ def normalize_category(value: Any) -> str:
     return v if v in KB_CATEGORIES else ""
 
 
+def _keyword_pattern(keyword: str) -> "Optional[re.Pattern[str]]":
+    """返回该关键词的匹配正则；CJK 关键词返回 None（走子串）。
+
+    ASCII 关键词加 ``(?<![a-z0-9])`` / ``(?![a-z0-9])`` 前后哨兵：这样
+    ``api`` 只在独立词位置命中，不会从 ``apiary`` / ``capital`` 里抠出来。
+    连字符与空格（``browser-skill`` / ``provider kind``）由哨兵之外的字符
+    放行，词内连字符不影响匹配。
+    """
+    if keyword in _KEYWORD_PATTERNS:
+        return _KEYWORD_PATTERNS[keyword]
+    pat: Optional[re.Pattern[str]] = None
+    if keyword.isascii():
+        pat = re.compile(r"(?<![a-z0-9])" + re.escape(keyword)
+                         + r"(?![a-z0-9])", re.IGNORECASE)
+    _KEYWORD_PATTERNS[keyword] = pat
+    return pat
+
+
+#: 标题命中的权重倍数。标题是人写的命名约定，tags/concepts 更可能是
+#: 自动抽取的噪声 —— 前者应该是更强的证据。
+_TITLE_WEIGHT = 2
+
+
+def _keyword_weight(keyword: str) -> int:
+    """证据权重：越具体的关键词权重越高，封顶 12。
+
+    长度是「具体程度」的可用代理 —— ``hermes``（6）比 ``api``（3）更像
+    在说"关于这套系统"。只在标题没有标志词时作为**回退**判据使用。
+    """
+    return min(len(keyword), 12)
+
+
+def _title_marker_category(title: str) -> str:
+    """按标题标志词判定类目；无标志词 → ""。
+
+    最长匹配优先，所以 ``硬件配置`` 永远压过 ``配置``。歧义标志词要求位于
+    标题结尾（允许尾随空白），因为只有结尾才构成类型声明。
+    """
+    t = (title or "").strip()
+    if not t:
+        return ""
+    low = t.lower()
+    for marker, category, must_be_tail in _TITLE_MARKERS_SORTED:
+        m = marker.lower()
+        if must_be_tail:
+            if low.endswith(m):
+                return category
+        elif m in low:
+            return category
+    return ""
+
+def _category_scores(head: str, meta_text: str) -> List[Tuple[int, int, int, str]]:
+    """关键词回退通道：给每个类目算「最强单条证据 + 累加总量」。
+
+    只在**标题标志词**没给出答案时使用（见 :func:`_title_marker_category`）。
+
+    排序键是**单条最强证据**（``max``）而不是累加总量 —— 一篇讲
+    「Hermes 记忆系统的 API 端点」的笔记会在 meta / tooling / reference
+    三家各命中一个弱词，累加到三家平手，而标题里那个决定性的
+    「记忆系统」属于 meta。累加值只用来在最强证据**同分**时做区分。
+
+    返回 ``(最强单条分, 累加总分, -书写顺序, category)``，降序。
+    """
+    scores: List[Tuple[int, int, int, str]] = []
+    for order, (category, keywords) in enumerate(_CATEGORY_HINTS):
+        best = 0
+        total = 0
+        for kw in keywords:
+            low = kw.lower()
+            pat = _keyword_pattern(low)
+            base = _keyword_weight(low)
+            hit = 0
+            if pat is None:                      # CJK：子串匹配
+                if low in head:
+                    hit = base * _TITLE_WEIGHT
+                elif low in meta_text:
+                    hit = base
+            else:                                # ASCII：词边界匹配
+                if pat.search(head):
+                    hit = base * _TITLE_WEIGHT
+                elif pat.search(meta_text):
+                    hit = base
+            if hit:
+                best = max(best, hit)
+                total += hit
+        if best:
+            scores.append((best, total, -order, category))
+    scores.sort(reverse=True)
+    return scores
+
+
 def infer_category(title: str, tags: Any, concepts: Any = None,
                    body: str = "") -> str:
     """从 title/tags/concepts 推断受控分类。推断不出 → ""（绝不硬猜）。
 
-    关键词全部小写比对，因此中文 tag 原样命中、英文 tag 大小写无关。
-    ``body`` 只在 title/tags/concepts 都没命中时参与，且只取前 400 字 ——
+    **两道通道，标题标志词优先**：
+
+    1. :func:`_title_marker_category` —— 标题结尾的属性词说明这篇笔记
+       **是什么类型**（``hermes_综合归纳`` → synthesis、``ZCode ... 配置``
+       → tooling）。这是最强的判据，因为它读的是标题的**构词法**。
+    2. :func:`_category_scores` —— 关键词加权（标题权重 2 倍，ASCII 走词
+       边界）作为回退，用于标题没有标志词的笔记（多为英文标题）。
+
+    两道通道都判不出 → ""，绝不硬猜。
+
+    ``body`` 只在 title/tags/concepts 全空时参与，且只取前 400 字 ——
     分类是导航属性，靠标题和元数据就该能定，正文只是最后的兜底。
     """
     def _as_list(v: Any) -> List[str]:
@@ -268,15 +418,19 @@ def infer_category(title: str, tags: Any, concepts: Any = None,
             return [str(x) for x in v]
         return []
 
-    hay = " ".join(_as_list(tags) + _as_list(concepts) + [title or ""]).lower()
-    if not hay.strip():
-        hay = (body or "")[:400].lower()
+    by_marker = _title_marker_category(title or "")
+    if by_marker:
+        return by_marker
 
-    for category, keywords in _CATEGORY_HINTS:
-        for kw in keywords:
-            if kw.lower() in hay:
-                return category
-    return ""
+    head = str(title or "").lower()
+    meta_text = " ".join(_as_list(tags) + _as_list(concepts)).lower()
+    if not head.strip() and not meta_text.strip():
+        head = (body or "")[:400].lower()
+    if not (head.strip() or meta_text.strip()):
+        return ""
+
+    scores = _category_scores(head, meta_text)
+    return scores[0][3] if scores else ""
 
 
 def write_note(path: Path, meta: Dict[str, Any], body: str) -> None:

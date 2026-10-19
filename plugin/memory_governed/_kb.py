@@ -378,9 +378,22 @@ class _Note:
         return _as_list(self.meta.get("concepts"))
 
     @property
+    def category(self) -> str:
+        """受控分类；缺失或非法 → ""（见 ``_vault.normalize_category``）。"""
+        return _vault.normalize_category(self.meta.get("category"))
+
+    @property
     def short_text(self) -> str:
-        """用于 bigram 命中的短文本（标题 + 标签 + 概念）。"""
-        return " ".join([self.title] + self.tags + self.concepts)
+        """用于 bigram 命中的短文本（标题 + 标签 + 概念 + 分类）。
+
+        分类进关键词通道是有意的：``kb-search --category tooling`` 里
+        ``tooling`` 会作为一个词命中，于是「按类目筛 + 用类目名检索」两种
+        用法都能走同一条路，而不必先过滤再各自排序。
+        """
+        parts = [self.title] + self.tags + self.concepts
+        if self.category:
+            parts.append(self.category)
+        return " ".join(parts)
 
     @property
     def full_text(self) -> str:
@@ -1437,7 +1450,8 @@ class KnowledgeBase:
         """
         return min(cls._keyword_score(query, note) / _KEYWORD_SCORE_DENOM, 1.0)
 
-    def search(self, query: str, top_k: int = 10, section: str = "") -> List[Dict[str, Any]]:
+    def search(self, query: str, top_k: int = 10, section: str = "",
+               category: str = "") -> List[Dict[str, Any]]:
         """融合检索：关键词 + 语义（权重融合） + 反链统计。
 
         两路分数各自归一化到 [0,1] 后按 :data:`_KB_KW_WEIGHT` /
@@ -1457,6 +1471,10 @@ class KnowledgeBase:
         当前真值**（自愈成功就报新鲜），同步前的差异计数在 ``pre_sync_*`` ——
         两者分开是 2026-09-17 的修正：旧实现只挂同步前那一份，于是自愈成功
         了却报「结果可能不全」，是误报。
+
+        ``section``（按 vault 子目录）与 ``category``（按受控分类）是两道
+        独立的门，可同时给。``category`` 传了非法值直接返回空 —— 静默忽略
+        过滤条件会让「我按 tooling 筛却拿到全部」看起来像筛选生效了。
         """
         if not query.strip():
             return []
@@ -1467,8 +1485,17 @@ class KnowledgeBase:
         if not _search_includes_archived(self._config.kb):
             archived_rels = {self._rel(n.path) for n in notes if _is_archived(n)}
             notes = [n for n in notes if not _is_archived(n)]
-        if section:
-            notes = [n for n in notes if n.section == section]
+        want_section = section or ""
+        want_category = ""
+        if want_section:
+            notes = [n for n in notes if n.section == want_section]
+        if category:
+            # 非法类目直接判空结果，而不是静默忽略这个过滤条件 ——
+            # 后者会让「我按 tooling 筛却拿到全部」看起来像筛选生效了。
+            want_category = _vault.normalize_category(category)
+            if not want_category:
+                return []
+            notes = [n for n in notes if n.category == want_category]
 
         kb_cfg = self._config.kb
         keyword_on = bool(getattr(kb_cfg, "keyword_enabled", True))
@@ -1636,8 +1663,24 @@ class KnowledgeBase:
             "rerank": rerank_state,
         }
 
+        # 候选集 = 关键词路 ∪ 语义路。**过滤必须在这个并集上做**，不能只
+        # 过滤关键词候选：语义路会带进 notes 列表之外的路径（索引投影滞后、
+        # 或 vault 里已移动的笔记），只在 notes 上过滤会让 section/category
+        # 门被语义路绕过 —— 实测 section="inbox" 仍返回 notes 里的笔记。
+        cat_by_rel: Dict[str, str] = {}
+        sec_by_rel: Dict[str, str] = {}
+        for n in notes:
+            cat_by_rel[self._rel(n.path)] = n.category
+            sec_by_rel[self._rel(n.path)] = n.section
+
         scored: Dict[str, Dict[str, Any]] = {}
         for rel in set(kw_norm) | set(sem_norm):
+            if want_category and cat_by_rel.get(rel, "") != want_category:
+                continue
+            # ``.get(rel, "")`` 对不在 notes 里的路径返回 ""，于是任何非空
+            # section / category 都能把它们挡在外面。
+            if want_section and sec_by_rel.get(rel, "") != want_section:
+                continue
             kw = kw_norm.get(rel, 0.0)
             sem = sem_norm.get(rel, 0.0)
             note = note_by_rel.get(rel)
@@ -1691,6 +1734,7 @@ class KnowledgeBase:
                 "title": title,
                 "path": rel,
                 "section": section_name,
+                "category": cat_by_rel.get(rel, ""),
                 "score": round(base, 4),
                 "rank_key": round(rank_key, 4),
                 "kind": kind,

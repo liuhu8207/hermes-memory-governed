@@ -2921,29 +2921,87 @@ KB_CATEGORIES = [
 ]
 
 _CATEGORY_HINTS: List[Tuple[str, List[str]]] = [
-    # 顺序即优先级：先匹配到的赢。顺序经过真实库标定 —— 把强信号放前面，
-    # 弱信号（"api" 这种到处都有的词）放后面，否则一篇讲某工具怎么装的笔记
-    # 会因为正文里出现过 "api" 被判成 reference。
-    ("synthesis", ["综合归纳", "synthesis"]),
+    # ASCII 关键词走词边界匹配、CJK 走子串匹配 —— 理由与插件侧 _vault.py
+    # 的同名表逐条对应（两侧由测试钉住一致）。
+    ("synthesis", ["综合归纳"]),
     ("meta", ["hermes", "shared memory", "共享记忆", "hgm", "记忆系统",
               "governed", "plugin"]),
-    ("reference", ["规格", "spec", "端点", "endpoint", "支持规格", "能力",
-                   "capability", "选型"]),
-    # "配置" 单独出现时不作数：一篇讲 NAS 硬件事实的笔记标题里也有"配置"，
-    # 但它描述的是环境，不是工具怎么配。要判 tooling，得是"某工具的配置"。
+    ("reference", ["规格", "spec", "端点", "endpoint", "capability"]),
     ("tooling", ["dsh", "browser-skill", "bsk", "zcode", "mimo", "octop",
                  "api", "config", "troubleshooting", "upgrade",
-                 "provider", "model", "gateway", "安装", "坑", "升级",
-                 "配置：", "配置:", "provider kind", "改配置"]),
-    ("user", ["用户", "偏好", "user", "preference", "工作流偏好",
-              "地理位置", "location"]),
+                 "provider", "model", "gateway", "安装", "坑", "升级"]),
+    ("user", ["用户", "偏好", "user", "preference", "location"]),
     ("environment", ["nas", "硬件", "hardware", "pc", "服务器", "server",
                      "network", "网络", "wireguard", "vpn", "routeros",
                      "homelab", "linux", "环境", "cpu", "内存", "存储",
                      "ip", "ssh"]),
-    ("workflow", ["workflow", "工作流", "流程", "方法", "约定", "步骤"]),
+    ("workflow", ["workflow", "流程", "方法", "约定", "步骤"]),
     ("project", ["project", "项目"]),
 ]
+
+# 标题标志词：(标志词, 类目, 是否必须位于标题结尾)。最长匹配优先。
+# 与插件侧 _vault._TITLE_MARKERS 同源。
+_TITLE_MARKERS = [
+    ("综合归纳", "synthesis", False),
+    ("共享记忆", "meta", False),
+    ("记忆系统", "meta", False),
+    ("重启验证", "meta", False),
+    ("支持规格", "reference", False),
+    ("配套规格", "reference", False),
+    ("端点能力", "reference", False),
+    ("知识库选型", "reference", False),
+    ("硬件配置", "environment", False),
+    ("系统环境", "environment", False),
+    ("隧道拓扑", "environment", False),
+    ("升级坑", "tooling", False),
+    ("工作流偏好", "user", False),
+    ("配置", "tooling", True),
+    ("安装", "tooling", True),
+    ("升级", "tooling", True),
+    ("开通", "meta", True),
+    ("规格", "reference", True),
+    ("选型", "reference", True),
+]
+_TITLE_MARKERS_SORTED = sorted(_TITLE_MARKERS, key=lambda m: -len(m[0]))
+
+_KEYWORD_PATTERNS = {}
+
+
+def _keyword_pattern(keyword):
+    """ASCII 关键词编译成词边界正则；CJK 返回 None（走子串）。"""
+    if keyword in _KEYWORD_PATTERNS:
+        return _KEYWORD_PATTERNS[keyword]
+    pat = None
+    if keyword.isascii():
+        pat = re.compile(r"(?<![a-z0-9])" + re.escape(keyword)
+                         + r"(?![a-z0-9])", re.IGNORECASE)
+    _KEYWORD_PATTERNS[keyword] = pat
+    return pat
+
+
+#: 标题命中的权重倍数（与插件侧 _vault._TITLE_WEIGHT 一致）。
+_TITLE_WEIGHT = 2
+
+
+def _keyword_weight(keyword):
+    """证据权重：越具体越高，封顶 12（与插件侧 _vault._keyword_weight 一致）。"""
+    return min(len(keyword), 12)
+
+
+def _title_marker_category(title):
+    """按标题标志词判定类目；无标志词 → ""。最长匹配优先。"""
+    t = str(title or "").strip()
+    if not t:
+        return ""
+    low = t.lower()
+    for marker, category, must_be_tail in _TITLE_MARKERS_SORTED:
+        m = marker.lower()
+        if must_be_tail:
+            if low.endswith(m):
+                return category
+        elif m in low:
+            return category
+    return ""
 
 
 def is_archived(meta):
@@ -2964,7 +3022,16 @@ def normalize_category(value):
 
 
 def infer_category(title, tags, concepts=None, body=""):
-    """从 title/tags/concepts 推断受控分类；推断不出 → ""。"""
+    """推断受控分类；推断不出 → ""。
+
+    两道通道，标题标志词优先（与插件侧 _vault.infer_category 同源）：
+    1. 标题标志词（构词法，最强判据）
+    2. 关键词加权（标题 2 倍，ASCII 走词边界）
+    """
+    by_marker = _title_marker_category(title)
+    if by_marker:
+        return by_marker
+
     def _as_list(v):
         if isinstance(v, str):
             return [v]
@@ -2972,14 +3039,39 @@ def infer_category(title, tags, concepts=None, body=""):
             return [str(x) for x in v]
         return []
 
-    hay = " ".join(_as_list(tags) + _as_list(concepts) + [str(title or "")]).lower()
-    if not hay.strip():
-        hay = str(body or "")[:400].lower()
-    for category, keywords in _CATEGORY_HINTS:
+    head = str(title or "").lower()
+    meta_text = " ".join(_as_list(tags) + _as_list(concepts)).lower()
+    if not head.strip() and not meta_text.strip():
+        head = str(body or "")[:400].lower()
+    if not (head.strip() or meta_text.strip()):
+        return ""
+
+    scores = []
+    for order, (category, keywords) in enumerate(_CATEGORY_HINTS):
+        best = total = 0
         for kw in keywords:
-            if kw.lower() in hay:
-                return category
-    return ""
+            low = kw.lower()
+            pat = _keyword_pattern(low)
+            base = _keyword_weight(low)
+            hit = 0
+            if pat is None:
+                if low in head:
+                    hit = base * _TITLE_WEIGHT
+                elif low in meta_text:
+                    hit = base
+            elif pat.search(head):
+                hit = base * _TITLE_WEIGHT
+            elif pat.search(meta_text):
+                hit = base
+            if hit:
+                best = max(best, hit)
+                total += hit
+        if best:
+            scores.append((best, total, -order, category))
+    if not scores:
+        return ""
+    scores.sort(reverse=True)
+    return scores[0][3]
 
 
 def dump_frontmatter(meta: dict) -> str:
@@ -3014,7 +3106,7 @@ def _kb_search_includes_archived(config: dict) -> bool:
     return bool(config.get("kb", {}).get("search_archived", False))
 
 def cmd_kb_search(config: dict, query: str, top_k: int, section: str,
-                  errors: list = None) -> list:
+                  errors: list = None, category: str = "") -> list:
     """Search the knowledge base through the plugin's hybrid ranker.
 
     The CLI used to carry its own keyword-only scan here. One store then
@@ -3031,14 +3123,14 @@ def cmd_kb_search(config: dict, query: str, top_k: int, section: str,
     interpreter (no lancedb, no embeddings), where the plugin path raises
     instead of answering with fewer results.
     """
-    hits = _kb_hybrid_search(config, query, top_k, section, errors)
+    hits = _kb_hybrid_search(config, query, top_k, section, errors, category)
     if hits is not None:
         return hits
-    return _kb_keyword_search(config, query, top_k, section, errors)
+    return _kb_keyword_search(config, query, top_k, section, errors, category)
 
 
 def _kb_hybrid_search(config: dict, query: str, top_k: int, section: str,
-                      errors: list):
+                      errors: list, category: str = ""):
     """Run the plugin's hybrid search, or ``None`` when it cannot run.
 
     Returning ``None`` (not ``[]``) is what separates "the hybrid channel
@@ -3059,6 +3151,14 @@ def _kb_hybrid_search(config: dict, query: str, top_k: int, section: str,
             errors.append(str(exc))
         return []
 
+    # 类目校验与 keyword 回退路径同规则：非法值判空并说明，绝不静默忽略。
+    if category and not normalize_category(category):
+        if errors is not None:
+            errors.append(
+                "refused: %r is not a controlled category (see KB_CATEGORIES)"
+                % category)
+        return []
+
     try:
         cfg_obj = plugin_config()
         # The caller's ``config`` names the vault to search. Ignoring it here
@@ -3074,11 +3174,13 @@ def _kb_hybrid_search(config: dict, query: str, top_k: int, section: str,
             if hasattr(cfg_obj.kb, key):
                 setattr(cfg_obj.kb, key, value)
         kb = plugin_module("_kb").KnowledgeBase(cfg_obj)
-        out = kb.search(query, top_k=top_k, section=section or "")
+        out = kb.search(query, top_k=top_k, section=section or "",
+                        category=category or "")
         results = [{
                 "title": r.get("title") or r.get("path", ""),
                 "path": str(r.get("path", "")),
                 "section": r.get("section", ""),
+                "category": r.get("category", ""),
                 # ``score`` is the relevance WITHOUT the usage bonus;
                 # ``rank_key`` (what ordered the list) multiplies it by up to
                 # 1.15, which flattens the top rows and hides the difference
@@ -3107,10 +3209,19 @@ def _kb_hybrid_search(config: dict, query: str, top_k: int, section: str,
 
 
 def _kb_keyword_search(config: dict, query: str, top_k: int, section: str,
-                       errors: list) -> list:
+                       errors: list, category: str = "") -> list:
     """Dependency-light keyword scan: the CLI's original behaviour."""
     # No section -> search the whole vault, not a fixed list of sections.
     subdirs = [section] if section else None
+    # 非法类目直接判空结果，而不是静默忽略这个过滤条件 —— 后者会让
+    # 「我按 tooling 筛却拿到全部」看起来像筛选生效了。
+    want_cat = normalize_category(category)
+    if category and not want_cat:
+        if errors is not None:
+            errors.append(
+                "refused: %r is not a controlled category (see KB_CATEGORIES)"
+                % category)
+        return []
     tokens = re.findall(r"[\w\u4e00-\u9fff]+", query)
     include_archived = _kb_search_includes_archived(config)
     results = []
@@ -3138,13 +3249,16 @@ def _kb_keyword_search(config: dict, query: str, top_k: int, section: str,
         if not include_archived and \
                 str(meta.get("status", "") or "").strip().lower() == "archived":
             continue
+        if want_cat and normalize_category(meta.get("category")) != want_cat:
+            continue
         title = meta.get("title") or p.stem
         hay = f"{title} {body}".lower()
         score = sum(1 for t in tokens if t.lower() in hay)
         if score > 0:
             snippet = re.sub(r"\s+", " ", body[:200])
             results.append({"title": title, "path": str(p.relative_to(wiki_dir(config))),
-                            "section": p.parent.name, "score": score, "snippet": snippet})
+                            "section": p.parent.name, "score": score, "snippet": snippet,
+                            "category": normalize_category(meta.get("category"))})
     results.sort(key=lambda r: r["score"], reverse=True)
     return results[:top_k]
 
@@ -3644,6 +3758,10 @@ def build_parser() -> argparse.ArgumentParser:
     ks.add_argument("query")
     ks.add_argument("--top-k", type=int, default=10)
     ks.add_argument("--section", default="")
+    ks.add_argument("--category", default="",
+                    help="Filter by controlled category (see KB_CATEGORIES); "
+                         "an illegal value returns nothing rather than "
+                         "silently searching everything")
 
     kg = sub.add_parser("kb-get", parents=[common], help="Read a full note by title")
     kg.add_argument("title")
@@ -3875,7 +3993,8 @@ def main():
     elif args.cmd == "kb-search":
         refused: list = []
         results = cmd_kb_search(config, args.query, args.top_k, args.section,
-                                refused)
+                                refused,
+                                category=getattr(args, "category", ""))
         out = {"results": results}
         # An empty list is what "no notes matched" looks like; a refused
         # --section must not borrow that shape.

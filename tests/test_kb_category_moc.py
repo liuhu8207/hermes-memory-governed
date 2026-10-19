@@ -94,6 +94,70 @@ class TestInference:
         assert _vault.infer_category("", ["NAS", "Hardware"]) == "environment"
 
 
+class TestWordBoundaryMatching:
+    """ASCII 关键词必须走词边界，否则英文笔记大面积误分类。
+
+    裸子串匹配下 ``script`` / ``recipe`` / ``skip`` / ``pipeline`` /
+    ``shipping`` 都因为含 "ip" 被判成 environment，``capital`` /
+    ``apiary`` 因为含 "api" 被判成 tooling —— 而这些笔记跟环境、工具
+    毫无关系。
+    """
+
+    @pytest.mark.parametrize("word", [
+        "script", "recipe", "skip", "pipeline", "shipping", "capital",
+        "apiary", "ubuntu", "capitalize", "spaceship",
+    ])
+    def test_a_substring_is_not_a_match(self, word):
+        got = _vault.infer_category("", [word])
+        assert got in ("", "project"), (
+            "%r 不该凭子串命中 environment/tooling，实际判成 %r"
+            % (word, got))
+
+    @pytest.mark.parametrize("word,expected", [
+        ("api", "tooling"), ("ip", "environment"), ("nas", "environment"),
+        ("ssh", "environment"), ("vpn", "environment"),
+    ])
+    def test_the_word_itself_still_matches(self, word, expected):
+        assert _vault.infer_category("", [word]) == expected
+
+    def test_a_real_word_containing_a_keyword_is_not_dragged_in(self):
+        """``spacecraft`` 含 ``craft`` 不含 ``cpu``；这条盯的是反向。"""
+        assert _vault.infer_category("Spacecraft notes", []) in ("", "project")
+
+
+class TestTitleMarkerWins:
+    """标题标志词优先于关键词加权。
+
+    判据是标题的**构词法**而不是"哪个词更强"：中文笔记标题是
+    ``<主体>_<属性>`` 结构，结尾的属性词说明这篇笔记是什么类型。
+    """
+
+    @pytest.mark.parametrize("title,tags,expected", [
+        # 同一批词摆在不同位置，含义完全不同：
+        ("hermes_综合归纳", ["自动化"], "synthesis"),
+        ("workflow_综合归纳", ["工作流"], "synthesis"),
+        ("ZCode provider kind 配置", ["zcode", "config"], "tooling"),
+        ("飞牛 NAS 硬件配置", ["nas", "硬件"], "environment"),
+    ])
+    def test_marker_beats_the_keyword_channel(self, title, tags, expected):
+        assert _vault.infer_category(title, tags) == expected
+
+    def test_longest_marker_wins(self):
+        """``硬件配置``(4 字) 必须压过 ``配置``(2 字)。"""
+        assert _vault.infer_category("飞牛 NAS 硬件配置", []) == "environment"
+        assert _vault.infer_category("某工具配置", []) == "tooling"
+
+    def test_ambiguous_marker_only_counts_at_the_tail(self):
+        """``配置`` 在句中只是内容描述，只有结尾才构成类型声明。"""
+        assert _vault.infer_category("配置管理的心得", []) == ""
+        assert _vault.infer_category("Octopus 配置", []) == "tooling"
+
+    def test_marker_needs_a_real_title(self):
+        assert _vault._title_marker_category("") == ""
+        assert _vault._title_marker_category("   ") == ""
+
+
+
 # ---------------------------------------------------------------------------
 # 写入路径
 # ---------------------------------------------------------------------------
@@ -141,6 +205,84 @@ class TestWritePath:
         assert r.get("ok") is True
         meta, _ = _vault.read_note(kb._vault / "notes" / "无题.md")
         assert "category" not in meta
+
+
+# ---------------------------------------------------------------------------
+# 检索侧：分类必须真的能用来筛
+# ---------------------------------------------------------------------------
+
+class TestCategoryFiltersRetrieval:
+    """分类不能只活在 index.md 里 —— 「想按类目找」是它存在的理由。"""
+
+    def _seed(self, kb):
+        kb.add("飞牛 NAS 硬件配置", "nas 硬件 内存 存储", category="environment")
+        kb.add("ZCode provider kind 配置", "zcode config provider",
+               category="tooling")
+        kb.add("用户工作流偏好", "偏好 工作流", category="user")
+
+    def test_category_filter_narrows_results(self, kb):
+        self._seed(kb)
+        hits = kb.search("配置", top_k=10, category="tooling")
+        assert hits, "按类目筛必须能筛出东西"
+        assert all(h["path"].startswith("notes/") for h in hits)
+        titles = {h["title"] for h in hits}
+        assert "ZCode provider kind 配置" in titles
+        assert "飞牛 NAS 硬件配置" not in titles
+
+    def test_illegal_category_returns_nothing_rather_than_everything(self, kb):
+        """静默忽略过滤条件 = 「我按 tooling 筛却拿到全部」。"""
+        self._seed(kb)
+        assert kb.search("配置", top_k=10, category="not-a-category") == []
+
+    def test_empty_category_is_not_a_filter(self, kb):
+        self._seed(kb)
+        unfiltered = kb.search("配置", top_k=10)
+        assert len(unfiltered) >= 2
+
+    def test_category_is_in_the_keyword_channel(self, kb):
+        """类目名本身作为一个词参与关键词打分。"""
+        kb.add("某篇无关笔记", "完全不相干的内容", category="tooling")
+        note = [n for n in kb._iter_notes() if n.title == "某篇无关笔记"][0]
+        assert "tooling" in note.short_text.lower()
+
+    def test_section_filter_is_not_bypassed_by_the_semantic_channel(self, kb):
+        """回归：过滤必须作用在**两路并集**上，不只关键词候选。
+
+        语义通道按索引返回路径，可能带进 ``notes`` 列表之外的笔记（索引
+        投影滞后、笔记被移动）。只在关键词候选上过滤时，``section="inbox"``
+        仍会返回 ``notes/`` 里的笔记 —— 门形同虚设。
+        """
+        self._seed(kb)
+        for section in ("notes", "inbox", "archive", "areas"):
+            hits = kb.search("配置", top_k=10, section=section)
+            for h in hits:
+                assert h["section"] == section, (
+                    "section=%r 却返回了 %r（来自 %s）"
+                    % (section, h["section"], h["path"]))
+
+    def test_section_and_category_are_independent_gates(self, kb):
+        self._seed(kb)
+        assert kb.search("配置", top_k=10, section="notes",
+                         category="tooling")
+        assert kb.search("配置", top_k=10, section="inbox",
+                         category="tooling") == []
+
+    def test_cli_search_accepts_and_honours_category(self, kb):
+        self._seed(kb)
+        # CLI 从 ``config["wiki_dir"]`` 取要搜的库（它必须搜调用方指的库，
+        # 而不是默认的 HERMES_HOME vault），所以这里传真实路径。
+        cfg = {"wiki_dir": str(kb._vault)}
+        errs: list = []
+        hits = memory_cli.cmd_kb_search(cfg, "配置", 10, "", errs,
+                                       category="tooling")
+        assert hits, "CLI 侧也要能按类目筛"
+        assert all(h.get("category") == "tooling" for h in hits)
+
+    def test_cli_refuses_an_illegal_category_by_name(self, monkeypatch):
+        errs: list = []
+        assert memory_cli.cmd_kb_search({}, "x", 10, "", errs,
+                                        category="bogus") == []
+        assert any("not a controlled category" in e for e in errs)
 
 
 # ---------------------------------------------------------------------------
