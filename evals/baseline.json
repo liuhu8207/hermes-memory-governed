@@ -8,6 +8,7 @@
   "negative_false_positive_rate": 0.0,
   "misses": [],
   "negative_false_positives": [],
+  "degraded_queries": [],
   "top_k": 5,
   "affinity_enabled": false,
   "ok": true,

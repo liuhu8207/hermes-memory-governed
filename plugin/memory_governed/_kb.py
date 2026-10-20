@@ -1678,6 +1678,12 @@ class KnowledgeBase:
                         for rel in rels
                     ]
                     scores = rer.scores(query, texts, top_n=None)
+                    if not scores:
+                        # 一次瞬时空结果（限流/网络抖动）不该让整批候选
+                        # 跳过 rerank 直接放行。重试一次；仍失败则保持
+                        # rerank_no_scores，让调用方看见降级。
+                        time.sleep(0.2)
+                        scores = rer.scores(query, texts, top_n=None)
                     scored = {rels[i]: s for i, s in scores.items()
                               if i < len(rels)}
                 except Exception as e:  # noqa: BLE001 — 读路径永不抛

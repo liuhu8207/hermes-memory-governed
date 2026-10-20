@@ -45,11 +45,15 @@ def evaluate(kb, gold: list, top_k: int) -> dict:
     negatives = [g for g in gold if not g.get("expect")]
     p1 = r5 = mrr = 0.0
     misses = []
+    degraded = []
     for g in positives:
         q = str(g["q"])
         expect = [str(x) for x in g["expect"]]
         hits = kb.search(q, top_k=top_k)
         titles = [str(h.get("title", "")) for h in hits]
+        if any(h.get("rerank") in ("rerank_no_scores", "rerank_unavailable")
+               for h in hits):
+            degraded.append(q)
         if titles and titles[0] in expect:
             p1 += 1
         if any(t in expect for t in titles[:5]):
@@ -64,6 +68,9 @@ def evaluate(kb, gold: list, top_k: int) -> dict:
     negative_details = []
     for g in negatives:
         hits = kb.search(str(g["q"]), top_k=top_k)
+        if any(h.get("rerank") in ("rerank_no_scores", "rerank_unavailable")
+               for h in hits):
+            degraded.append(str(g["q"]))
         if hits:
             negative_fp += 1
             negative_details.append({"q": g["q"],
@@ -79,6 +86,7 @@ def evaluate(kb, gold: list, top_k: int) -> dict:
             round(negative_fp / max(1, len(negatives)), 4)),
         "misses": misses,
         "negative_false_positives": negative_details,
+        "degraded_queries": degraded,
         "top_k": top_k,
         "affinity_enabled": bool(getattr(
             getattr(getattr(kb, "_config", None), "kb", None),
@@ -100,6 +108,11 @@ def validate(result: dict, channels: dict) -> dict:
     elif channels.get("reranker_available") is False:
         result["ok"] = False
         result["error"] = "reranker is enabled but unavailable"
+    elif result.get("degraded_queries"):
+        result["ok"] = False
+        result["error"] = ("%d query/queries ran without reranker filtering; "
+                           "the scoreboard is not comparable"
+                           % len(result["degraded_queries"]))
     return result
 
 
@@ -111,6 +124,11 @@ def main() -> int:
     parser.add_argument("--baseline", default="")
     parser.add_argument("--max-drop", type=float, default=0.02,
                         help="Allowed P@1 / recall@5 drop vs baseline")
+    parser.add_argument("--rerank-min-score", type=float, default=None,
+                        help="Override kb.rerank_min_score for a calibration sweep")
+    parser.add_argument("--repeat", type=int, default=1,
+                        help="Run the whole set N times and report mean/min/max; "
+                             "a single pass hides retrieval jitter")
     parser.add_argument("--with-affinity", action="store_true",
                         help="Measure the production ranking including usage "
                              "affinity. Off by default: affinity updates as "
@@ -125,13 +143,36 @@ def main() -> int:
     from plugin.memory_governed._kb import KnowledgeBase
 
     cfg = load_governed_config(HERMES_HOME)
+    if args.rerank_min_score is not None:
+        cfg.kb.rerank_min_score = float(args.rerank_min_score)
     if not args.with_affinity:
         # 评测必须可复现：affinity 的命中计数会在查询过程中增长，同一份
         # gold 集连跑两次会得到不同排序。默认关掉，只测核心相关性；
         # 要看生产完整排序时显式传 --with-affinity（结果不保证可复现）。
         cfg.kb.affinity_enabled = False
     kb = KnowledgeBase(cfg)
-    result = evaluate(kb, gold, args.top_k)
+    runs = [evaluate(kb, gold, args.top_k)
+            for _ in range(max(1, int(args.repeat)))]
+    result = runs[0]
+    if len(runs) > 1:
+        metrics = ("p_at_1", "recall_at_5", "mrr",
+                   "negative_false_positive_rate")
+        result["repeat"] = len(runs)
+        result["runs"] = [{k: r[k] for k in metrics} for r in runs]
+        result["stability"] = {
+            key: {
+                "mean": round(sum(r[key] for r in runs) / len(runs), 4),
+                "min": round(min(r[key] for r in runs), 4),
+                "max": round(max(r[key] for r in runs), 4),
+            } for key in metrics
+        }
+        for key in metrics:
+            result[key] = result["stability"][key]["mean"]
+        result["misses"] = [m for r in runs for m in r["misses"]][:20]
+        result["negative_false_positives"] = [
+            n for r in runs for n in r["negative_false_positives"]][:20]
+        result["degraded_queries"] = sorted({
+            q for r in runs for q in r.get("degraded_queries", [])})
     result["ok"] = True
 
     # 诚实报告通道状态：语义通道不可用时，记分板只是关键词通道的成绩，
