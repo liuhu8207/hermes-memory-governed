@@ -25,11 +25,17 @@
 现在的契约
 ----------
 
-* ``HERMES_HOME`` 未设 ⇒ **拒绝**（抛 :class:`HermesHomeNotConfiguredError`），
-  绝不静默使用生产目录。
-* 测试会话（或 ``HGM_STRICT_ISOLATION=1``）下，解析出的 home 若**就是生产目录** ⇒ 必须显式 opt-in
-  （``HGM_ALLOW_PRODUCTION=1`` 或 ``bootstrap(..., allow_production=True)``），
-  且打一条醒目 WARNING，点明当前用的是哪个 home。
+* ``HERMES_HOME`` 未设 / 指向**生产存储**（含它的**子目录**）⇒ 在**测试会话**
+  或 ``HGM_STRICT_ISOLATION=1`` 下**拒绝**（抛 :class:`HermesHomeNotConfiguredError`）。
+  ⚠️ **正常脚本不在此列**：cron / 运维脚本**必须**能操作生产存储，否则
+  ``kb_reindex``、``restore_drill``、``l2_capacity`` 会全部拒绝运行 —— 那不是
+  安全，是让备份与清理停摆。所以非严格进程里，未设 / 指向生产只是**解析到生产
+  目录并打一条醒目 WARNING**（点名是哪个目录），**不拒绝**。
+* 显式授权：``HGM_ALLOW_PRODUCTION=1`` 或 ``bootstrap(..., allow_production=True)``
+  ⇒ 连**严格模式**下也放行（WARNING 照打，点明当前用的是哪个 home）。没有这个
+  opt-in 时，"严格模式 + 生产 home" 一定是拒绝。
+  （判据见 :func:`strict_isolation` / :func:`production_allowed`——**以代码为准**，
+  本段是代码行为的描述，不是代码要去满足的愿望。）
 * ``load_dotenv`` 默认 ``overwrite=False``：**已显式设置的环境变量永不被覆盖**；
   ``bootstrap()`` 结束前会把 ``os.environ["HERMES_HOME"]`` **重新对齐**到解析结果，
   杜绝"env 变量与 home 分叉"。
