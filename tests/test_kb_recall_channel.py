@@ -218,13 +218,21 @@ class TestIncrementalIndex:
         assert "notes/新笔记.md" in fake.rows
 
     def test_deleted_note_is_removed_from_index(self, tmp_path):
-        kb = _make_kb(tmp_path, {"notes/a.md": "---\ntitle: A\n---\nalpha"})
+        # 两篇、删一篇 ⇒ 扫描**仍非空** ⇒ 正常清理。
+        # （删掉**最后**一篇会让扫描变成空，那是 fail-closed 的另一回事：
+        #   "vault 真的空" 与 "vault 读失败" 在调用方无法区分，必须显式
+        #   allow_purge=True 才放行 —— 见 tests/test_kb_sync_fail_closed.py。）
+        kb = _make_kb(tmp_path, {
+            "notes/a.md": "---\ntitle: A\n---\nalpha",
+            "notes/b.md": "---\ntitle: B\n---\nbeta",
+        })
         fake = _FakeIndex()
         kb._index_get = lambda: fake
         kb.sync_index()
         kb._vault.joinpath("notes/a.md").unlink()
         r = kb.sync_index()
-        assert r["removed"] == 1 and not fake.rows
+        assert r["removed"] == 1 and "notes/a.md" not in fake.rows
+        assert "notes/b.md" in fake.rows, "没删的那篇必须留在索引里"
 
     def test_force_reindexes_everything(self, tmp_path):
         kb = _make_kb(tmp_path, {"notes/a.md": "---\ntitle: A\n---\nalpha"})
@@ -804,6 +812,21 @@ class TestUnreadableNoteDoesNotSinkTheSearch:
     后果不是"少一条结果"而是"整次检索失败"—— ``hgm_recall`` 走协议错误，
     ``hgm_kb_search`` 什么都不返回。一个坏文件被读成"整个库是空的"。
     """
+
+    @pytest.fixture(autouse=True)
+    def _isolated_home(self, tmp_path, monkeypatch):
+        """把 ``HERMES_HOME`` 指到本测试的 tmp 目录。
+
+        ``cmd_kb_search`` 的**索引路径**来自 ``HERMES_HOME``（``wiki_dir`` 才是
+        调用方给的）⇒ 不隔离的话，这些用例会共用同一个索引，于是别的用例写
+        进去的行会出现在本用例的检索结果里（"库里没这篇"和"这篇在别的用例
+        里"长得一模一样）。旧实现靠"把不是我的行全删掉"把这个污染盖住了 ——
+        那正是本次 P0 要禁的删除行为；护栏修好后，污染必须从**测试隔离**上解。
+        """
+        home = tmp_path / "home"
+        (home / "memory").mkdir(parents=True, exist_ok=True)
+        monkeypatch.setenv("HERMES_HOME", str(home))
+        return home
 
     @staticmethod
     def _vault_with_one_poisoned_note(tmp_path: Path) -> dict:

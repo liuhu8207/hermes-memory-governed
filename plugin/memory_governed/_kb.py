@@ -606,28 +606,63 @@ class KBIndex:
 
     # -- 写 ----------------------------------------------------------
 
-    def upsert(self, path: str, text: str, mtime: float = 0.0) -> None:
-        """写入/更新一条向量。失败仅 debug 记录，不抛。
+    def upsert(self, path: str, text: str, mtime: float = 0.0) -> bool:
+        """写入/更新一条向量。**先写成功、再谈替换**；失败返回 ``False``。
 
         Args:
             mtime: 正本文件的 mtime（epoch 秒）。增量同步据此判断陈旧。
+
+        Returns:
+            ``True`` = 写入成功；``False`` = 失败（此时**旧行原样保留**）。
+
+        为什么不能"先删后加"（旧实现）：``delete`` 先跑、``add`` 后跑，``add``
+        失败时**旧行已经被删掉** —— 这条笔记的向量就此丢失，而失败只被
+        ``log_degraded`` 记下、**不抛**，调用方以为写成功了（于是"upsert 失败
+        ⇒ 不删对应旧行"这条规则在旧实现里根本无从谈起）。现在改成：
+          - 该 path 已有行 → ``update`` **原地**改写（行数不变，**没有"行不
+            存在"的窗口**）；失败则旧行完好；
+          - 该 path 没有行 → ``add``（本来就没有旧行，失败也不丢东西）。
+        两种情况都**先写成功**才替换，失败时旧数据一分不少。
         """
         if not self._available or self._service is None:
-            return
+            log_degraded("kb_index", "upsert_backend_unavailable", detail=str(path))
+            return False
         vec = self._service.embed_one(text)
         if vec is None:
-            return
+            # 拿不到向量就不写、也**不删**（静默返回会让调用方以为写成功了）。
+            # 独立评估者实测过这个洞：``embed_one`` 返 None 时旧实现直接 return，
+            # 既不 add 也不抛 ⇒ ``sync_index`` 的 except 根本不触发 ⇒
+            # **errors: 0**，而索引行数已经从 4 掉到 0。失败必须**可见**。
+            log_degraded("kb_index", "upsert_embed_unavailable", detail=str(path))
+            return False
+        mtime_f = float(mtime or 0.0)
+        updater = getattr(self._store, "update", None)
+        if not callable(updater):
+            # 后端没有 update（老版本 lancedb）：宁可**报失败**，也不做
+            # "先删后加" —— 那个顺序会丢数据。
+            log_degraded("kb_index", "upsert_update_unsupported", detail=str(path))
+            return False
         try:
-            self.delete(path)
-        except Exception as e:  # noqa: BLE001 — 删不掉就靠搜索侧去重兜底
-            log_degraded("kb_index", "upsert_delete_failed", detail=str(path), exc=e)
-            pass
+            res = updater(where="path = %s" % _sql_literal(path),
+                          values={"text": text, "mtime": mtime_f, "vector": vec})
+        except Exception as e:  # noqa: BLE001 — 写失败不许毁掉旧行
+            logger.debug("kb index update failed for %s: %s", path, e)
+            log_degraded("kb_index", "upsert_update_failed", detail=str(path), exc=e)
+            return False
+        try:
+            updated = int(getattr(res, "rows_updated", 0) or 0)
+        except (TypeError, ValueError):  # silent-ok: value-fallback — 计数取不到就当 0 行（= 需要 add），per-note
+            updated = 0
+        if updated > 0:
+            return True
         try:
             self._store.add([{"path": path, "text": text,
-                              "mtime": float(mtime or 0.0), "vector": vec}])
+                              "mtime": mtime_f, "vector": vec}])
         except Exception as e:  # noqa: BLE001
             logger.debug("kb index upsert failed for %s: %s", path, e)
             log_degraded("kb_index", "upsert_add_failed", detail=str(path), exc=e)
+            return False
+        return True
 
     def path_mtimes(self) -> Dict[str, float]:
         """索引里 ``path -> mtime`` 的映射（供增量同步比对）。
@@ -654,6 +689,23 @@ class KBIndex:
             logger.debug("kb index path_mtimes failed: %s", e)
             log_degraded("kb_index", "path_mtimes_failed", exc=e)
             return {}
+
+    def row_count(self) -> Optional[int]:
+        """索引表真实行数；后端不可用/查询失败返回 ``None``（**未知**，不是 0）。
+
+        ``path_mtimes()`` 失败时返回空 dict，调用方会把「索引是空的」和「探针
+        挂了」混为一谈 —— 后者让同步误以为要全量重建，前者让状态面板显示
+        「0 行」而实际有 52 行（删空过的现场就是这么被藏住的）。行数必须能
+        **独立**回答，且"测不出来"要说"测不出来"。
+        """
+        if not self._available or self._store is None:
+            return None
+        try:
+            return int(self._store.count_rows())
+        except Exception as e:  # noqa: BLE001
+            logger.debug("kb index row_count failed: %s", e)
+            log_degraded("kb_index", "row_count_failed", exc=e)
+            return None
 
     def delete(self, path: str) -> None:
         if not self._available or self._store is None:
@@ -980,6 +1032,10 @@ class KnowledgeBase:
         # 最近一次 vault 遍历被拒绝的路径（越界链接等）。必须留痕：
         # 「库里没这篇」和「这篇被拒了」对调用方长得一模一样。
         self._vault_walk_refusals: List[str] = []
+        # 最近一次索引同步的**结论**（含被拒绝删除时的 reason）。必须留痕：
+        # 索引被删空过一次，光看「missing=52」是看不出来的 —— 状态面板要能
+        # 一眼回答"上次同步到底成没成、删了多少行"。
+        self._last_sync: Dict[str, Any] = {}
 
     # -- 索引新鲜度探测（廉价，只读元数据） ----------------------------
 
@@ -1115,8 +1171,42 @@ class KnowledgeBase:
         与 :meth:`sync_index` 共用同一份「陈旧」定义（``_INDEX_MTIME_TOLERANCE``
         容差），所以这里报 ``missing=1`` 就一定意味着下一次同步会补上 1 篇。
         探针不可用时 ``probe="unsupported"`` / ``fresh=None``（未知 ≠ 不可用）。
+
+        另外透出**索引行数**与**上次同步的结论**（``index_rows`` /
+        ``last_sync_ok`` / ``last_sync_reason`` / ``last_sync_removed``）——
+        索引被删空过一次，光看「missing=52」是发现不了的，那类现场必须一眼
+        可见。``index_rows`` 来自独立的行数查询，探针失败时是 ``None``
+        （**未知**，不是 0）。
         """
-        return self._probe_state(self._index_get())
+        idx = self._index_get()
+        state = self._probe_state(idx)
+        last = self._last_sync or {}
+        state["index_rows"] = self._index_row_count(idx)
+        state["last_sync_ok"] = last.get("ok") if last else None
+        state["last_sync_reason"] = str(last.get("reason") or "")
+        state["last_sync_removed"] = int(last.get("removed") or 0)
+        state["last_sync_errors"] = int(last.get("errors") or 0)
+        state["last_sync_at"] = last.get("at")
+        return state
+
+    def _index_row_count(self, idx: KBIndex) -> Optional[int]:
+        """索引表行数；测不出来返回 ``None``（**未知**，不是 0）。"""
+        probe = getattr(idx, "row_count", None)
+        if callable(probe):
+            try:
+                n = probe()
+                return int(n) if n is not None else None
+            except Exception as e:  # noqa: BLE001 — 诊断失败不该影响主流程
+                log_degraded("kb_index", "row_count_probe_failed", exc=e)
+                return None
+        probe_mtimes = getattr(idx, "path_mtimes", None)
+        if callable(probe_mtimes):
+            try:
+                return len(probe_mtimes())
+            except Exception as e:  # noqa: BLE001
+                log_degraded("kb_index", "row_count_probe_failed", exc=e)
+                return None
+        return None
 
     @property
     def last_index_status(self) -> Dict[str, Any]:
@@ -1176,8 +1266,8 @@ class KnowledgeBase:
             self._index_status = state
             if state["fresh"] is False:
                 # 增量同步，并把已经算好的两侧映射传进去，避免重复 stat / 扫描
-                self.sync_index(_vault_mtimes=vault, _note_paths=paths,
-                                _index_mtimes=indexed)
+                result = self.sync_index(_vault_mtimes=vault, _note_paths=paths,
+                                         _index_mtimes=indexed)
                 # 同步后重探：fresh / missing / stale / orphaned 必须是**当前真值**。
                 # 直接返回同步前的快照会自相矛盾（synced=True 却 fresh=False、
                 # missing=1），而 search() 正是在同步之后才构建结果的 —— 那句
@@ -1189,13 +1279,32 @@ class KnowledgeBase:
                 # 若重探后仍 fresh=False（例如文件持续在变），如实报 —— 那是有
                 # 价值的真信号，不能强行折成 True。
                 after = self._probe_state(idx)
+                synced = bool(result.get("ok"))
+                reason = str(result.get("reason") or "")
+                if not synced and not reason:
+                    # 失败但没有"被拒绝"的理由 ⇒ 是写入失败（errors>0）。
+                    # 给一个**能读懂**的理由，别留空串让调用方猜。
+                    reason = ("sync_write_failed" if result.get("errors")
+                              else "sync_failed")
                 self._index_status = dict(
                     after,
-                    synced=True,
+                    synced=synced,
+                    sync_ok=synced,
+                    sync_reason=reason,
+                    sync_errors=int(result.get("errors") or 0),
+                    sync_removed=int(result.get("removed") or 0),
                     pre_sync_missing=state["missing"],
                     pre_sync_stale=state["stale"],
                     pre_sync_orphaned=state["orphaned"],
                 )
+                if not synced:
+                    # 同步被 fail-closed 拒绝、或有笔记写失败 ⇒ **不能**报
+                    # 「一切正常」。旧实现无条件 ``synced=True``，于是"同步被
+                    # 拒了"和"同步成功修好了"在调用方长得一模一样 —— 状态在
+                    # 骗人，而调用方据此以为索引是好的。
+                    log_degraded("kb_index", "sync_failed",
+                                 detail=str(result.get("reason") or "sync failed"))
+                    self._index_status["fresh"] = False
             return self._index_status
 
     # -- 骨架 / 索引 -------------------------------------------------
@@ -1270,10 +1379,150 @@ class KnowledgeBase:
             n += 1
         return {"ok": True, "indexed": n}
 
+    def _note_file_exists(self, rel: str) -> bool:
+        """索引里的某条路径，其**文件是否还在磁盘上**（且仍算一篇笔记）。
+
+        这是"扫描漏了"与"用户删了"的**唯一可靠区分点**：文件还在 ⇒ 扫描不完整
+        （vault 读失败 / 被跳过），"索引里有、正本没有"是**扫描的错**而不是事实；
+        文件真没了 ⇒ 才是合法 orphan，可以删。
+
+        ``index.md``（MOC）与点目录下的文件**本来就不参与**扫描，它们"还在"是
+        正常的 —— 不能因此永久堵住 orphan 清理。
+        """
+        parts = str(rel).replace("\\", "/").split("/")
+        if parts[-1] == "index.md":
+            return False
+        if any(p.startswith(".") for p in parts[:-1]):
+            return False
+        try:
+            return (Path(self._vault) / rel).is_file()
+        except OSError:  # silent-ok: value-fallback — 判不准就当"还在"（保守：拒绝删）
+            return True
+
+    def _index_vault_marker(self) -> Path:
+        """记录"这个索引属于哪个 vault"的 sidecar 路径（与索引表同目录）。"""
+        return Path(self._index_db) / "vault_root.json"
+
+    def _recorded_vault_root(self) -> str:
+        """sidecar 里记录的 vault 根；没有 / 读不出来返回空串。"""
+        try:
+            path = self._index_vault_marker()
+            if not path.is_file():
+                return ""
+            raw = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):  # silent-ok: value-fallback — sidecar 读不出来就当"没记过"，per-call
+            return ""
+        return str(raw.get("vault_root") or "") if isinstance(raw, dict) else ""
+
+    def _record_vault_root(self) -> None:
+        """把当前 vault 根写进 sidecar（**只在有证据时**调用，见闸门）。
+
+        只在"索引里的行确实能在当前 vault 里找到"时才认领这个索引 —— 否则
+        一个**指错 vault** 的调用方会把 sidecar 写成它的 tmp vault，把生产索引
+        的配对关系污染掉（之后真正的生产同步就会一直判"错配"、永远不敢清理）。
+        """
+        try:
+            self._index_vault_marker().write_text(
+                json.dumps({"vault_root": str(Path(self._vault).resolve()),
+                            "recorded_at": time.time()},
+                           ensure_ascii=False, indent=2),
+                encoding="utf-8")
+        except OSError as e:  # silent-ok: value-fallback — sidecar 写不了不该阻断同步
+            logger.debug("kb index vault marker not written: %s", e)
+
+    def _index_rows_present_in_vault(self, indexed: Dict[str, float]) -> bool:
+        """索引里是否**至少有一行**的文件还在当前 vault 里（配对证据）。"""
+        for rel in indexed:
+            if self._note_file_exists(rel):
+                return True
+        return False
+
+    def _purge_block_reason(self, *, scanned: int, indexed_rows: int,
+                            orphans: List[str], allow_purge: bool,
+                            expected_notes: "Optional[int]",
+                            indexed: "Optional[Dict[str, float]]" = None
+                            ) -> "Optional[Tuple[str, str]]":
+        """判定是否**拒绝**删除 orphan 行（fail-closed）。
+
+        返回 ``(reason, detail)`` = 拒绝并说明理由；返回 ``None`` = 允许删。
+
+        删索引行是**不可逆**的，而"vault 读失败"与"vault 真的空"在调用方**长得
+        一模一样** —— 一次挂载抖动就足以把 52 行索引删成 0 行，然后每次自愈
+        重建又多写一版（``_versions`` 膨胀）。所以在删之前必须先证明"这些行确实
+        是孤儿"。
+
+        **实际可达的拒绝规则：4 个 reason / 6 条规则。** 这份清单是**照着代码数
+        出来的**，不是设计愿望 —— 复评者纠正过一次"宣称 8 道、实际只有 7 道可达"
+        的过度声明；"声明超前于效果"正是这轮一直在治的同一个毛病。
+
+        =========  ==========================  ==================================
+        reason      触发条件                      覆盖的场景
+        =========  ==========================  ==================================
+        1           ``vault_scan_empty``         扫到 0 篇（挂载没就绪 / wiki_dir 指错）
+        2           ``vault_scan_incomplete``    ① 扫到的少于 ``expected_notes``
+                                                    ② 遍历有被拒绝的路径
+                                                    ③ orphan 的文件还在磁盘上（扫描漏了它）
+        3           ``index_vault_mismatch``     sidecar 记录的 vault ≠ 当前 vault
+        4           ``index_vault_unknown``      索引里的行在当前 vault 里**一个都不存在**
+        =========  ==========================  ==================================
+
+        另有两条"放行"分支：``allow_purge=True``（调用方显式确认）与"没有 orphan"
+        （无从删起）。
+
+        **曾经还有一条 ``purge_to_zero``（"这次 purge 会清空索引"），已删除** ——
+        它与规则 4 是**同一个条件**（可证：只要存在配对证据，就至少有一行不是
+        orphan ⇒ purge 不可能清空索引），留着只会让"清空"这个**症状**盖住"索引与
+        vault 毫无关系"这个**病因**。复评者实测过：把 sidecar 写成另一个 vault 时
+        报出来的是 ``purge_to_zero``，而不是更贴切的 ``index_vault_unknown``。
+        """
+        if allow_purge:
+            return None
+        if not orphans:
+            return None
+        if scanned == 0:
+            return ("vault_scan_empty",
+                    "vault scan returned 0 notes while the index holds %d row(s)"
+                    % indexed_rows)
+        if expected_notes is not None and scanned < expected_notes:
+            return ("vault_scan_incomplete",
+                    "scanned %d note(s) but %d expected" % (scanned, expected_notes))
+        if self.last_walk_refusals:
+            return ("vault_scan_incomplete",
+                    "%d vault path(s) were refused during the walk"
+                    % len(self.last_walk_refusals))
+        survivors = [rel for rel in orphans if self._note_file_exists(rel)]
+        if survivors:
+            return ("vault_scan_incomplete",
+                    "%d indexed path(s) still exist on disk but were not "
+                    "scanned (e.g. %s)" % (len(survivors), survivors[0]))
+        # ---- 索引↔vault 配对 ------------------------------------------------
+        # 上面几条都以**当前 vault** 为准，所以一旦"索引"和"vault"来自两个世界
+        # （调用方指了另一个 vault / 索引配错），它们会**全部不触发** ——
+        # 而"索引里的每一行在当前 vault 里都不存在"恰恰是**配对错位**的特征，
+        # 不是"用户把笔记删光了"。实测事故：索引 52 行（真实 vault 的）+
+        # 当前 vault 只有 1 篇测试夹具 ⇒ 52 行全被判成 orphan 删光。
+        recorded = self._recorded_vault_root()
+        current = str(Path(self._vault).resolve())
+        if recorded and recorded != current:
+            return ("index_vault_mismatch",
+                    "this index was built for vault %r but the current vault "
+                    "is %r" % (recorded, current))
+        if indexed is not None and not self._index_rows_present_in_vault(indexed):
+            # 索引与当前 vault **毫无关系** ⇒ "索引里有、正本没有"是**扫描的错**，
+            # 不是事实 ⇒ 拒绝删。（这条同时覆盖"这次 purge 会清空索引"的情形 ——
+            # 两者是同一个条件，见上面 docstring 的说明。）
+            return ("index_vault_unknown",
+                    "none of the %d indexed row(s) exists in the current vault "
+                    "(%d note(s) scanned) — refusing to purge"
+                    % (indexed_rows, scanned))
+        return None
+
     def sync_index(self, *, background: bool = False, force: bool = False,
                    _vault_mtimes: "Optional[Dict[str, float]]" = None,
                    _note_paths: "Optional[Dict[str, Path]]" = None,
-                   _index_mtimes: "Optional[Dict[str, float]]" = None
+                   _index_mtimes: "Optional[Dict[str, float]]" = None,
+                   allow_purge: bool = False,
+                   expected_notes: "Optional[int]" = None
                    ) -> Dict[str, Any]:
         """增量同步：正本（vault）变更 → 索引投影更新。
 
@@ -1291,9 +1540,21 @@ class KnowledgeBase:
             background: True 时在守护线程里执行，立即返回（供插件初始化调用，
                 避免首次全量补齐的 embedding 调用拖慢启动）。
             force: True 时忽略 mtime 比对，全量重嵌。
+            allow_purge: **显式确认"vault 就是空的"**，才允许把索引里的 orphan
+                行删光。默认 False —— 删索引行是**不可逆**的，而"vault 读失败"
+                （挂载没就绪 / wiki_dir 指错）与"vault 真的空"在调用方**长得
+                一模一样**：旧实现把前者当成后者，52 行索引一次抖动就被删成 0 行
+                （而且报 ``ok: True``），随后每次自愈重建又多写一版
+                （``_versions`` 膨胀）。
+            expected_notes: 调用方若知道 vault **应该**有多少篇，就传进来；
+                扫到的少于预期 ⇒ 判"扫描不完整"并**拒绝删**（部分扫描失败同样
+                会造成大面积误删）。
 
         Returns:
-            统计 dict：``{ok, added, updated, removed, unchanged, errors}``。
+            统计 dict：``{ok, added, updated, removed, unchanged, errors}``；
+            被拒绝删除时额外带 ``reason``（``vault_scan_empty`` /
+            ``vault_scan_incomplete``）与 ``purged=False``，且 ``ok=False``。
+            写失败的笔记计入 ``errors``，此时 ``ok=False``（不再报"一切正常"）。
 
         私有参数 ``_vault_mtimes`` / ``_note_paths`` / ``_index_mtimes`` 供
         :meth:`_ensure_fresh_index` 复用已经算好的「正本 mtime 表 / 路径表 /
@@ -1312,7 +1573,9 @@ class KnowledgeBase:
 
         idx = self._index_get()
         if not idx.available:
-            return {"ok": False, "reason": idx.last_error or "index unavailable"}
+            result = {"ok": False, "reason": idx.last_error or "index unavailable"}
+            self._last_sync = dict(result, at=time.time())
+            return result
 
         paths = _note_paths if _note_paths is not None else self.scan_vault_paths()
         vault: Dict[str, float] = (
@@ -1332,9 +1595,51 @@ class KnowledgeBase:
                 added.append(rel)
             elif abs(cur - mt) > _INDEX_MTIME_TOLERANCE:  # 避开文件系统时间精度差异
                 updated.append(rel)
-        removed = [rel for rel in indexed if rel not in vault]
+        orphans = [rel for rel in indexed if rel not in vault]
+
+        # ---- fail-closed：删索引行之前，先证明"这些行确实是孤儿" -----------
+        # 旧实现把"扫描结果为空"直接推导出"索引里的每一行都是孤儿"，于是
+        # 一次 vault 读失败 = 一次整表删空（而且报 ok:true / removed:N）。
+        block = self._purge_block_reason(
+            scanned=len(vault), indexed_rows=len(indexed), orphans=orphans,
+            allow_purge=allow_purge, expected_notes=expected_notes,
+            indexed=indexed,
+        )
+        if block is not None:
+            reason, detail = block
+            log_degraded("kb_index", reason, detail=detail)
+            result = {
+                "ok": False,
+                "reason": reason,
+                "detail": detail,
+                "removed": 0,
+                "added": 0,
+                "updated": 0,
+                "unchanged": len(vault),
+                "errors": 0,
+                "scanned": len(vault),
+                "indexed_rows": len(indexed),
+                "purged": False,
+            }
+            self._last_sync = dict(result, at=time.time())
+            logger.warning("kb index sync refused to purge: %s (%s)",
+                           reason, detail)
+            return result
 
         errors = 0
+        #: 向量**没写进去**的路径（embedding 挂 / upsert 抛错）⇒ 系统性故障，
+        #: **阻断删除**（见下）。
+        write_failures: List[str] = []
+        #: 读不到文件的路径（per-note，一篇坏文件）⇒ 计入 errors，但**不阻断
+        #: 删除**：一篇读不出来的笔记说明不了"这次扫描/写入环境坏了"，用它挡住
+        #: 整个清理，会让一行陈旧数据永久留在索引里。
+        read_failures: List[str] = []
+        # 索引↔vault 配对：**有证据**（索引里至少有一行的文件在当前 vault 里）
+        # 才认领这个索引并记下 sidecar；没有证据就不写 —— 否则一个指错 vault
+        # 的调用方会把生产索引的配对关系写成它的 tmp vault。
+        if indexed and not self._recorded_vault_root():
+            if self._index_rows_present_in_vault(indexed):
+                self._record_vault_root()
         # 只读差异部分的内容：批量重建（reindex）才需要读全库，
         # 一次自愈通常只有 1~2 篇是新的，没必要把 27 篇全 parse 一遍。
         for rel in added + updated:
@@ -1346,39 +1651,81 @@ class KnowledgeBase:
             path = paths.get(rel)
             if path is None:
                 errors += 1
+                read_failures.append(rel)
                 continue
             try:
                 text = path.read_text(encoding="utf-8", errors="replace")
             except OSError as e:  # silent-ok: value-fallback — 单篇读失败 → 跳过并计 errors，per-note
                 logger.debug("kb sync read failed for %s: %s", rel, e)
                 errors += 1
+                read_failures.append(rel)
                 continue
             meta, body = _vault.parse_frontmatter(text)
             note = _Note(path, _vault.note_title(path), meta, body)
             try:
-                idx.upsert(rel, note.full_text, mtime=mt)
+                written = idx.upsert(rel, note.full_text, mtime=mt)
             except Exception as e:  # noqa: BLE001
                 logger.debug("kb sync upsert failed for %s: %s", rel, e)
                 log_degraded("kb_sync", "upsert_failed", detail=rel, exc=e)
                 errors += 1
-        for rel in removed:
-            try:
-                idx.delete(rel)
-            except Exception as e:  # noqa: BLE001
-                logger.debug("kb sync delete failed for %s: %s", rel, e)
-                log_degraded("kb_sync", "delete_failed", detail=rel, exc=e)
+                write_failures.append(rel)
+                continue
+            # ``upsert`` 现在**先写成功、再替换**：写失败时旧行原样保留。
+            # ``None`` 是旧实现/替身的返回值（不表态），按"没报错"处理。
+            if written is False:
                 errors += 1
+                write_failures.append(rel)
+        # ---- 写失败 ⇒ 这一轮**一行都不删** --------------------------------
+        # 独立评估者实测过的组合：embedding 挂掉 + vault 路径集变化 ⇒ 行数
+        # 4→0、``errors: 0``。为什么这条比"vault 扫描为空"更危险：扫描为空时
+        # 后续检索还能靠重建自愈（实测连 3 次 kb-search，行数 52→52 不变）；
+        # 而"**删空 + embedding 同时坏**"⇒ 重建路径本身也依赖 embedding ⇒
+        # 索引会**长期为 0 且无法自愈**，状态却还报健康 —— 那才是真正的静默失效。
+        # **向量写不进去**本身就是"这一轮的写入环境不健康"的证据，所以这一轮
+        # **不做任何删除**（陈旧的孤儿行留着，下一轮再判；删光了就回不来了）。
+        # ⚠️ 只由**写失败**触发；"读不到文件"是 per-note 的坏文件，说明不了
+        # 环境坏了，用它挡住整个清理会让一行陈旧数据永久留在索引里。
+        removed_count = 0
+        purge_skipped = ""
+        if write_failures:
+            purge_skipped = "sync_write_failed"
+            log_degraded("kb_sync", "purge_skipped",
+                         detail="%d write(s) failed; %d orphan row(s) kept"
+                                % (len(write_failures), len(orphans)))
+        else:
+            # 写失败的路径**不删**：它的旧行正是这次没写成功的那一份，删掉等于
+            # 把最后一份可用数据也毁掉。orphan 集合与写入集合互斥，这里仍然
+            # 显式排除，让"失败 ⇒ 不删"这条规则在代码里看得见。
+            for rel in orphans:
+                if rel in write_failures:
+                    continue
+                try:
+                    idx.delete(rel)
+                    removed_count += 1
+                except Exception as e:  # noqa: BLE001
+                    logger.debug("kb sync delete failed for %s: %s", rel, e)
+                    log_degraded("kb_sync", "delete_failed", detail=rel, exc=e)
+                    errors += 1
 
         result = {
-            "ok": True,
+            "ok": errors == 0,
             "added": len(added),
             "updated": len(updated),
-            "removed": len(removed),
+            "removed": removed_count,
             "unchanged": len(vault) - len(added) - len(updated),
             "errors": errors,
+            "scanned": len(vault),
+            "indexed_rows": len(indexed),
+            "purged": bool(removed_count),
         }
-        if added or updated or removed:
+        if purge_skipped:
+            result["purge_skipped"] = purge_skipped
+        if errors:
+            log_degraded("kb_sync", "sync_write_failed",
+                         detail="%d note(s) failed" % errors)
+        if added or updated or orphans or errors:
             logger.info("kb index sync: %s", result)
+        self._last_sync = dict(result, at=time.time())
         return result
 
     def index_stats(self) -> Dict[str, Any]:
