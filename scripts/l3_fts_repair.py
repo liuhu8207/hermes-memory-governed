@@ -39,10 +39,10 @@ def _integrity(path: Path) -> str:
         conn.close()
 
 
-def _backup(path: Path) -> Path:
+def _backup(path: Path, kind: str = "pre_fts_repair") -> Path:
     BACKUP_DIR.mkdir(parents=True, exist_ok=True)
     stamp = datetime.now().astimezone().strftime("%Y%m%d_%H%M%S")
-    dest = BACKUP_DIR / ("l3_pre_fts_repair_%s.db" % stamp)
+    dest = BACKUP_DIR / ("l3_%s_%s.db" % (kind, stamp))
     src = sqlite3.connect(str(path))
     dst = sqlite3.connect(str(dest))
     try:
@@ -59,6 +59,9 @@ def main() -> int:
     parser.add_argument("--yes", action="store_true", help="Skip confirmation")
     parser.add_argument("--keep-backups", type=int, default=3,
                         help="Keep this many FTS-repair backups (default 3)")
+    parser.add_argument("--snapshot", action="store_true",
+                        help="Take a known-good post-repair snapshot even when "
+                             "the index is already healthy")
     args = parser.parse_args()
 
     if not L3_DB_PATH.exists():
@@ -68,8 +71,14 @@ def main() -> int:
 
     before = _integrity(L3_DB_PATH)
     if before == "ok":
-        print(json.dumps({"ok": True, "changed": False,
-                          "integrity": before}, indent=2))
+        if args.snapshot:
+            snapshot = _backup(L3_DB_PATH, kind="post_fts_repair")
+            print(json.dumps({"ok": True, "changed": False,
+                              "integrity": before,
+                              "snapshot": str(snapshot)}, indent=2))
+        else:
+            print(json.dumps({"ok": True, "changed": False,
+                              "integrity": before}, indent=2))
         return 0
 
     if args.dry_run:
@@ -93,6 +102,8 @@ def main() -> int:
         conn.close()
 
     after = _integrity(L3_DB_PATH)
+    post_snapshot = (_backup(L3_DB_PATH, kind="post_fts_repair")
+                     if after == "ok" else None)
     backups = sorted(BACKUP_DIR.glob("l3_pre_fts_repair_*.db"),
                      key=lambda p: p.stat().st_mtime, reverse=True)
     removed = []
@@ -105,7 +116,9 @@ def main() -> int:
 
     out = {"ok": after == "ok", "changed": True,
            "before": before, "after": after,
-           "backup": str(backup), "pruned": removed}
+           "backup": str(backup),
+           "post_repair_snapshot": str(post_snapshot) if post_snapshot else "",
+           "pruned": removed}
     print(json.dumps(out, ensure_ascii=False, indent=2))
     return 0 if out["ok"] else 1
 

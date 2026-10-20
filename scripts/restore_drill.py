@@ -67,7 +67,8 @@ def _pick_l3(name: str):
     if name and name != "latest":
         candidate = root / name
         return candidate if candidate.is_file() else None
-    return _latest(list(root.glob("l3_pre_redact_*.db")))
+    # 脱敏前备份和 FTS 修复前备份都是完整 DB 快照，取最新的那一份。
+    return _latest(list(root.glob("l3_*.db")))
 
 
 def _wiki_dir() -> Path:
