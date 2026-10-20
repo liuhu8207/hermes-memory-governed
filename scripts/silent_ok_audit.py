@@ -62,7 +62,14 @@ REPO = Path(__file__).resolve().parent.parent
 if str(REPO) not in sys.path:
     sys.path.insert(0, str(REPO))
 
-import guardrail_rules as rules  # noqa: E402  （先补 sys.path 再导入）
+try:
+    import guardrail_rules as rules  # noqa: E402  （先补 sys.path 再导入）
+except ImportError:  # 部署副本没有仓库根的 guardrail_rules.py
+    print(
+        "silent_ok_audit is a repository tool: guardrail_rules.py was not "
+        "found next to the checkout. Run it from the repository root.",
+        file=sys.stderr)
+    raise SystemExit(2)
 
 #: 退出码。
 EXIT_OK = 0
