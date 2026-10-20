@@ -145,6 +145,25 @@ the same set score differently every run; pass `--affinity on` (or the legacy
 `--with-affinity`) only when you explicitly want the production full path.
 `--affinity both` reports both variants in one run, off first.
 
+## Test Isolation vs Production Scripts
+
+These are two different situations and must not be conflated:
+
+* **pytest** — the repository-root `conftest.py` points `HERMES_HOME` at a
+  temporary directory before any test module imports a script. Scripts also
+  refuse a production home inside a pytest session (second line of defence).
+* **normal CLI / cron / manual ops** — `bootstrap()` resolves the real
+  `HERMES_HOME` and prints a WARNING that it is about to touch production.
+  It does **not** refuse: refusing here would stop `kb_reindex`,
+  `restore_drill`, `l2_capacity` and every scheduled backup/cleanup.
+* **force refusal anyway** — set `HGM_STRICT_ISOLATION=1` (CI or a one-off
+  investigation). The gateway launcher also sets `HGM_ALLOW_PRODUCTION=1`
+  for its own process tree only.
+
+If a script is invoked without `HERMES_HOME`, it falls back to the platform
+default and warns. Set the variable explicitly in cron jobs so the target is
+never ambiguous.
+
 ## Health Check
 
 ```bash
