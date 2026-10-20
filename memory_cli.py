@@ -79,6 +79,14 @@ from pathlib import Path
 
 logger = logging.getLogger(__name__)
 
+
+def _safe_exc(exc: BaseException) -> str:
+    """``Type: message``，且异常自身的 ``__str__`` 坏掉时也不抛。"""
+    try:
+        return "%s: %s" % (type(exc).__name__, exc)
+    except Exception:  # silent-ok: already-reported — 返回值写进 errors，异常本体不吞
+        return type(exc).__name__
+
 DEFAULT_HERMES_HOME = r"D:/repos\hermes-home"
 VAULT_SUBDIRS = ["inbox", "notes", "projects", "areas", "resources", "archive"]
 
@@ -3470,8 +3478,18 @@ def cmd_kb_add(config: dict, title: str, body: str, section: str,
         except OSError:
             pass
         raise
+    # 导航是派生视图：写入后重建，避免「笔记加了、MOC 还停在上一版」。
+    # 失败只记录，绝不影响写入结果。
+    moc_rebuilt = False
+    if bool((config.get("kb") or {}).get("moc_auto_rebuild", True)):
+        try:
+            cmd_kb_moc(config)
+            moc_rebuilt = True
+        except Exception as exc:  # silent-ok: already-reported — logger.warning 已记录，派生视图不阻断写入
+            logger.warning("MOC 重建失败（不影响笔记写入）：%s", exc)
     return {"ok": True, "path": str(path), "section": section,
-            "title": title.strip(), "agent": agent, "updated": existed}
+            "title": title.strip(), "agent": agent, "updated": existed,
+            "category": category, "moc_rebuilt": moc_rebuilt}
 
 
 
@@ -3591,6 +3609,11 @@ def cmd_kb_moc(config: dict) -> dict:
             "uncategorized": len(uncategorized)}
 
 
+def title_value(meta, path):
+    """笔记标题：frontmatter title 优先，否则用文件名。"""
+    return meta.get("title") or path.stem
+
+
 def cmd_kb_migrate_category(config: dict, apply: bool = False) -> dict:
     """给缺受控分类的存量笔记补 category（默认 dry-run）。
 
@@ -3605,17 +3628,41 @@ def cmd_kb_migrate_category(config: dict, apply: bool = False) -> dict:
         except OSError:
             continue
         rel = str(path.relative_to(wiki_dir(config))).replace("\\", "/")
+        raw = meta.get("category")
+        norm = normalize_category(raw)
+
+        # 旧体系的非受控值（工作/技术）：保留为 legacy_category，让出受控字段。
+        # 与插件侧 KnowledgeBase.migrate_categories 同源。
+        if isinstance(raw, str) and raw.strip() and not norm:
+            proposed.append({"title": title_value(meta, path), "path": rel,
+                             "action": "legacy_category",
+                             "legacy_category": raw.strip()})
+            if apply:
+                try:
+                    meta["legacy_category"] = raw.strip()
+                    meta.pop("category", None)
+                    text = dump_frontmatter(meta) + "\n\n" + body.rstrip() + "\n"
+                    fd, tmp = tempfile.mkstemp(dir=str(path.parent), suffix=".tmp")
+                    with os.fdopen(fd, "w", encoding="utf-8") as f:
+                        f.write(text)
+                    os.replace(tmp, path)
+                    written.append(rel)
+                except OSError as e:  # silent-ok: already-reported — 聚合进返回的 errors
+                    errors.append("write failed: %s: %s" % (rel, _safe_exc(e)))
+            continue
+
         if is_archived(meta):
             continue
-        if normalize_category(meta.get("category")):
+        if norm:
             continue
-        title = meta.get("title") or path.stem
+        title = title_value(meta, path)
         cat = infer_category(title, meta.get("tags"), meta.get("concepts"), body)
         if not cat:
             skipped.append({"title": title, "path": rel,
                             "reason": "no category could be inferred"})
             continue
-        proposed.append({"title": title, "path": rel, "category": cat})
+        proposed.append({"title": title, "path": rel,
+                         "action": "set_category", "category": cat})
         if apply:
             try:
                 meta["category"] = cat
@@ -3625,8 +3672,8 @@ def cmd_kb_migrate_category(config: dict, apply: bool = False) -> dict:
                     f.write(text)
                 os.replace(tmp, path)
                 written.append(rel)
-            except OSError as e:
-                errors.append(f"write failed: {rel}: {type(e).__name__}: {e}")
+            except OSError as e:  # silent-ok: already-reported — 聚合进返回的 errors
+                errors.append("write failed: %s: %s" % (rel, _safe_exc(e)))
 
     return {"ok": True, "applied": bool(apply), "proposed": proposed,
             "skipped": skipped, "written": written, "errors": errors}

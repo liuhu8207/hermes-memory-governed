@@ -309,6 +309,11 @@ class KnowledgeConfig:
     #: questions）。**默认 False = 现行为**；LLM 调用走 ``config.synthesis``
     #: 端点，写入时一次（非查询时），失败不阻断写入。
     enrich: bool = False
+    #: 写入/更新笔记后自动重建 ``index.md`` 导航（MOC）。默认开：导航只由
+    #: 一个命令维护时，人迟早会看到一张过期的索引。大库（数千篇）可关掉，
+    #: 改用 cron 调 ``memory_cli kb-moc --yes``。
+    #: 重建失败绝不影响写入 —— 导航是派生视图，正本是笔记本身。
+    moc_auto_rebuild: bool = True
 
 
 @dataclass

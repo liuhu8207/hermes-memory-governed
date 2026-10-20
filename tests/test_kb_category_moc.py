@@ -383,6 +383,44 @@ class TestMoc:
         assert "知识库导航 (MOC)" not in titles
 
 
+class TestMocAutoRebuild:
+    """导航不能只在手动命令后更新 —— 笔记加了、MOC 还停在上一版没人发现。"""
+
+    def test_add_rebuilds_the_moc(self, kb):
+        kb.add("飞牛 NAS 硬件配置", "nas 硬件", category="environment")
+        index = kb._vault / "index.md"
+        assert index.exists()
+        assert "[[飞牛 NAS 硬件配置]]" in index.read_text(encoding="utf-8")
+
+    def test_the_switch_can_turn_it_off(self, kb):
+        kb._config.kb.moc_auto_rebuild = False
+        r = kb.add("飞牛 NAS 硬件配置", "nas 硬件", category="environment")
+        assert r["moc_rebuilt"] is False
+        text = (kb._vault / "index.md").read_text(encoding="utf-8")
+        assert "[[飞牛 NAS 硬件配置]]" not in text
+
+    def test_a_failed_rebuild_does_not_block_the_write(self, kb, monkeypatch):
+        def boom():
+            raise OSError("disk full")
+
+        monkeypatch.setattr(kb, "rebuild_moc", boom)
+        r = kb.add("飞牛 NAS 硬件配置", "nas 硬件", category="environment")
+        assert r["ok"] is True, "MOC 是派生视图，失败不能阻断写入"
+        assert r["moc_rebuilt"] is False
+        assert (kb._vault / "notes" / "飞牛 NAS 硬件配置.md").exists()
+
+
+class TestSemanticTextCarriesCategory:
+    """语义索引的输入必须包含 category，否则类目永远进不了向量通道。"""
+
+    def test_full_text_contains_the_category(self, kb):
+        kb.add("飞牛 NAS 硬件配置", "nas 硬件", category="environment")
+        note = [n for n in kb._iter_notes() if n.title == "飞牛 NAS 硬件配置"][0]
+        assert "environment" in note.short_text
+        assert "environment" in note.full_text, (
+            "full_text 是建向量索引的输入；不含 category 就说明语义通道看不到它")
+
+
 # ---------------------------------------------------------------------------
 # 迁移
 # ---------------------------------------------------------------------------
@@ -420,6 +458,21 @@ class TestMigrate:
         meta, _ = _vault.read_note(
             kb._vault / "notes" / "飞牛 NAS 硬件配置.md")
         assert meta["category"] == "reference"
+
+    def test_legacy_category_is_preserved_not_dropped(self, kb):
+        """旧值 ``工作`` 不在受控词表里：保留为 legacy_category，让出字段。
+
+        静默归一成空会让「历史分类」凭空消失；硬猜一个新类目则会伪造结论。
+        """
+        path = kb._vault / "archive" / "meetings" / "旧会议.md"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        _vault.write_note(path, {"title": "旧会议", "status": "archived",
+                                 "category": "工作"}, "会议纪要")
+        r = kb.migrate_categories(apply=True)
+        assert any(p.get("action") == "legacy_category" for p in r["proposed"])
+        meta, _ = _vault.read_note(path)
+        assert meta.get("legacy_category") == "工作"
+        assert "category" not in meta
 
     def test_archive_is_left_alone(self, kb):
         kb.add("旧笔记", "nas 硬件", section="archive")

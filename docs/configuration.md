@@ -248,6 +248,7 @@ of them in `$HERMES_HOME/governed_memory.json`.
 | promote_hits | 3 | Inbox notes hit this many times get flagged `promote_suggest`. |
 | auto_archive_days | 45 | Auto-zone notes with zero hits and no update for this long are suggested for `archive/`. The sweep **skips archiving when there is no usage data at all** (fail-closed: "no data" is not "unused"). |
 | search_archived | false | Whether `status: "archived"` notes take part in retrieval. |
+| moc_auto_rebuild | true | Rebuild `index.md` (the MOC) after a note is written or updated. Navigation kept only by a manual command goes stale; a large vault can set this false and run `kb-moc` from cron instead. A failed rebuild never blocks the write — the MOC is a derived view. |
 | enrich | false | On `add`, use the LLM to write a one-line `summary` plus 2-3 `questions` into frontmatter, feeding the keyword channel. One call at write time, failure never blocks the write. |
 
 ## Reranking Config

@@ -53,9 +53,16 @@ python memory_cli.py kb-add "标题" "正文"
 python memory_cli.py kb-migrate-category
 python memory_cli.py kb-migrate-category --apply --yes
 
-# 重建 index.md 导航（MOC）
+# 重建 index.md 导航（MOC）。kb-add / 插件 add() 成功后会自动重建；
+# 这里的手动命令用于首次安装、批量改动之后，或关掉自动重建的大库。
 python memory_cli.py kb-moc --yes
 ```
+
+## 旧分类值的处理
+
+旧版本写过 `工作` / `技术` 这类不在词表里的值。迁移不会把它们静默清空，也不会
+硬猜一个新类目：原值被移到 `legacy_category`，受控 `category` 留空。信息保留，
+字段干净。
 
 ## 三条不妥协的规则
 

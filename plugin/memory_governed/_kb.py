@@ -2120,15 +2120,27 @@ class KnowledgeBase:
         if section == "notes" and getattr(self._config.kb, "autolink_related", True):
             links_added = self._link_related(path, title, meta, body, concepts, tags)
 
+        # 导航是派生视图：每次写入后重建，才不会出现「笔记加了、MOC 还停在
+        # 上周」。失败只记录不阻断 —— 正本是笔记，索引可以下一轮补。
+        moc_rebuilt = False
+        if bool(getattr(self._config.kb, "moc_auto_rebuild", True)):
+            try:
+                self.rebuild_moc()
+                moc_rebuilt = True
+            except Exception as e:  # noqa: BLE001 — 派生视图不得阻断写入
+                log_degraded("kb", "moc_rebuild_failed", exc=e)
+
         return {
             "ok": True,
             "title": title,
             "path": self._rel(path),
             "section": section,
+            "category": category,
             "tags": tags,
             "concepts": concepts,
             "review_required": review_required,
             "links_added": links_added,
+            "moc_rebuilt": moc_rebuilt,
         }
 
     def list_review(self, limit: int = 50) -> List[Dict[str, Any]]:
@@ -2506,18 +2518,46 @@ class KnowledgeBase:
         errors: List[str] = []
 
         for note in self._iter_notes():
+            rel = self._rel(note.path)
+            raw = note.meta.get("category")
+            norm = _vault.normalize_category(raw)
+
+            # 旧体系留下的非受控值（实测 ``工作`` / ``技术``）：不要静默归一成
+            # 空、也不要硬猜一个新类目，而是**保留信息、让出字段** ——
+            # 改名成 ``legacy_category``，受控 ``category`` 保持为空。这样既不
+            # 说谎，也不丢历史。
+            if isinstance(raw, str) and raw.strip() and not norm:
+                proposed.append({"title": note.title, "path": rel,
+                                 "action": "legacy_category",
+                                 "legacy_category": raw.strip()})
+                if apply:
+                    try:
+                        meta = dict(note.meta)
+                        meta["legacy_category"] = raw.strip()
+                        meta.pop("category", None)
+                        _vault.write_note(note.path, meta, note.body)
+                        self._index_get().upsert(
+                            rel,
+                            _Note(note.path, note.title, meta,
+                                  note.body).full_text,
+                            mtime=_file_mtime(note.path))
+                        written.append(rel)
+                    except OSError as e:  # silent-ok: already-reported — 聚合进 errors
+                        errors.append(f"write failed: {rel}: {_safe_str(e)}")
+                continue
+
             if _is_archived(note):
                 continue
-            if _vault.normalize_category(note.meta.get("category")):
+            if norm:
                 continue
-            rel = self._rel(note.path)
             cat = _vault.infer_category(
                 note.title, note.tags, note.concepts, note.body)
             if not cat:
                 skipped.append({"title": note.title, "path": rel,
                                 "reason": "no category could be inferred"})
                 continue
-            proposed.append({"title": note.title, "path": rel, "category": cat})
+            proposed.append({"title": note.title, "path": rel,
+                             "action": "set_category", "category": cat})
             if apply:
                 try:
                     meta = dict(note.meta)
