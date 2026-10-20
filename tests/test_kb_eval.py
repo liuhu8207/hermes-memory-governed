@@ -53,3 +53,29 @@ def test_all_misses_are_reported():
     assert out["p_at_1"] == 0.0
     assert out["recall_at_5"] == 0.0
     assert out["misses"][0]["q"] == "x"
+
+
+
+def test_zero_positives_is_a_failure_not_an_empty_scoreboard():
+    mod = _load()
+    out = mod.validate({"positives": 0, "ok": True}, {
+        "semantic_enabled": True, "index_available": True})
+    assert out["ok"] is False
+    assert "no positive queries" in out["error"]
+
+
+def test_unavailable_semantic_channel_is_a_failure():
+    mod = _load()
+    out = mod.validate({"positives": 5, "ok": True}, {
+        "semantic_enabled": True, "index_available": False})
+    assert out["ok"] is False
+    assert "semantic channel" in out["error"]
+
+
+def test_healthy_channels_keep_ok():
+    mod = _load()
+    out = mod.validate({"positives": 5, "ok": True}, {
+        "semantic_enabled": True, "index_available": True,
+        "reranker_available": True})
+    assert out["ok"] is True
+    assert "error" not in out

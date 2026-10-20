@@ -104,15 +104,16 @@ def main() -> int:
     after = _integrity(L3_DB_PATH)
     post_snapshot = (_backup(L3_DB_PATH, kind="post_fts_repair")
                      if after == "ok" else None)
-    backups = sorted(BACKUP_DIR.glob("l3_pre_fts_repair_*.db"),
-                     key=lambda p: p.stat().st_mtime, reverse=True)
     removed = []
-    for old in backups[max(1, int(args.keep_backups)):]:
-        try:
-            old.unlink()
-            removed.append(old.name)
-        except OSError:  # silent-ok: already-reported — 清理失败不影响修复结果
-            pass
+    for pattern in ("l3_pre_fts_repair_*.db", "l3_post_fts_repair_*.db"):
+        backups = sorted(BACKUP_DIR.glob(pattern),
+                         key=lambda p: p.stat().st_mtime, reverse=True)
+        for old in backups[max(1, int(args.keep_backups)):]:
+            try:
+                old.unlink()
+                removed.append(old.name)
+            except OSError:  # silent-ok: already-reported — 清理失败不影响修复结果
+                pass
 
     out = {"ok": after == "ok", "changed": True,
            "before": before, "after": after,

@@ -156,7 +156,16 @@ def main() -> int:
     parser.add_argument("--dry-run", action="store_true",
                         help="Show what would be restored, touch nothing")
     parser.add_argument("--keep", action="store_true",
-                        help="Keep the restored tree and print its path")
+                        help="Keep the restored tree (contains a full plaintext "
+                             "L3 copy) for inspection")
+    parser.add_argument("--keep-days", type=int, default=7,
+                        help="Delete kept drill directories older than this "
+                             "(default 7)")
+    parser.add_argument("--allow-repair", action="store_true",
+                        help="Treat a backup that needs an FTS rebuild as a "
+                             "warning instead of a failure. Default is to fail: "
+                             "a backup that is not directly usable is a bad "
+                             "backup, and cron only reads the exit code.")
     args = parser.parse_args()
 
     l2 = _pick_l2(args.l2_backup)
@@ -188,7 +197,13 @@ def main() -> int:
         return 1
 
     started = time.time()
-    root = Path(tempfile.mkdtemp(prefix="hgm-restore-drill-"))
+    # 不要放系统临时目录：L3 是**完整明文副本**（含脱敏前凭据），
+    # 放 %TEMP% 会被清理策略遗漏或被其它账户读到。统一放在 HERMES_HOME
+    # 下的受控目录，默认用后即删，--keep 时按 --keep-days 过期清理。
+    drill_root = env_path("HGM_RESTORE_DRILL_DIR",
+                          HERMES_HOME / "restore_drills")
+    drill_root.mkdir(parents=True, exist_ok=True)
+    root = Path(tempfile.mkdtemp(prefix="drill-", dir=str(drill_root)))
     result: dict[str, Any] = {"ok": True, "restored_into": str(root),
                               "sources": plan, "checks": {}}
     try:
@@ -248,9 +263,13 @@ def main() -> int:
                 after = _count_l3(restored_l3)
                 l3_check["fts_rebuilt_in_restore"] = True
                 l3_check["integrity_after_rebuild"] = after.get("integrity")
-                result.setdefault("warnings", []).append(
-                    "restored L3 FTS index was malformed and was rebuilt "
-                    "(the source backup needs the same repair)")
+                message = ("restored L3 FTS index was malformed and was "
+                           "rebuilt (the source backup needs the same repair)")
+                if args.allow_repair:
+                    result.setdefault("warnings", []).append(message)
+                else:
+                    result["ok"] = False
+                    result["error"] = message
                 if after.get("integrity") != "ok":
                     result["ok"] = False
                     result["error"] = ("restored L3 still fails integrity "
@@ -269,9 +288,24 @@ def main() -> int:
         result["error"] = _safe_exc(exc)
     finally:
         result["elapsed_seconds"] = round(time.time() - started, 3)
+        if l3:
+            result["contains_plaintext_l3"] = True
         if not args.keep:
             shutil.rmtree(root, ignore_errors=True)
             result["restored_into"] = None
+        else:
+            # 过期清理：只保留最近 keep-days 天内的演练目录
+            cutoff = time.time() - max(1, int(args.keep_days)) * 86400
+            pruned = []
+            for old in drill_root.glob("drill-*"):
+                try:
+                    if old.is_dir() and old.stat().st_mtime < cutoff:
+                        shutil.rmtree(old, ignore_errors=True)
+                        pruned.append(old.name)
+                except OSError:  # silent-ok: already-reported — 单个过期目录清理失败不影响本次演练
+                    continue
+            if pruned:
+                result["pruned_drill_dirs"] = pruned
         print(json.dumps(result, ensure_ascii=False, indent=2))
     return 0 if result.get("ok") else 1
 

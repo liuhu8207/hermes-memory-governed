@@ -58,6 +58,15 @@ python memory_cli.py kb-migrate-category --apply --yes
 python memory_cli.py kb-moc --yes
 ```
 
+## category 不参与相关性打分
+
+`category` 提供两件事：**按类目过滤**（`kb-search --category`）和**导航**
+（MOC）。它**不是排序信号**，也不会提升检索命中率——三轮实测中，把类目名
+加入关键词文本后，金标查询的位次没有任何变化（21/21 不变）。
+
+所以它适合回答"给我所有 tooling 笔记"，不适合期待"问了某句话就更容易找到"。
+检索质量由 embedding、关键词与 reranker 负责；三者是不同层次的机制。
+
 ## 旧分类值的处理
 
 旧版本写过 `工作` / `技术` 这类不在词表里的值。迁移不会把它们静默清空，也不会

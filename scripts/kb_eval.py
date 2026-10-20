@@ -86,6 +86,23 @@ def evaluate(kb, gold: list, top_k: int) -> dict:
     }
 
 
+def validate(result: dict, channels: dict) -> dict:
+    """Fail the verdict when the scoreboard would be misleading."""
+    result["channels"] = channels
+    if result["positives"] == 0:
+        result["ok"] = False
+        result["error"] = ("gold set has no positive queries — nothing was "
+                           "measured (collector output must be curated first)")
+    elif channels["semantic_enabled"] and not channels["index_available"]:
+        result["ok"] = False
+        result["error"] = ("semantic channel is unavailable; scores below come "
+                           "from the keyword channel only")
+    elif channels.get("reranker_available") is False:
+        result["ok"] = False
+        result["error"] = "reranker is enabled but unavailable"
+    return result
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description="Evaluate KB retrieval")
     parser.add_argument("--gold", required=True)
@@ -117,6 +134,21 @@ def main() -> int:
     result = evaluate(kb, gold, args.top_k)
     result["ok"] = True
 
+    # 诚实报告通道状态：语义通道不可用时，记分板只是关键词通道的成绩，
+    # 不能打 ok:true 让人以为全链路都通过了。
+    channels = {
+        "semantic_enabled": bool(getattr(cfg.kb, "semantic_enabled", True)),
+        "index_available": bool(kb.index_available),
+        "reranker_enabled": bool(getattr(cfg.reranking, "enabled", False)),
+    }
+    if channels["reranker_enabled"]:
+        try:
+            channels["reranker_available"] = bool(
+                kb._get_reranker().available)
+        except Exception:  # silent-ok: already-reported — 下面会写 unavailable
+            channels["reranker_available"] = False
+    validate(result, channels)
+
     if args.save_baseline:
         dest = Path(args.save_baseline)
         dest.parent.mkdir(parents=True, exist_ok=True)
@@ -142,7 +174,7 @@ def main() -> int:
                                 "delta": fp_delta})
         result["baseline_deltas"] = deltas
         result["regressions"] = regressions
-        result["ok"] = not regressions
+        result["ok"] = bool(result["ok"]) and not regressions
 
     print(json.dumps(result, ensure_ascii=False, indent=2))
     return 0 if result["ok"] else 1

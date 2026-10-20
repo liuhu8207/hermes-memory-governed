@@ -1,0 +1,20 @@
+{
+  "queries": 21,
+  "positives": 16,
+  "negatives": 5,
+  "p_at_1": 1.0,
+  "recall_at_5": 1.0,
+  "mrr": 1.0,
+  "negative_false_positive_rate": 0.0,
+  "misses": [],
+  "negative_false_positives": [],
+  "top_k": 5,
+  "affinity_enabled": false,
+  "ok": true,
+  "channels": {
+    "semantic_enabled": true,
+    "index_available": true,
+    "reranker_enabled": true,
+    "reranker_available": true
+  }
+}

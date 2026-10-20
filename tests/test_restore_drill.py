@@ -54,15 +54,20 @@ def drill_env(tmp_path, monkeypatch):
     conn.close()
 
     mod = _load()
+    # 演练目录现在落在 HERMES_HOME/restore_drills（不是 %TEMP%）
+    monkeypatch.setattr(mod, "HERMES_HOME", tmp_path / "home")
     monkeypatch.setattr(mod, "MEMORY_DIR", memory)
     monkeypatch.setattr(mod, "_wiki_dir", lambda: wiki)
     monkeypatch.setattr(sys, "argv", ["restore_drill.py"])
     return mod
 
 
-def test_restore_drill_verifies_all_three_stores(drill_env, capsys):
+def test_restore_drill_verifies_all_three_stores(drill_env, capsys, tmp_path):
     rc = drill_env.main()
     out = capsys.readouterr().out
     assert rc == 0, out
     assert '"l2"' in out and '"l3"' in out and '"vault"' in out
     assert '"malformed_frontmatter": 0' in out
+    # 默认用后即删，不留下明文 L3 副本
+    drills = tmp_path / "home" / "restore_drills"
+    assert not drills.exists() or not list(drills.iterdir())

@@ -14,8 +14,8 @@ Run:
 
 ```bash
 python scripts/kb_eval.py --gold evals/retrieval_gold.seed.json
-python scripts/kb_eval.py --gold ... --save-baseline "$HERMES_HOME/evals/baseline.json"
-python scripts/kb_eval.py --gold ... --baseline "$HERMES_HOME/evals/baseline.json"
+python scripts/kb_eval.py --gold evals/retrieval_gold.seed.json --save-baseline evals/baseline.json
+python scripts/kb_eval.py --gold evals/retrieval_gold.seed.json --baseline evals/baseline.json
 ```
 
 The last form exits non-zero if P@1 / recall@5 / MRR drops more than

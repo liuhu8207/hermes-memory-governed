@@ -114,6 +114,21 @@ def _doc_default(kind, value) -> str:
     return str(value)
 
 
+def _defaults_equal(doc_value: str, default) -> bool:
+    """文档单元格 vs dataclass 默认值（字符串允许空格，数值允许 30≡30.0）。"""
+    doc_value = doc_value.strip()
+    want = _doc_default("", default)
+    if isinstance(default, str):
+        return doc_value == want
+    token = doc_value.split()[0] if doc_value.split() else ""
+    if token == want:
+        return True
+    try:
+        return float(token) == float(want)
+    except (TypeError, ValueError):
+        return False
+
+
 class TestDocDefaultsMatchCode:
     """默认值必须与 ``_config.py`` 一致，不只是字段名存在。
 
@@ -129,6 +144,8 @@ class TestDocDefaultsMatchCode:
         "## Reranking Config": "RerankingConfig",
         "## Synthesis Config": "SynthesisConfig",
         "## ASR Config": "AsrConfig",
+        "## Recall Config Additions": "RecallConfig",
+        "## Sync Config Additions": "SyncConfig",
     }
 
     @pytest.mark.parametrize("heading,cls_name", sorted(SECTIONS.items()))
@@ -140,22 +157,61 @@ class TestDocDefaultsMatchCode:
         for f in dataclasses.fields(cls):
             if f.name in RUNTIME_ONLY or f.name not in table:
                 continue
-            want = _doc_default(cls_name, f.default)
             got = table[f.name]
-            # 文档里允许带说明空格，取第一个词比较
-            token = got.split()[0]
-            if token != want:
-                # 数值允许 30 与 30.0 等价（文档写整数的可读性优先）
-                same_number = False
-                try:
-                    same_number = float(token) == float(want)
-                except (TypeError, ValueError):
-                    pass
-                if not same_number:
-                    mismatches.append("%s: doc=%r code=%r"
-                                      % (f.name, token, want))
+            if not _defaults_equal(got, f.default):
+                mismatches.append("%s: doc=%r code=%r"
+                                  % (f.name, got, _doc_default(cls_name, f.default)))
         assert not mismatches, (
             "%s 的默认值与代码不一致：\n  " % heading + "\n  ".join(mismatches))
+
+
+class TestCombinedDocTable:
+    """Persona / Mermaid / Tencent 共用一张 4 列表，单独解析。"""
+
+    HEADING = "## Persona / Mermaid / Tencent Extraction"
+    CLASSES = {
+        "persona": "PersonaConfig",
+        "mermaid_compress": "MermaidConfig",
+        "tencent_extract": "TextractConfig",
+    }
+
+    def _table(self):
+        import re
+
+        text = _doc_text()
+        start = text.find(self.HEADING)
+        block = text[start:]
+        current = None
+        out = {}
+        for line in block.splitlines():
+            m = re.match(
+                r"\|\s*(`[^`]+`)?\s*\|\s*([^|]+?)\s*\|\s*([^|]*?)\s*\|", line)
+            if not m:
+                continue
+            section, keys, default = m.group(1), m.group(2).strip(), m.group(3).strip()
+            if section:
+                current = section.strip("`")
+            if not current or not keys or keys.lower() == "key":
+                continue
+            for key in [k.strip() for k in keys.split("/")]:
+                out[(current, key)] = default
+        return out
+
+    def test_defaults_match_the_dataclasses(self):
+        table = self._table()
+        assert table, "组合表没解析到"
+        mismatches = []
+        for section, cls_name in self.CLASSES.items():
+            cls = getattr(_config, cls_name)
+            for f in dataclasses.fields(cls):
+                got = table.get((section, f.name))
+                if got is None:
+                    continue
+                if not _defaults_equal(got, f.default):
+                    mismatches.append("%s.%s: doc=%r code=%r"
+                                      % (section, f.name, got,
+                                         _doc_default(cls_name, f.default)))
+        assert not mismatches, "\n  ".join(mismatches)
 
 
 class TestDocsNameEveryTunable:

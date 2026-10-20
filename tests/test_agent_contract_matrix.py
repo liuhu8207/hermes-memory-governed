@@ -90,3 +90,42 @@ def test_three_write_surfaces_normalise_the_same_fields(tmp_path, monkeypatch):
     index = (kb._vault / "index.md").read_text(encoding="utf-8")
     for name in ("契约 插件", "契约 CLI", "契约 MCP"):
         assert "[[%s]]" % name in index
+
+
+
+def test_keyword_search_parity_between_plugin_and_cli(tmp_path):
+    """semantic 关闭时，同一查询在两个入口必须给出同样的顺序。"""
+    cfg, kb = _kb(tmp_path)
+    cfg.kb.semantic_enabled = False
+    cfg.kb.keyword_enabled = True
+    cfg.kb.affinity_enabled = False
+    cfg.reranking.enabled = False
+    kb.add("飞牛 NAS 硬件配置", "nas 硬件 内存", category="environment")
+    kb.add("本地 PC 硬件", "pc 硬件 环境", category="environment")
+    kb.add("ZCode 配置", "zcode provider 配置", category="tooling")
+
+    plugin = [h["title"] for h in kb.search("NAS 硬件", top_k=5)]
+    cli_cfg = {"wiki_dir": cfg.wiki_dir,
+               "reranking": {"enabled": False},
+               "kb": {"semantic_enabled": False, "keyword_enabled": True,
+                      "affinity_enabled": False,
+                      "moc_auto_rebuild": True}}
+    cli = [h["title"] for h in memory_cli.cmd_kb_search(
+        cli_cfg, "NAS 硬件", 5, "", [])]
+    assert plugin == cli, "插件与 CLI 的检索顺序不一致：%r vs %r" % (plugin, cli)
+
+
+def test_both_write_surfaces_refuse_secrets(tmp_path):
+    """错误路径也要有同一套语义：两处都必须拒绝含密钥的正文。"""
+    cfg, kb = _kb(tmp_path)
+    secret = "sk-" + "A" * 24
+
+    r1 = kb.add("插件密钥测试", "token = " + secret, category="tooling")
+    r2 = memory_cli.cmd_kb_add(
+        {"wiki_dir": cfg.wiki_dir}, "CLI 密钥测试", "token = " + secret,
+        "notes", [], [], None, agent="cli-test", category="tooling")
+
+    assert r1.get("ok") is False
+    assert r2.get("ok") is False
+    assert not (kb._vault / "notes" / "插件密钥测试.md").exists()
+    assert not (kb._vault / "notes" / "CLI 密钥测试.md").exists()

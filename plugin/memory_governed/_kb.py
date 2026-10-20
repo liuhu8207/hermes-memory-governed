@@ -946,8 +946,25 @@ class KnowledgeBase:
     def __init__(self, config: GovernedMemoryConfig):
         self._config = config
         self._vault = _vault.vault_root(config)
-        # 独立向量库目录（与 L2 记忆的 l2/ 分开）
-        self._index_db = Path(config.l2_db_path).parent / "kb_index"
+        # 独立向量库目录（与 L2 记忆的 l2/ 分开）。
+        #
+        # 必须解析成**绝对路径**：``Path("").parent`` == ``"."``，相对路径
+        # 会让索引随进程 cwd 漂移 —— 换一个工作目录就换一份索引，读到的
+        # "没结果"可能只是读错了库。仓库根那个 2 行的 kb_index/ 就是物证。
+        raw_l2 = str(getattr(config, "l2_db_path", "") or "").strip()
+        if not raw_l2:
+            home = str(os.environ.get("HERMES_HOME", "") or "").strip()
+            if not home:
+                raise ValueError(
+                    "l2_db_path is empty and HERMES_HOME is unset; refusing to "
+                    "place kb_index under the current working directory")
+            raw_l2 = str(Path(home) / "memory" / "l2")
+        l2_path = Path(raw_l2)
+        if not l2_path.is_absolute():
+            raise ValueError(
+                "l2_db_path must be absolute: %r would make the kb index "
+                "depend on the process cwd" % raw_l2)
+        self._index_db = l2_path.parent / "kb_index"
         self._index: Optional[KBIndex] = None
         # retrieve-then-rerank：与 L2 共用同一个 reranker 配置，但这里是
         # KB 自己的实例（进程内单例，构造期解析一次密钥）

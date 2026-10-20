@@ -63,10 +63,18 @@ python scripts/restore_drill.py --dry-run   # show which backups would be used
 python scripts/restore_drill.py             # restore into a temp dir and verify
 ```
 
-It copies the newest L2 / L3 / vault backups into a temporary tree, opens them
-the way the runtime does, checks L2 columns, SQLite integrity and vault
-frontmatter, and prints row counts. The live store is only read. `--keep` keeps
-the restored tree for inspection.
+It copies the newest L2 / L3 / vault backups into a tree under
+`$HERMES_HOME/restore_drills/` (not the system temp dir), opens them the way the
+runtime does, checks L2 columns, SQLite integrity and vault frontmatter, and
+prints row counts. The live store is only read. The tree is deleted unless
+`--keep`; kept trees are pruned after `--keep-days` (default 7).
+
+A drill that would need to rebuild the L3 FTS index exits **non-zero**: a backup
+that is not directly usable is a bad backup, and cron only reads the exit code.
+Pass `--allow-repair` to downgrade that to a warning while investigating.
+
+> The restored tree contains a **full plaintext copy of L3**. Keep it only as
+> long as necessary.
 
 If an older L3 backup reports `malformed inverted index for FTS5`, the drill
 rebuilds the index **in the restored copy** and reports it as a warning. Repair
@@ -77,6 +85,33 @@ python scripts/l3_fts_repair.py --dry-run
 python scripts/l3_fts_repair.py --yes       # makes its own backup first
 ```
 
+## Silent-Exception Audit
+
+`# silent-ok:` is the guard's escape hatch; a human still has to check that the
+reason is true. List every exemption with its enclosing function:
+
+```bash
+python scripts/silent_ok_audit.py
+python scripts/silent_ok_audit.py --check   # fails on short/empty reasons
+```
+
+Review this list quarterly and tighten the per-file ratchet baseline as sites
+are cleaned up.
+
+## Vector Index Maintenance
+
+Every upsert/delete leaves a LanceDB version behind. The real `kb_notes` table
+had **10,911 versions for 52 rows** before cleanup. Compact periodically:
+
+```bash
+python scripts/kb_index_optimize.py --dry-run
+python scripts/kb_index_optimize.py --days 7
+```
+
+`--days 7` keeps a week of time-travel history; `--days 0` keeps only the
+current version. It also prunes `kb_notes.bak_*` table backups to
+`--keep-index-backups` (default 2).
+
 ## Retrieval Evaluation
 
 `evals/retrieval_gold.seed.json` is a curated set of realistic queries
@@ -85,7 +120,8 @@ nothing). It measures P@1, recall@5, MRR and the negative false-positive rate:
 
 ```bash
 python scripts/kb_eval.py --gold evals/retrieval_gold.seed.json
-python scripts/kb_eval.py --gold ... --baseline "$HERMES_HOME/evals/baseline.json"
+python scripts/kb_eval.py --gold evals/retrieval_gold.seed.json \
+    --baseline evals/baseline.json
 ```
 
 The baseline form exits non-zero when a metric drops more than `--max-drop`.
