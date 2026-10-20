@@ -1,0 +1,9 @@
+{
+  "_comment": "Format of the entity -> placeholder map used by scripts/eval_collect.py --desensitize-map and scripts/kb_eval.py --title-map. The real map is NOT committed (its keys are the sensitive part) - keep it under $HERMES_HOME/evals/ and pass it with --title-map. The entries below are dummy values that show the shape only.",
+  "<real product or project name>": "<PROJECT>",
+  "<real model or version identifier>": "<MODEL>",
+  "<real hostname>": "<HOST>",
+  "<real ip address>": "<IP>",
+  "<real path>": "<PATH>",
+  "<real user name>": "<USER>"
+}

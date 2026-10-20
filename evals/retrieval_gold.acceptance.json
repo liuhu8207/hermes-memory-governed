@@ -1,0 +1,72 @@
+[
+ {
+  "q": "飞牛NAS的配置你知道吧？",
+  "expect": [
+   "<PRODUCT> NAS 硬件配置"
+  ]
+ },
+ {
+  "q": "我现在用wireguard连好了的",
+  "expect": [
+   "公司↔家里 WireGuard 隧道拓扑（RouterOS site-to-site）"
+  ]
+ },
+ {
+  "q": "公司和家里的ros两边通过wireguard连通",
+  "expect": [
+   "公司↔家里 WireGuard 隧道拓扑（RouterOS site-to-site）"
+  ]
+ },
+ {
+  "q": "Hermes Gateway 重启必须用什么方式",
+  "expect": [
+   "<PROJECT> Gateway 重启验证方法"
+  ]
+ },
+ {
+  "q": "SR588 的内存和存储扩展规格",
+  "expect": [
+   "<HW> 配套规格（内存 扩展 存储）"
+  ]
+ },
+ {
+  "q": "ZCode 改 provider kind 会怎么样",
+  "expect": [
+   "<PROJECT> provider kind 配置：不要擅自改 anthropic → openai"
+  ]
+ },
+ {
+  "q": "dsh 怎么升级",
+  "expect": [
+   "<PROJECT> 已升级到 0.2.0-rc.2"
+  ]
+ },
+ {
+  "q": "browser-skill 安装有什么坑",
+  "expect": [
+   "<PROJECT> (bsk) 安装状态与 Windows 升级坑"
+  ]
+ },
+ {
+  "q": "我本地电脑的系统环境和硬件",
+  "expect": [
+   "本地 PC 硬件与系统环境"
+  ]
+ },
+ {
+  "q": "TrueNAS 换成 Unraid 然后挂载 ZFS 备份数据可行吗",
+  "expect": []
+ },
+ {
+  "q": "帮我安排晨间邮件摘要并推送到企业微信",
+  "expect": []
+ },
+ {
+  "q": "执行美团一键领券",
+  "expect": []
+ },
+ {
+  "q": "分析一下 <PROJECT> 这个项目",
+  "expect": []
+ }
+]

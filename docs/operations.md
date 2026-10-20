@@ -116,18 +116,34 @@ current version. It also prunes `kb_notes.bak_*` table backups to
 
 `evals/retrieval_gold.seed.json` is a curated set of realistic queries
 (positives with expected notes, plus negative queries that should return
-nothing). It measures P@1, recall@5, MRR and the negative false-positive rate:
+nothing). It measures P@1, recall@5, MRR and the negative false-positive rate.
+
+There are three sets and they have **different jobs** (see
+[`evals/README.md`](../evals/README.md) and
+[`docs/configuration.md`](configuration.md#choosing-the-rerank-floor-ab-separated-auditable)):
 
 ```bash
-python scripts/kb_eval.py --gold evals/retrieval_gold.seed.json
-python scripts/kb_eval.py --gold evals/retrieval_gold.seed.json \
-    --baseline evals/baseline.json
+# smoke: does the channel answer at all? (not a scoreboard, never a baseline)
+python scripts/kb_eval.py --gold evals/retrieval_gold.seed.json --set smoke
+
+# A (calibration): pick the rerank floor + prove the set has discriminability
+python scripts/kb_eval.py --gold evals/retrieval_gold.calibration.json --set A \
+    --select-threshold --discriminability-check
+
+# B (acceptance): report results and compare against the acceptance baseline
+python scripts/kb_eval.py --gold evals/retrieval_gold.acceptance.json --set B \
+    --baseline evals/baseline.acceptance.json
 ```
 
 The baseline form exits non-zero when a metric drops more than `--max-drop`.
+It only accepts the **acceptance** set: `--baseline` refuses a calibration or
+smoke run, and refuses a baseline file produced from a *different* set — two
+numbers from two different sets are not comparable.
+
 Affinity is disabled by default because it updates during each query and makes
-the same set score differently every run; pass `--with-affinity` only when you
-explicitly want the production full path.
+the same set score differently every run; pass `--affinity on` (or the legacy
+`--with-affinity`) only when you explicitly want the production full path.
+`--affinity both` reports both variants in one run, off first.
 
 ## Health Check
 

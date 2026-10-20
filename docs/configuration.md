@@ -234,7 +234,7 @@ of them in `$HERMES_HOME/governed_memory.json`.
 | semantic_enabled | true | Semantic (embedding) channel on. |
 | keyword_enabled | true | Keyword channel on. |
 | semantic_min_score | 0.0 | Cosine floor for the semantic channel. **Off by default.** Calibration on the real vault (bge-m3, 21 notes) put relevant hits at 0.41-0.84 and irrelevant ones at 0.31-0.49 — the bands overlap, so there is no usable cosine threshold. Kept for a deployment that wants a hard cosine cut. |
-| rerank_min_score | 0.0 | Floor on the reranker score. **Code default is off (0.0)**; the shipped example config sets `0.10`. This is the real filter: with bge-m3 + bge-reranker-v2-m3 irrelevant queries scored <=0.027 and relevant ones 0.6-0.99; A real 18-query set showed FPR 0.25 at 0.04 (a semantically adjacent negative scored 0.173); at 0.10-0.20 recall stayed 1.0 and FPR fell to 0.0, so 0.10 is the lowest safe floor. Set to 0.0 to disable. Separate from `semantic_min_score` because the two are on different scales — sharing one threshold once emptied every result below 0.4. |
+| rerank_min_score | 0.0 | Floor on the reranker score. **Code default is off (0.0)**; the shipped example config sets `0.08`. This is the real filter: with bge-m3 + bge-reranker-v2-m3 irrelevant queries scored <=0.027 and relevant ones 0.6-0.99. The floor is **picked, not guessed**: it is calibrated on the independent set (`evals/retrieval_gold.calibration.json`, 14 positives + 8 negatives) by the rule in [`scripts/kb_eval.py --select-threshold`](#choosing-the-rerank-floor-ab-separated-auditable) — the lowest floor that loses no positive, which keeps the most headroom before the cliff. Set to 0.0 to disable. Separate from `semantic_min_score` because the two are on different scales — sharing one threshold once emptied every result below 0.4. |
 | rerank_trace | false | Log candidate/kept/dropped counts and the floor for KB rerank. |
 | confidence_threshold | 0.7 | Semi-automatic routing: confidence >= threshold goes to `notes/`, below it goes to `inbox/` with `review_required`. |
 | autolink_related | true | Add reciprocal `[[wikilink]]`s between a new note and existing notes sharing concepts/tags. |
@@ -244,12 +244,96 @@ of them in `$HERMES_HOME/governed_memory.json`.
 | recall_max_notes | 3 | Max notes named in one hint line. |
 | fusion | "linear" | `linear` (weighted raw scores) or `rrf` (rank fusion, k=60). RRF combines by rank because keyword and semantic scores are on different scales. Both modes keep the same normalised ceilings (keyword <=0.4, semantic <=0.6, top of both = 1.0), so the two gates above mean the same thing either way. An unknown value falls back to `linear` with a warning. |
 | mmr_lambda | 0.0 | MMR redundancy penalty (0 = off, 0.7 suggested). Similarity is bigram Jaccard over title+snippet, so it only drops near-duplicates. |
-| affinity_enabled | false | Usage-affinity ranking and hit counting. **Keep this off unless you have measured it on your own queries**: on the real 18-query set it lowered P@1 from 1.0 to 0.79-0.86 (varying between identical runs) and raised the negative false-positive rate from 0.0 to 0.25. `false` = zero side effects. When on, ranking is multiplied by `1 + 0.15*log1p(hits)/log1p(8)` (capped at x1.15) — a slow nudge, not a feedback loop. |
+| affinity_enabled | false | Usage-affinity ranking and hit counting. **Keep this off unless you have measured it on your own queries.** Measured on both sets at floor 0.08, with the real usage table (29 rows) populated: calibration set A: P@1 1.0 → **0.857**, MRR 1.0 → 0.929, FPR unchanged (0.125); acceptance set B: P@1 1.0 → **0.889**, MRR 1.0 → 0.917, FPR unchanged (0.0). Both sets point the same way, so it stays **off** (which is also zero-side-effect). ⚠️ An earlier reading of "ON and OFF give identical numbers" came from an eval home whose usage table was **empty** — with no hits, affinity cannot change anything; reproduce any affinity number with the table populated, or it is a no-op dressed up as evidence. `false` = zero side effects. When on, ranking is multiplied by `1 + 0.15*log1p(hits)/log1p(8)` (capped at x1.15) — a slow nudge, not a feedback loop. |
 | promote_hits | 3 | Inbox notes hit this many times get flagged `promote_suggest`. |
 | auto_archive_days | 45 | Auto-zone notes with zero hits and no update for this long are suggested for `archive/`. The sweep **skips archiving when there is no usage data at all** (fail-closed: "no data" is not "unused"). |
 | search_archived | false | Whether `status: "archived"` notes take part in retrieval. |
 | moc_auto_rebuild | true | Rebuild `index.md` (the MOC) after a note is written or updated. Navigation kept only by a manual command goes stale; a large vault can set this false and run `kb-moc` from cron instead. A failed rebuild never blocks the write — the MOC is a derived view. |
 | enrich | false | On `add`, use the LLM to write a one-line `summary` plus 2-3 `questions` into frontmatter, feeding the keyword channel. One call at write time, failure never blocks the write. |
+
+## Choosing the rerank floor (A/B separated, auditable)
+
+`kb.rerank_min_score` is a **lossy** switch: raise it and real answers stop
+coming back. So the floor is chosen by a written rule on a **calibration set**,
+and the result is reported on a **separate acceptance set**. The two are never
+mixed on one scoreboard.
+
+| Set | File | Role | Used for |
+|-----|------|------|----------|
+| seed | `evals/retrieval_gold.seed.json` | smoke | proving the channel is alive. **Not a scoreboard** — it has no discriminability, so it can never pick a floor. |
+| A | `evals/retrieval_gold.calibration.json` | calibration | picking the floor (`--select-threshold`) and the discriminability self-check. |
+| B | `evals/retrieval_gold.acceptance.json` | acceptance | reporting results and the `--baseline` gate. |
+
+`scripts/kb_eval.py` enforces the split: `--set A|B` declares the role, and
+`--baseline` refuses anything that is not the acceptance set (it also checks
+that the baseline file was produced from the *same* set — two numbers from two
+different sets are not comparable).
+
+### The rule
+
+> On the calibration set, take the **lowest** floor that loses **no** positive
+> sample; among the floors on that plateau, prefer the lowest FPR. The
+> benchmark is the best tier the set can reach — *not* `floor=0`, because
+> "no filtering at all" lets noise take rank 1 and would make lowering the
+> floor look like "losing nothing".
+
+Measured on the independent set A (14 positives + 8 negatives):
+
+| floor | P@1 | recall@5 | MRR | negative FPR |
+|-------|-----|----------|-----|--------------|
+| 0.00 | 0.9286 | 0.9286 | 0.9286 | 1.0 |
+| 0.04 | 0.9286 | 1.0 | 0.9524 | 0.25 |
+| 0.05 | 0.9286 | 1.0 | 0.9524 | 0.125 |
+| 0.06 / 0.07 | 0.9286 | 1.0 | 0.9643 | 0.125 |
+| **0.08 / 0.09 / 0.10** | **1.0** | **1.0** | **1.0** | **0.125** |
+| 0.11 | 0.9286 | 0.9286 | 0.9286 | 0.0 |
+| 0.12 | 0.9286 | 0.9286 | 0.9286 | 0.0 |
+
+* `0.08` is the **lowest lossless** tier, so it is the pick: it keeps 0.02 more
+  headroom than `0.10` before anything changes, and the whole `0.08`–`0.10`
+  plateau has identical metrics.
+* **`0.11` is a trap, and it is worse than "one step from the cliff".** It looks
+  best (FPR → 0.0) but the positive *"now default model?"* scores **≈0.117**
+  (bisection estimate, bracket `[0.109, 0.125]`) — only ~0.007 above 0.11.
+  So at 0.11 that query is already **unstable**: one sweep kept it in the top-5
+  (recall@5 1.0), the next dropped it (recall@5 0.9286). A floor whose
+  positives flip between identical runs is not a floor, it is a coin toss. The
+  tool reports the FPR-optimal tier together with its cliff margin and never
+  picks it.
+* The earlier note "recall stayed 1.0 at 0.10-0.20" was measured on the
+  18-query real set; **on the independent set only 0.10 holds** — 0.11 already
+  puts a positive on the edge.
+
+### Discriminability self-check
+
+A scoreboard that does not react to the floor cannot pick one. Before a set is
+allowed to choose a floor, `scripts/kb_eval.py --discriminability-check`
+perturbs the floor to `0.30` (known to drop positives) and requires:
+
+* at least **15%** of the positives (and at least **2** of them) to drop out.
+  **Zero dropped ⇒ "this set has no discriminability" ⇒ exit 1.** The seed set
+  fails here, which is exactly why it is only a smoke set.
+* **at least 8 negatives** (warning, written into the JSON): with only 4
+  negatives the FPR step is 0.25 — "FPR fell to 0" then means "one negative
+  fewer", statistically near-meaningless.
+* the **median** positive rerank score at least **0.2** away from the current
+  floor (warning): a set that hugs the floor is both sensitive and brittle.
+
+### Reproducing it
+
+```bash
+# A: pick the floor and prove the set has discriminability
+python scripts/kb_eval.py --gold evals/retrieval_gold.calibration.json --set A \
+    --select-threshold --discriminability-check
+
+# B: report and compare against the acceptance baseline
+python scripts/kb_eval.py --gold evals/retrieval_gold.acceptance.json --set B \
+    --baseline evals/baseline.acceptance.json
+```
+
+See [`evals/README.md`](../evals/README.md) for what is committed, what is
+deliberately not committed, and how the desensitised sets relate to the
+originals.
 
 ## Reranking Config
 

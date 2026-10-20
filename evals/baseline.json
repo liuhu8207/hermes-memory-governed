@@ -17,5 +17,15 @@
     "index_available": true,
     "reranker_enabled": true,
     "reranker_available": true
-  }
+  },
+  "set": {
+    "id": "smoke",
+    "role": "smoke",
+    "name": "retrieval_gold.seed",
+    "gold": "evals/retrieval_gold.seed.json",
+    "positives": 16,
+    "negatives": 5
+  },
+  "rerank_min_score": 0.1,
+  "note": "历史冒烟集基线（种子集）。**不是闸门** —— 种子集没有鉴别力（门槛扰动到 0.30 也不掉正样本），不能用来选门槛。验收闸门用 evals/baseline.acceptance.json（验收集 B）。"
 }
