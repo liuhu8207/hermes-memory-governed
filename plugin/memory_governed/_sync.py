@@ -2670,7 +2670,8 @@ class L3Writer:
                     for sentence in _split_sentences(content):
                         rowid_map.setdefault(_rowid_key(sentence), rowid)
 
-                    self._write_fts(conn, fts_cols, content, role, session_id, now)
+                    self._write_fts(conn, fts_cols, content, role, session_id,
+                                    now, rowid=rowid)
             except Exception:
                 try:
                     conn.rollback()
@@ -2683,8 +2684,17 @@ class L3Writer:
         return rowid_map
 
     def _write_fts(self, conn: sqlite3.Connection, fts_cols: Optional[List[str]],
-                   content: str, role: str, session_id: str, now: float) -> None:
-        """Mirror one row into messages_fts; report (never swallow) failures.
+                   content: str, role: str, session_id: str, now: float,
+                   *, rowid: int) -> None:
+        """Mirror one row into messages_fts **with the same rowid**.
+
+        ``messages.id`` and ``messages_fts.rowid`` must stay aligned: the
+        reader joins them by rowid, and FTS5's ``integrity_check`` reports
+        ``malformed inverted index`` once they drift. Inserting without an
+        explicit rowid lets FTS maintain its own sequence — after any id gap
+        (deleted/redacted row) the two sequences diverge and every subsequent
+        write makes the drift worse. ``redact_l3_archive`` already rebuilds
+        with ``rowid = messages.id``; the live writer must do the same.
 
         A row that lands in ``messages`` but not in ``messages_fts`` is
         archived yet permanently unsearchable — that is data loss, not a
@@ -2699,11 +2709,12 @@ class L3Writer:
             "session_id": session_id,
             "timestamp": now,
         }
-        sql = "INSERT INTO messages_fts ({}) VALUES ({})".format(
-            ", ".join(fts_cols), ", ".join("?" * len(fts_cols))
-        )
         try:
-            conn.execute(sql, [values[c] for c in fts_cols])
+            cols = ["rowid"] + list(fts_cols)
+            vals = [int(rowid)] + [values[c] for c in fts_cols]
+            sql = "INSERT INTO messages_fts ({}) VALUES ({})".format(
+                ", ".join(cols), ", ".join("?" * len(cols)))
+            conn.execute(sql, vals)
         except Exception as e:  # noqa: BLE001
             log_data_loss(
                 "l3_fts",
