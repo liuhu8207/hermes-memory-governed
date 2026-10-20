@@ -55,6 +55,15 @@ PACKAGE_DIR = REPO_ROOT / "plugin" / "memory_governed"
 #: 扫描集合的**锚点**：无论模块数怎么变，都必须包含这些（防"扫到空集恒绿"）。
 PACKAGE_ANCHORS: tuple = ("_diag.py", "_recall.py")
 
+#: 包内模块数**下限**。与实际一致（当前 19）；**新增/删除模块时同步调整** ——
+#: 不留余量（"≥15"这种带余量的阈值会让"少扫几个"也不红）。与 ``PACKAGE_ANCHORS``
+#: 合起来同时防"扫空集"与"路径写错"。
+#:
+#: ⚠️ 三个调用方**共用这一个数字**：``tests/test_recall_degraded_visibility.py``、
+#: ``tests/test_no_eager_exception_format.py``、``scripts/silent_ok_audit.py``。
+#: 各写一份阈值必然漂移（一个收紧了、另一个还按旧的放行）。
+PACKAGE_MIN_MODULES = 19
+
 
 # ---------------------------------------------------------------------------
 # 常量（沿用测试的命名，抽离后语义不变）
@@ -756,19 +765,42 @@ class AuditResult:
         return [f for f in self.findings if not f.blocking]
 
 
-def package_files(root: Path = PACKAGE_DIR) -> list:
-    """**递归**发现包内全部 ``*.py``（子包也纳入，避免新子目录成盲区）。"""
-    return sorted(root.rglob("*.py"))
+def package_files(root: Path | None = None) -> list:
+    """**递归**发现包内全部 ``*.py``（子包也纳入，避免新子目录成盲区）。
+
+    ``root`` 默认在**调用时**解析（不是 import 时的默认值）—— 这样测试可以把
+    ``PACKAGE_DIR`` 换掉来验证"扫描根写错时守卫是否真的拦得住"。
+    """
+    return sorted((PACKAGE_DIR if root is None else root).rglob("*.py"))
 
 
-def package_anchor_error(root: Path = PACKAGE_DIR) -> str:
-    """校验扫描集合含锚点且数量达标：通过返回 ``""``，否则返回错误描述。"""
-    names = {p.name for p in package_files(root)}
+def package_anchor_error(root: Path | None = None,
+                         min_modules: int | None = None) -> str:
+    """校验扫描集合含锚点且数量达标：通过返回 ``""``，否则返回错误描述。
+
+    **为什么需要它**：只写 ``assert files``（"扫到了东西"）是不够的 —— 扫描根
+    写错到某个只含 1 个 ``.py`` 的目录，集合非空、断言通过、检查**空转恒绿**，
+    这正是本项目最忌讳的"安静地失效"。故用两层校验：
+
+    * **锚点**：必需模块必须在集合里（防路径写错到别的目录）；
+    * **数量下限**：不留余量（防"扫到一小部分也恒绿"）。
+
+    改成**递归**发现之前，``tests/test_no_eager_exception_format.py`` 用非递归
+    ``glob``：包内新增子目录即成盲区（QA 埋文件实验证明过），且它没有这两层
+    守卫。现在三个调用方共用本函数。
+    """
+    root = PACKAGE_DIR if root is None else root
+    min_modules = PACKAGE_MIN_MODULES if min_modules is None else min_modules
+    files = package_files(root)
+    names = {p.name for p in files}
+    if not names:
+        return f"扫描集合为空（root={root}）"
     missing = [a for a in PACKAGE_ANCHORS if a not in names]
     if missing:
         return f"扫描集合缺少锚点模块 {missing}（root={root}）"
-    if not names:
-        return f"扫描集合为空（root={root}）"
+    if len(names) < min_modules:
+        return (f"仅发现 {len(names)} 个模块，少于下限 {min_modules}"
+                f"（root={root}）；新增模块时请同步上调该下限")
     return ""
 
 

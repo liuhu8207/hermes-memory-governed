@@ -244,7 +244,7 @@ of them in `$HERMES_HOME/governed_memory.json`.
 | recall_max_notes | 3 | Max notes named in one hint line. |
 | fusion | "linear" | `linear` (weighted raw scores) or `rrf` (rank fusion, k=60). RRF combines by rank because keyword and semantic scores are on different scales. Both modes keep the same normalised ceilings (keyword <=0.4, semantic <=0.6, top of both = 1.0), so the two gates above mean the same thing either way. An unknown value falls back to `linear` with a warning. |
 | mmr_lambda | 0.0 | MMR redundancy penalty (0 = off, 0.7 suggested). Similarity is bigram Jaccard over title+snippet, so it only drops near-duplicates. |
-| affinity_enabled | false | Usage-affinity ranking and hit counting. **Keep this off unless you have measured it on your own queries.** Measured on both sets at floor 0.08, with the real usage table (29 rows) populated: calibration set A: P@1 1.0 → **0.857**, MRR 1.0 → 0.929, FPR unchanged (0.125); acceptance set B: P@1 1.0 → **0.889**, MRR 1.0 → 0.917, FPR unchanged (0.0). Both sets point the same way, so it stays **off** (which is also zero-side-effect). ⚠️ An earlier reading of "ON and OFF give identical numbers" came from an eval home whose usage table was **empty** — with no hits, affinity cannot change anything; reproduce any affinity number with the table populated, or it is a no-op dressed up as evidence. `false` = zero side effects. When on, ranking is multiplied by `1 + 0.15*log1p(hits)/log1p(8)` (capped at x1.15) — a slow nudge, not a feedback loop. |
+| affinity_enabled | false | Usage-affinity ranking and hit counting. **Keep this off unless you have measured it on your own queries.** Measured at floor 0.08 with the real usage table (29 rows) populated: calibration set A drops **stably** (P@1 1.0 → **0.857**, MRR 1.0 → 0.929, FPR 0.125); acceptance set B drops **intermittently** (P@1 0.889–1.0, MRR 0.917–1.0, 5 of 7 runs identical to off, FPR 0.0). Across ~20 observations affinity was never better than off. The reason to keep it off is **zero benefit + more fragility**: the multiplier is capped at 1.15, it pulls near-ties closer, and MMR then reorders them. ⚠️ An earlier reading of "ON and OFF give identical numbers" came from an eval home whose usage table was **empty** — with no hits, affinity cannot change anything; reproduce any affinity number with the table populated, or it is a no-op dressed up as evidence. `false` = zero side effects. When on, ranking is multiplied by `1 + 0.15*log1p(hits)/log1p(8)` (capped at x1.15) — a slow nudge, not a feedback loop. |
 | promote_hits | 3 | Inbox notes hit this many times get flagged `promote_suggest`. |
 | auto_archive_days | 45 | Auto-zone notes with zero hits and no update for this long are suggested for `archive/`. The sweep **skips archiving when there is no usage data at all** (fail-closed: "no data" is not "unused"). |
 | search_archived | false | Whether `status: "archived"` notes take part in retrieval. |
@@ -286,20 +286,19 @@ Measured on the independent set A (14 positives + 8 negatives):
 | 0.05 | 0.9286 | 1.0 | 0.9524 | 0.125 |
 | 0.06 / 0.07 | 0.9286 | 1.0 | 0.9643 | 0.125 |
 | **0.08 / 0.09 / 0.10** | **1.0** | **1.0** | **1.0** | **0.125** |
-| 0.11 | 0.9286 | 0.9286 | 0.9286 | 0.0 |
-| 0.12 | 0.9286 | 0.9286 | 0.9286 | 0.0 |
+| 0.11 | 0.9286 | 0.9286 | 0.9286 | 0.125 |
+| 0.12 | 0.9286 | 0.9286 | 0.9286 | 0.125 |
 
 * `0.08` is the **lowest lossless** tier, so it is the pick: it keeps 0.02 more
   headroom than `0.10` before anything changes, and the whole `0.08`–`0.10`
   plateau has identical metrics.
-* **`0.11` is a trap, and it is worse than "one step from the cliff".** It looks
-  best (FPR → 0.0) but the positive *"now default model?"* scores **≈0.117**
-  (bisection estimate, bracket `[0.109, 0.125]`) — only ~0.007 above 0.11.
-  So at 0.11 that query is already **unstable**: one sweep kept it in the top-5
-  (recall@5 1.0), the next dropped it (recall@5 0.9286). A floor whose
-  positives flip between identical runs is not a floor, it is a coin toss. The
-  tool reports the FPR-optimal tier together with its cliff margin and never
-  picks it.
+* **`0.11` is a trap, but the evidence is instability, not an FPR gain.** It
+  loses a positive without reducing FPR (0.125 at 0.08–0.12 alike). The positive
+  *"now default model?"* scores **0.108924** (mode of 12 runs, range
+  0.108924–0.112891, sd 0.0014) — about **0.0011 below** 0.11. At 0.11 it flips
+  between identical runs (8 of 16 queries flipped in one sweep; three whole-set
+  runs gave P@1 0.9286 / 1.0 / 1.0). The earlier "≈0.117, ~0.007 above 0.11"
+  figure was an artifact of a 0.03 bisection tolerance measuring a ±0.004 band.
 * The earlier note "recall stayed 1.0 at 0.10-0.20" was measured on the
   18-query real set; **on the independent set only 0.10 holds** — 0.11 already
   puts a positive on the edge.

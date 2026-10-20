@@ -73,8 +73,8 @@ EXIT_USAGE = 2
 SCOPES = ("package", "all")
 
 
-def _targets(scope: str) -> list:
-    """本次扫描的文件集合。
+def _targets(scope: str, root: Path) -> list:
+    """本次扫描的文件集合（``root`` 由调用方显式传入，便于测试替换）。
 
     * ``package``：``plugin/memory_governed/**/*.py``（**零容忍**，阻断）—— 与
       pytest 闸门同一范围。
@@ -82,7 +82,7 @@ def _targets(scope: str) -> list:
       管辖**（它有 201 处历史存量，由 ``tests/test_guardrail_ratchet.py`` 的按文件
       棘轮看管），故这里**只列出、不阻断** —— 不然两个闸门会互相打架。
     """
-    files = rules.package_files()
+    files = rules.package_files(root)
     if scope == "all":
         files = files + [REPO / "memory_cli.py"] + sorted((REPO / "scripts").glob("*.py"))
     return [p for p in files if p.exists()]
@@ -258,12 +258,14 @@ def main(argv: list | None = None) -> int:
         help="从文件按行读取要注入的已知标识（# 开头为注释）")
     args = parser.parse_args(argv)
 
-    anchor_err = rules.package_anchor_error()
+    # 扫描根在**调用时**读取（不是 import 时的默认值），这样守卫可被测试替换验证。
+    root = rules.PACKAGE_DIR
+    anchor_err = rules.package_anchor_error(root)
     if anchor_err:
         print("扫描集合自检失败：%s" % anchor_err, file=sys.stderr)
         return EXIT_USAGE
 
-    paths = _targets(args.scope)
+    paths = _targets(args.scope, root)
     if not paths:
         print("扫描目标为空（路径写错？）", file=sys.stderr)
         return EXIT_USAGE

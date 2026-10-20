@@ -173,8 +173,10 @@ def test_audit_check_is_red_on_a_dirty_tree(tmp_path, monkeypatch, capsys):
         "        return []\n",
         encoding="utf-8")
 
-    monkeypatch.setattr(rules, "package_files", lambda *a, **k: sorted(pkg.rglob("*.py")))
-    monkeypatch.setattr(rules, "package_anchor_error", lambda *a, **k: "")
+    # 只换**扫描根**（PACKAGE_DIR / 下限），**不打桩**守卫函数 —— 走的是真实
+    # 发现 + 真实守卫路径，这样"扫描根写错"也能被测出来。
+    monkeypatch.setattr(rules, "PACKAGE_DIR", pkg)
+    monkeypatch.setattr(rules, "PACKAGE_MIN_MODULES", 2)
     monkeypatch.setattr(audit, "REPO", tmp_path)
 
     assert audit.main(["--check"]) == audit.EXIT_BLOCKED
@@ -197,12 +199,53 @@ def test_strict_upgrades_needs_human_to_blocking(tmp_path, monkeypatch):
         "    except Exception:  # silent-ok: already-reported — 聚合进 errors\n"
         "        return []\n",
         encoding="utf-8")
-    monkeypatch.setattr(rules, "package_files", lambda *a, **k: sorted(pkg.rglob("*.py")))
-    monkeypatch.setattr(rules, "package_anchor_error", lambda *a, **k: "")
+    monkeypatch.setattr(rules, "PACKAGE_DIR", pkg)
+    monkeypatch.setattr(rules, "PACKAGE_MIN_MODULES", 2)
     monkeypatch.setattr(audit, "REPO", tmp_path)
 
     assert audit.main(["--check"]) == audit.EXIT_OK                 # 默认不阻断
     assert audit.main(["--check", "--strict"]) == audit.EXIT_BLOCKED
+
+
+def test_audit_is_red_when_the_scan_root_is_wrong(tmp_path, monkeypatch, capsys):
+    """审计器也有同样的"扫描根空转"风险，必须有守卫：根写错 → 非零退出。
+
+    审计器**不遍历**仓库、但会遍历 ``plugin/memory_governed``，所以同样可能被
+    "扫了个空集 / 扫了个寂寞"骗绿。守卫与两个护栏测试共用
+    ``guardrail_rules.package_anchor_error``（锚点 + 模块数下限）。
+    """
+    monkeypatch.setattr(audit, "REPO", tmp_path)
+    original_root = rules.PACKAGE_DIR          # 先留原值，③要用它还原
+
+    # ① 不存在的目录 → 空集
+    monkeypatch.setattr(rules, "PACKAGE_DIR", tmp_path / "no_such_dir")
+    assert audit.main(["--check"]) == audit.EXIT_USAGE
+    assert "扫描集合自检失败" in capsys.readouterr().err
+
+    # ② 只有 1 个 .py 的目录（旧式 assert files 挡不住的情形）
+    tiny = tmp_path / "tiny"
+    tiny.mkdir()
+    (tiny / "_recall.py").write_text("x = 1\n", encoding="utf-8")
+    monkeypatch.setattr(rules, "PACKAGE_DIR", tiny)
+    assert len(rules.package_files()) == 1            # 集合非空
+    assert audit.main(["--check"]) == audit.EXIT_USAGE  # 守卫拦住
+
+    # ③ 真实 root 通过守卫
+    monkeypatch.setattr(rules, "PACKAGE_DIR", original_root)
+    monkeypatch.setattr(audit, "REPO", REPO)
+    assert audit.main(["--check"]) == audit.EXIT_OK
+
+
+def test_scan_guard_is_shared_with_the_sibling_files():
+    """三个调用方共用**同一份**扫描集合守卫（不是各写一套阈值）。"""
+    import tests.test_no_eager_exception_format as eager
+    import tests.test_recall_degraded_visibility as visibility
+
+    assert rules.PACKAGE_ANCHORS is visibility._PACKAGE_ANCHORS
+    assert rules.PACKAGE_ANCHORS is eager._PACKAGE_ANCHORS
+    assert rules.PACKAGE_MIN_MODULES == visibility._PACKAGE_MIN_MODULES
+    assert rules.PACKAGE_MIN_MODULES == eager._PACKAGE_MIN_MODULES
+    assert visibility._package_py_files is eager._pkg_py_files is rules.package_files
 
 
 def test_reason_key_cli_option_is_wired():

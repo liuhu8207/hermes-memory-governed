@@ -60,13 +60,14 @@ Measured on A (14 positives + 8 negatives):
 
 `0.08` is the lowest lossless tier and therefore the pick — it keeps 0.02 more
 headroom than `0.10`, and the whole `0.08`–`0.10` plateau has identical
-metrics. **`0.11` is a trap, and it is worse than "one step from the cliff".**
-It looks best (FPR → 0) but the positive *"now default model?"* scores
-**≈0.117** (bisection estimate, bracket `[0.109, 0.125]`) — ~0.007 above 0.11.
-At 0.11 that query is already unstable: one sweep kept it in the top-5
-(recall@5 1.0), the next dropped it (recall@5 0.9286). A floor whose positives
-flip between identical runs is a coin toss, not a floor. The tool reports the
-FPR-optimal tier together with its cliff margin and does not pick it.
+metrics. **`0.11` is a trap, but the reason is instability, not a better FPR.**
+The positive *"now default model?"* scores **0.108924** (mode of 12 runs,
+range 0.108924–0.112891, sd 0.0014) — about **0.0011 below** 0.11, not above it.
+At 0.11 that query flips between identical runs (8 of 16 queries flipped in one
+sweep; three whole-set runs gave P@1 0.9286 / 1.0 / 1.0). The earlier "≈0.117,
+0.007 above 0.11" figure was an artifact: ``SCORE_PROBE_TOL = 0.03`` (bisection)
+is too coarse to measure a ±0.004 jitter band. The tool reports the FPR-optimal
+tier together with its cliff margin and does not pick it.
 
 The shipped example config therefore sets `kb.rerank_min_score: 0.08`
 (`config/governed_memory.example.json`); the **code default stays 0.0** (off).
@@ -151,11 +152,11 @@ python scripts/kb_eval.py --gold evals/retrieval_gold.acceptance.json --set B \
 
 `evals/entity_map.example.json` shows the format with dummy keys.
 
-⚠️ One caveat found while measuring: the negative *"analyse project X"* sits
-right on the 0.08 boundary, so the acceptance set's FPR reads 0.0 or 0.25
-depending on the run (one negative out of four). With 4 negatives the FPR step
-is 0.25 — the discriminability check refuses such a set for *choosing* a
-floor, and it is the acceptance set's job to report, not to choose.
+⚠️ An earlier caveat claimed the negative *"analyse project X"* sat on the
+0.08 boundary and made acceptance FPR alternate between 0.0 and 0.25. That was
+**not reproduced**: at floors 0.08 / 0.11 / 0.12 it was 0/8 false positives, and
+the acceptance set was 0.0 across ~20 observations. The earlier 0.0/0.25 reading
+came from a different/noisier setup, not from a floor-boundary property.
 
 ⚠️ The seed set predates this policy and still carries the raw note titles
 (it was committed before the desensitisation rule existed). It is the smoke
@@ -195,13 +196,14 @@ target note).
 |-----|----------|-----|----------|-----|-----|
 | A (calibration) | off | 1.0 | 1.0 | 1.0 | 0.125 |
 | A (calibration) | **on** | **0.857** | 1.0 | 0.929 | 0.125 |
-| B (acceptance) | off | 1.0 | 1.0 | 1.0 | 0.0 / 0.25 † |
-| B (acceptance) | **on** | **0.889** | 1.0 | 0.917 | 0.0 / 0.25 † |
+| B (acceptance) | off | 1.0 | 1.0 | 1.0 | 0.0 |
+| B (acceptance) | **on** | **0.889–1.0** | 1.0 | 0.917–1.0 | 0.0 |
 
-† one of four negatives sits on the floor boundary; see the caveat above.
-
-Both sets point the same way, so affinity stays **off** (which is also the
-zero-side-effect choice). The earlier "ON and OFF are identical" reading came
-from an eval home whose usage table was **empty** — with no hits, affinity
-cannot change anything, so the comparison was a no-op. Populate the usage
-table before believing any affinity number.
+A drops **stably**; B drops **intermittently** (5 of 7 runs were identical to
+off). Across ~20 observations affinity was **never better** than off. The
+mechanism is not "unreproducible counting": ``search()`` only reads usage and
+does not touch it, and a populated 29-row table gives stable results. The real
+reason to keep it off is **zero benefit + more fragility** — the multiplier is
+capped at 1.15, it pulls near-ties closer, and MMR then reorders them. The
+earlier "ON and OFF are identical" reading came from an **empty** usage table;
+populate it before believing any affinity number.

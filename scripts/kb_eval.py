@@ -96,8 +96,17 @@ DISC_MIN_NEGATIVES = 8         # 负样本数下限（FPR 步长 ≤ 0.125）
 DISC_MIN_POSITIVE_MARGIN = 0.2  # 正样本 rerank 分中位数离门槛的距离下限
 #: 悬崖余量下限：选中的门槛到「下一个会掉正样本的档位」的距离。
 CLIFF_MIN_MARGIN = 0.02
-#: 二分估分时的区间上限与精度（rerank 分落在 [0,1]）。
+#: 二分估分的区间上限（rerank 分落在 [0,1]；0.5 已远超真实分布）。
 SCORE_PROBE_HIGH = 0.5
+#: ⚠️⚠️ 二分估分的精度 —— **0.03 的尺子只够粗定位，不能拿来定门槛余量**。
+#: 实测（钩住 ``Reranker._post`` 直接读真实 ``relevance_score``，同一索引
+#: 12 次观测）：悬崖样本的众数是 **0.108924**，区间 **0.108924~0.112891**，
+#: 均值 0.109584、sd 0.00140、**极差只有 0.00397**。用宽 0.03 的区间去量
+#: ±0.004 的抖动带，只能量出一个偏高的区间中点 —— 这正是文档里那个
+#: **已被证伪**的「≈0.117、高出 0.11 约 0.007」的来源：真实众数是
+#: **低于** 0.11 的（−0.001076），连方向都是反的。
+#: 结论：**判断门槛余量必须读真实 rerank 分**（在 trace 里直接暴露），
+#: ``estimate_positive_scores`` 的输出只能回答「这一条大概在什么量级」。
 SCORE_PROBE_TOL = 0.03
 
 
@@ -487,12 +496,23 @@ def _hits_at(floor_kb, query: str, expect: list, top_k: int,
 
 def estimate_positive_scores(floor_kb, gold: list, top_k: int,
                               title_map: dict | None = None) -> dict:
-    """估计每个正样本的 rerank 分（黑盒二分）。
+    """估计每个正样本的 rerank 分（黑盒二分）—— **只够粗定位**。
 
     为什么二分而不是读内部字段：命中结果里**没有** rerank 分（只暴露融合
     分），而候选集怎么组是 ``_kb`` 的内部细节。黑盒只依赖 ``search()`` 的
     公开契约 —— 命中 ⇔ 门槛 ≤ 该条的 rerank 分，所以门槛就是分数的探针。
     这样本工具不会随 ``_kb`` 内部实现漂移。
+
+    ⚠️ **精度只有 ``SCORE_PROBE_TOL`` = 0.03，量不出 ±0.004 的抖动带。**
+    实测（钩住 ``Reranker._post`` 读真实 ``relevance_score``）：悬崖样本真实
+    众数 **0.108924**，12 次观测区间 **0.108924~0.112891**，极差仅
+    **0.00397**。用宽 0.03 的区间去量这么窄的带，返回的只会是一个偏高的
+    区间中点 —— 曾据此写出「≈0.117、高出 0.11 约 0.007」，而真实众数是
+    **低于** 0.11 的（−0.001076）。**方向都是反的。**
+
+    所以：**不要用本函数的输出去论证「某档门槛还剩多少余量」**，更不要
+    用它判断某条正样本「稳不稳」。那是 trace 里真实 rerank 分的活。本函数
+    只适合回答「这一条大概落在哪个量级」以及鉴别力自检里的中位数余量警告。
 
     Args:
         floor_kb: :class:`_FloorKB`。
@@ -645,8 +665,25 @@ def _set_info(args, gold: list) -> dict:
 
 
 def _affinity_modes(args) -> list:
-    """要跑哪几种亲和度配置。OFF 永远先跑 —— 亲和度的命中计数会在查询
-    过程中增长，同一份集连跑两次排序不同（ON 之后的结果不可复现）。"""
+    """要跑哪几种亲和度配置。OFF 永远先跑 —— 它是**生效配置**（默认关闭），
+    ON 一档是拿来对着我比对的对照档，所以先跑出参考档再跑对照档。
+
+    ⚠️ **这里原来写的理由是错的，已删除。** 原文：「亲和度的命中计数会在
+    查询过程中增长 ⇒ 同一份集连跑两次排序不同 ⇒ ON 不可复现」。实测证伪：
+    把真实 29 行 usage 表放进隔离 home、`affinity=on` 跑完 A 集 22 条查询，
+    usage 表 **29 → 29，delta = 0** —— ``search()`` 只读 ``hits()``，写入侧
+    的 ``touch()`` 只在召回提示通道被调用。且在**固定表**上连跑 3 次结果
+    完全一致。**ON 是可复现的**，不可复现这个说法不成立。
+
+    默认不走 ON 的**真**理由是「零收益 + 更脆」：
+
+    * 实测约 **20 次观测**中，**没有任何一次 ON 优于 OFF**。A 集稳定劣化
+      （P@1 0.786~0.929 vs OFF 1.0）；B 集无收益且间歇劣化（P@1
+      0.889~1.0，7 次里 5 次与 OFF 完全相同）；空表对照下 ON ≡ OFF；
+    * 机制上：affinity 的乘数上限只有 **1.15**，它顶不动前面的候选，只会把
+      本来接近的候选压得更近；而 MMR（用 ``rank_key``）在近距上会换序 ——
+      等于多引入一条换序抖动通道，却换不来任何排序收益。
+    """
     mode = getattr(args, "affinity", "off")
     if getattr(args, "with_affinity", False):
         mode = "on"
@@ -673,8 +710,9 @@ def main() -> int:
                         help="Deprecated alias for --affinity on")
     parser.add_argument("--affinity", choices=("off", "on", "both"),
                         default="off",
-                        help="affinity off（默认，可复现）/ on（含生产排序，"
-                             "不可复现）/ both（两组都报，off 在前）")
+                        help="off=生效配置（默认，可复现）/ on=含使用度加成，"
+                             "可复现但实测零收益且多一条换序抖动通道，别拿它"
+                             "当基线 / both=两组都报，off 在前作参考档")
     parser.add_argument("--title-map", default="",
                         help="实体→占位符的 JSON 映射（脱敏版 gold 对着真实库"
                              "跑时用；映射文件不提交）")
@@ -727,9 +765,11 @@ def main() -> int:
     effective_floor = float(getattr(cfg.kb, "rerank_min_score", 0.0) or 0.0)
     modes = _affinity_modes(args)
     if modes == ["off"]:
-        # 评测必须可复现：affinity 的命中计数会在查询过程中增长，同一份
-        # gold 集连跑两次会得到不同排序。默认关掉，只测核心相关性；
-        # 要看生产完整排序时显式传 --affinity on（结果不保证可复现）。
+        # 默认关掉 affinity，只测核心相关性。理由**不是**「不可复现」（实测
+        # 证伪：usage 表在 ON 下跑完 A 集 22 条查询 delta = 0，固定表连跑
+        # 3 次结果一致），而是「零收益 + 更脆」：约 20 次观测里没有任何一次
+        # ON 优于 OFF，且乘数上限只有 1.15 的加成会把近距候选压得更近，给
+        # MMR 的换序多开一条抖动通道。要看完整排序时显式传 --affinity on。
         cfg.kb.affinity_enabled = False
     kb = KnowledgeBase(cfg)
     floor_kb = _FloorKB(kb, cfg)

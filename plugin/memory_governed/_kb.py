@@ -1421,14 +1421,20 @@ class KnowledgeBase:
         一个**指错 vault** 的调用方会把 sidecar 写成它的 tmp vault，把生产索引
         的配对关系污染掉（之后真正的生产同步就会一直判"错配"、永远不敢清理）。
         """
+        marker = self._index_vault_marker()
         try:
-            self._index_vault_marker().write_text(
+            # kb_index/ 可能还不存在（首次写入 / 换库）：先建目录再写，
+            # 否则 sidecar 会静默缺失，配对判定的唯一证据被架空。
+            marker.parent.mkdir(parents=True, exist_ok=True)
+            marker.write_text(
                 json.dumps({"vault_root": str(Path(self._vault).resolve()),
                             "recorded_at": time.time()},
                            ensure_ascii=False, indent=2),
                 encoding="utf-8")
-        except OSError as e:  # silent-ok: value-fallback — sidecar 写不了不该阻断同步
-            logger.debug("kb index vault marker not written: %s", e)
+        except OSError as e:
+            # 写不出去不能只留 debug：降级必须可计数、可见。
+            log_degraded("kb_index", "vault_marker_unwritten",
+                         detail=str(marker), exc=e)
 
     def _index_rows_present_in_vault(self, indexed: Dict[str, float]) -> bool:
         """索引里是否**至少有一行**的文件还在当前 vault 里（配对证据）。"""

@@ -68,14 +68,9 @@ _DIAG_PATH = (Path(__file__).resolve().parents[1]
 _PACKAGE_DIR = (Path(__file__).resolve().parents[1]
                 / "plugin" / "memory_governed")
 
-#: 扫描集合的**锚点**：无论模块数怎么变，都必须包含这些（路径写错 / glob 失效 →
-#: 立刻红，防"扫到空集恒绿"）。
-_PACKAGE_ANCHORS = ("_diag.py", "_recall.py")
-
-#: 包内模块数**下限**。与实际一致（当前 19，含 P2 新增的 ``_rerank.py``）；
-#: **新增/删除模块时同步上调/调整** —— 不留余量，防"少扫几个也不红"。与
-#: `_PACKAGE_ANCHORS` 合起来同时防"扫空集"与"路径写错"。
-_PACKAGE_MIN_MODULES = 19
+#: 扫描集合的**锚点** / 模块数**下限**：定义见 ``guardrail_rules``（三个调用方
+#: 共用同一份阈值 —— 本文件、``tests/test_no_eager_exception_format.py``、
+#: ``scripts/silent_ok_audit.py``）。绑定在 ``_rules`` 导入之后（见下方）。
 
 # ---------------------------------------------------------------------------
 # 判定逻辑：**全部**来自 ``guardrail_rules``（唯一实现，与 CI 审计器共用）
@@ -114,6 +109,12 @@ _SELF_EXEMPT_MODULES = _rules.SELF_EXEMPT_MODULES
 _SILENT_OK_RE = _rules.SILENT_OK_RE
 _SILENT_OK_KINDS = _rules.SILENT_OK_KINDS
 _SILENT_OK_SEP_RE = _rules.SILENT_OK_SEP_RE
+
+#: 扫描集合守卫（锚点 + 模块数下限）—— **唯一实现**在 ``guardrail_rules``。
+_PACKAGE_ANCHORS = _rules.PACKAGE_ANCHORS
+_PACKAGE_MIN_MODULES = _rules.PACKAGE_MIN_MODULES
+_package_py_files = _rules.package_files
+_package_anchor_error = _rules.package_anchor_error
 
 _name_of = _rules._name_of
 _caught_names = _rules.caught_names
@@ -502,25 +503,12 @@ def test_unknown_marker_kind_is_rejected_by_both_checks():
 # 追加6：整包扫描（**递归** glob 动态发现，覆盖全部模块 / 子包）
 # ---------------------------------------------------------------------------
 
-def _package_py_files(root: Path) -> list:
-    """**递归**发现 ``root`` 下全部 ``*.py``（子包也纳入，避免新子目录成盲区）。"""
-    return sorted(root.rglob("*.py"))
-
-
-def _package_anchor_error(root: Path) -> str:
-    """校验扫描集合含锚点且数量达标：通过返回 ``""``，否则返回错误描述。
-
-    **不用"总数 ≥ 15"这种带余量的阈值**（少扫两个也不红），改为①必需模块**锚点**
-    + ②数量**下限**（与实际一致）。二者合起来同时防"扫空集恒绿"与"路径写错"。
-    """
-    names = {p.name for p in _package_py_files(root)}
-    missing = [a for a in _PACKAGE_ANCHORS if a not in names]
-    if missing:
-        return f"扫描集合缺少锚点模块 {missing}（root={root}）"
-    if len(names) < _PACKAGE_MIN_MODULES:
-        return (f"仅发现 {len(names)} 个模块，少于下限 {_PACKAGE_MIN_MODULES}"
-                f"（root={root}）；新增模块时请同步上调该下限")
-    return ""
+#: 上面已在 ``_rules`` 导入后绑定了 ``_package_py_files`` / ``_package_anchor_error``
+#: （唯一实现在 ``guardrail_rules``：``package_files`` = **递归** rglob；
+#: ``package_anchor_error`` = 锚点 + 模块数下限）。这里**不再**各写一份 ——
+#: 兄弟文件 ``tests/test_no_eager_exception_format.py`` 与 CI 审计器用的是同一个
+#: 函数对象（``tests/test_no_eager_exception_format.py::
+#: test_guard_constants_match_the_sibling_file`` 会断言这一点）。
 
 
 def test_whole_package_has_no_silent_exception_swallow():

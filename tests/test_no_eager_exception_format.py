@@ -45,12 +45,28 @@ kwargs/字典再展开），本扫描器会漏。届时按需加固即可。
 from __future__ import annotations
 
 import ast
+import sys
+import tempfile
 from pathlib import Path
 
-#: 被扫描的包目录。用 **glob** 取全部 ``*.py`` —— 手写文件列表会让**将来新增的
-#: 模块**成为扫描盲区（这个缺陷类已经证明会蔓延到新文件）。
-_PKG_DIR = (Path(__file__).resolve().parents[1]
-            / "plugin" / "memory_governed")
+_REPO_ROOT = Path(__file__).resolve().parents[1]
+if str(_REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(_REPO_ROOT))
+
+import guardrail_rules as _rules
+
+#: 被扫描的包目录。**递归**发现（``rglob``）—— 与兄弟文件
+#: ``tests/test_recall_degraded_visibility.py`` 同一口径；旧的**非递归** ``glob``
+#: 会在包内出现子目录时把它整个漏掉（QA 埋文件实验证明：
+#: ``plugin/memory_governed/sub/buried.py`` 非递归扫不到、递归能扫到）。
+_PKG_DIR = (_REPO_ROOT / "plugin" / "memory_governed")
+
+#: 扫描集合守卫（锚点 + 模块数下限）与发现逻辑：**唯一实现**在
+#: ``guardrail_rules``，本文件不再自造一套阈值（否则与兄弟文件互相打架）。
+_PACKAGE_ANCHORS = _rules.PACKAGE_ANCHORS
+_PACKAGE_MIN_MODULES = _rules.PACKAGE_MIN_MODULES
+_pkg_py_files = _rules.package_files
+_pkg_anchor_error = _rules.package_anchor_error
 
 
 def _scan(source: str) -> list:
@@ -175,16 +191,20 @@ def test_scanner_ignores_safe_forms():
 # ---------------------------------------------------------------------------
 
 def test_package_has_no_eager_exception_stringification():
-    """``plugin/memory_governed/*.py``（glob）内不得出现急切字符串化的 except 异常。"""
-    files = sorted(_PKG_DIR.glob("*.py"))
-    # 计数守卫：防目录路径写错导致"扫了个空集"而恒绿。
-    assert files, f"未找到任何待扫描文件：{_PKG_DIR}"
+    """``plugin/memory_governed/**/*.py``（**递归** rglob）内不得出现急切字符串化。
+
+    先过 ``guardrail_rules.package_anchor_error``（锚点 + 模块数下限）—— 旧的
+    ``assert files`` 只防"扫到空集"：扫描根写错到某个只含 1 个 ``.py`` 的目录时
+    集合非空、断言照过、检查**空转恒绿**。这两层守卫就是为那种"安静地失效"准备的。
+    """
+    anchor_err = _pkg_anchor_error(_PKG_DIR)
+    assert anchor_err == "", anchor_err
 
     offenders = {}
-    for p in files:
+    for p in _pkg_py_files(_PKG_DIR):
         hits = _scan(p.read_text(encoding="utf-8"))
         if hits:
-            offenders[p.name] = hits
+            offenders[p.relative_to(_PKG_DIR).as_posix()] = hits
 
     assert offenders == {}, (
         "存在对 except 绑定异常对象的**急切字符串化**"
@@ -192,3 +212,76 @@ def test_package_has_no_eager_exception_stringification():
         + "\n".join(f"  {name}:{ln}  [{pat}]  {txt}"
                     for name, hits in offenders.items()
                     for ln, pat, txt in hits))
+
+
+# ---------------------------------------------------------------------------
+# 扫描集合守卫（防"扫错根 / 扫一半"时空转恒绿）与递归发现
+# ---------------------------------------------------------------------------
+
+def test_package_scan_guard_fires_on_wrong_root():
+    """扫描根写错 → 守卫红（而不是"集合非空就放行"地恒绿）。
+
+    三种错法各试一次：①不存在的目录 ②只有 1 个 ``.py`` 的目录 ③锚点齐全但
+    数量远低于下限的目录（这一条专门证"数量下限"这层不是摆设）。
+    """
+    # ① 不存在的目录 → 空集
+    assert _pkg_anchor_error(_PKG_DIR / "no_such_subdir") != ""
+    # ② 锚点齐全、但只有 2 个模块 → 数量下限拦住（tmp 目录，不污染仓库）
+    with tempfile.TemporaryDirectory() as tmp:
+        tiny = Path(tmp) / "pkg"
+        tiny.mkdir()
+        for anchor in _PACKAGE_ANCHORS:
+            (tiny / anchor).write_text("x = 1\n", encoding="utf-8")
+        err = _pkg_anchor_error(tiny)
+        assert err != "", "只有 2 个模块却通过了守卫 —— 数量下限失效"
+        assert "少于下限" in err, err
+    # 反向证明：真实 root 通过守卫
+    assert _pkg_anchor_error(_PKG_DIR) == ""
+
+
+def test_package_scan_guard_fires_when_root_has_one_module(tmp_path):
+    """扫描根指向**只有 1 个 ``.py``** 的目录 → 整包测试必须红，而不是恒绿。
+
+    这是旧版 ``assert files`` 挡不住的情形：集合非空（1 个文件），断言通过，
+    于是"扫了个寂寞"也是绿。
+    """
+    tiny = tmp_path / "pkg"
+    tiny.mkdir()
+    (tiny / "_recall.py").write_text("x = 1\n", encoding="utf-8")
+    assert len(_pkg_py_files(tiny)) == 1          # 集合非空 —— 旧断言会放行
+    assert _pkg_anchor_error(tiny) != ""          # 新守卫拦住
+
+
+def test_package_scan_recurses_into_subpackages(tmp_path):
+    """**递归**发现：子目录里埋的坏模块必须被扫到（防新子包成盲区）。
+
+    QA 的埋文件实验：顶层 ``glob`` 漏掉 ``sub/buried.py``，``rglob`` 能捞到。
+    这里用 ``tmp_path`` 复现，不污染仓库。
+    """
+    pkg = tmp_path / "pkg"
+    (pkg / "sub").mkdir(parents=True)
+    (pkg / "_recall.py").write_text("x = 1\n", encoding="utf-8")     # 锚点
+    (pkg / "_diag.py").write_text("x = 1\n", encoding="utf-8")       # 锚点
+    (pkg / "sub" / "buried.py").write_text(
+        "def f():\n    try:\n        return []\n"
+        "    except Exception as e:\n        return f'x: {e}'\n",
+        encoding="utf-8")
+
+    found = {}
+    for p in _pkg_py_files(pkg):
+        hits = _scan(p.read_text(encoding="utf-8"))
+        if hits:
+            found[p.relative_to(pkg).as_posix()] = hits
+    assert list(found) == ["sub/buried.py"], found      # 子目录里的坏模块被抓到
+    assert found["sub/buried.py"][0][0] == 5            # 行号正确
+
+
+def test_guard_constants_match_the_sibling_file():
+    """两个护栏测试的守卫**口径一致**（同一个常量对象，不是一个抄一份）。"""
+    import tests.test_recall_degraded_visibility as sibling
+
+    assert _PACKAGE_ANCHORS is sibling._PACKAGE_ANCHORS
+    assert _PACKAGE_MIN_MODULES == sibling._PACKAGE_MIN_MODULES
+    assert _pkg_py_files is sibling._package_py_files
+    assert _pkg_anchor_error is sibling._package_anchor_error
+    assert _rules.package_anchor_error(_PKG_DIR) == ""
