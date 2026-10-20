@@ -3499,6 +3499,19 @@ def cmd_kb_govern(config: dict, apply: bool = False) -> dict:
                              "the environment)")
 
 
+def _moc_link(title, stem):
+    """MOC 链接：按文件名 stem 解析，标题不同时挂别名显示。
+
+    与插件侧 _kb._moc_link 同源。Obsidian 按文件名解析 [[...]]，标题里的
+    非法字符落盘时被替换，只用标题会得到死链。
+    """
+    title = str(title or "").strip()
+    stem = str(stem or "").strip()
+    if not stem or stem == title:
+        return "[[%s]]" % (title or stem)
+    return "[[%s|%s]]" % (stem, title)
+
+
 def cmd_kb_moc(config: dict) -> dict:
     """按受控分类重建 vault 根 index.md 导航（MOC）。
 
@@ -3520,10 +3533,12 @@ def cmd_kb_moc(config: dict) -> dict:
             continue
         cat = normalize_category(meta.get("category")) or infer_category(
             title, meta.get("tags"), meta.get("concepts"), body)
+        # 链接目标用文件名 stem（Obsidian 按文件名解析），标题只作显示名。
+        stem = path.stem
         if cat:
-            groups.setdefault(cat, []).append((title, rel))
+            groups.setdefault(cat, []).append((title, stem))
         else:
-            uncategorized.append((title, rel))
+            uncategorized.append((title, stem))
 
     ordered = [c for c in KB_CATEGORIES if c in groups]
     ordered += sorted(c for c in groups if c not in KB_CATEGORIES)
@@ -3534,15 +3549,15 @@ def cmd_kb_moc(config: dict) -> dict:
     for cat in ordered:
         lines.append("## %s" % cat)
         lines.append("")
-        for title, _rel in sorted(groups[cat], key=lambda x: x[0].lower()):
-            lines.append("- [[%s]]" % title)
+        for title, stem in sorted(groups[cat], key=lambda x: x[0].lower()):
+            lines.append("- " + _moc_link(title, stem))
         lines.append("")
     if uncategorized:
         lines += ["## Uncategorized", "",
                   "这些笔记没有受控分类，也推不出来。"
                   "用 `kb-add --category` 或 `kb-migrate-category` 补上。", ""]
-        for title, _rel in sorted(uncategorized, key=lambda x: x[0].lower()):
-            lines.append("- [[%s]]" % title)
+        for title, stem in sorted(uncategorized, key=lambda x: x[0].lower()):
+            lines.append("- " + _moc_link(title, stem))
         lines.append("")
 
     index_path = vault / "index.md"

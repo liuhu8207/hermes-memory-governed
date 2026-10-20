@@ -94,11 +94,13 @@ try:
     from plugin.memory_governed._bridge import (
         matched_secret_patterns as _secret_names,
     )
+    from plugin.memory_governed import _lifecycle as _life
     _GATE_AVAILABLE = True
     _GATE_IMPORT_ERROR = None
 except Exception as _gate_err:  # noqa: BLE001 — 让 main() 去报，别在这里猜
     _write_verdict = None
     _secret_names = None
+    _life = None
     _GATE_AVAILABLE = False
     _GATE_IMPORT_ERROR = _gate_err
 
@@ -185,6 +187,14 @@ def extract_facts(messages: list[dict[str, Any]], *,
     facts: list[dict[str, Any]] = []
     stats: Counter = Counter()
     agent = _rebuilt_agent()
+    # 墓碑门（防复活）：``--rebuild`` 从 L3 重新抽取事实，等于把整条写入路径
+    # 重跑一遍。写入路径会拒绝被 retract 过的句子，回灌路径此前**没有这道门**
+    # —— 于是重建会把明确撤回的事实原样带回来，墓碑形同虚设（2026-10-20
+    # 端到端实测确认）。这里在抽取阶段就查，与写入门是同一张表、同一个判据。
+    tombstones = (
+        _life.load_tombstones(MEMORY_DIR)
+        if gate and _life is not None else {}
+    )
     for msg in messages:
         content = msg.get("content", "")
         if not content:
@@ -206,6 +216,11 @@ def extract_facts(messages: list[dict[str, Any]], *,
                 names = _secret_names(sentence)
                 if names:
                     stats[f"secret:{'+'.join(names)}"] += 1
+                    continue
+                if tombstones and _life.is_tombstoned(sentence, tombstones):
+                    # 不静默丢：被墓碑挡下的条数要可数、可报，否则「重建
+                    # 后少了几条」和「本来就没有」看起来一模一样。
+                    stats["tombstone"] += 1
                     continue
             facts.append({
                 "content": sentence,

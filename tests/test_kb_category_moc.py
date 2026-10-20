@@ -260,6 +260,30 @@ class TestCategoryFiltersRetrieval:
                     "section=%r 却返回了 %r（来自 %s）"
                     % (section, h["section"], h["path"]))
 
+    def test_category_name_survives_the_reranker(self, kb):
+        """类目名是合法关键词，但 reranker 只看正文会把它筛掉。
+
+        回归：``kb-search "tooling" --category tooling`` 曾返回 0 ——
+        关键词通道给了 1.0 分，reranker 却因为 "tooling" 不在正文里把它
+        当噪声丢弃。类目名必须和正文一起提交给 reranker。
+        """
+        kb._config.reranking.enabled = True
+        kb._config.kb.rerank_min_score = 0.05
+        kb.add("某工具安装说明", "安装步骤与排障", category="tooling")
+        kb.add("某环境事实", "服务器硬件", category="environment")
+
+        class _R:
+            available = True
+
+            def scores(self, query, texts, top_n=None):
+                return {i: (0.9 if query in t else 0.01)
+                        for i, t in enumerate(texts)}
+
+        kb._get_reranker = lambda: _R()  # type: ignore[assignment]
+        hits = kb.search("tooling", top_k=5, category="tooling")
+        assert hits, "类目名检索被 reranker 整条筛掉了"
+        assert all(h["category"] == "tooling" for h in hits)
+
     def test_section_and_category_are_independent_gates(self, kb):
         self._seed(kb)
         assert kb.search("配置", top_k=10, section="notes",

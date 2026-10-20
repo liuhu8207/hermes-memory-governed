@@ -337,6 +337,19 @@ def _enrich_note(title: str, body: str, config: Any) -> Dict[str, Any]:
         return {}
 
 
+def _moc_link(title: str, stem: str) -> str:
+    """MOC 链接：按**文件名 stem** 解析，标题不同时挂别名显示。
+
+    Obsidian 按文件名解析 ``[[target]]``；``[[target|display]]`` 用别名显示。
+    标题与文件名不同（标题里的非法字符落盘时被替换）时，只写标题会得到死链。
+    """
+    title = (title or "").strip()
+    stem = (stem or "").strip()
+    if not stem or stem == title:
+        return "[[%s]]" % (title or stem)
+    return "[[%s|%s]]" % (stem, title)
+
+
 def _is_archived(note: "_Note") -> bool:
     """这篇笔记是否标记为归档。
 
@@ -1560,12 +1573,39 @@ class KnowledgeBase:
         # canonical note with nothing — a search for the NAS note returned
         # only its archived copies, then the post-hoc filter emptied them.
         candidates = (set(kw_norm) | set(sem_norm)) - set(archived_rels)
+        # rel -> 受控分类。要在 rerank 之前就绪：类目名是关键词通道的合法
+        # 命中（``kb-search "tooling" --category tooling``），但 reranker 只
+        # 看正文，词不在正文里会被它当噪声筛掉 —— 把类目一并交给它评分。
+        cat_by_rel: Dict[str, str] = {}
+        for n in notes:
+            cat_by_rel[self._rel(n.path)] = n.category
         if candidates and kb_rerank_on and rerank_floor > 0.0:
             rer = self._get_reranker()
             if rer.available:
                 try:
-                    rels = sorted(candidates)
-                    texts = [self._rel_body(rel) or rel for rel in rels]
+                    # ⚠️ 截断前必须按**相关性**排序，不能按路径码点排。
+                    # ``scores(top_n=None)`` 会用 ``reranking.top_n`` 截断
+                    # （部署值 10），只给前 limit 篇打分；按路径排时 CJK
+                    # 标题（码点远大于 ASCII）永远排在最后，于是库里一旦
+                    # 超过 10 篇在用笔记，中文标题笔记就**永久不可检索**
+                    # —— 查询词与标题完全一致也返回不了（2026-10-20 实测：
+                    # ``kb-search "飞牛 NAS 硬件配置"`` 不返回该笔记）。
+                    # 用两条通道的加权初筛分排序，让最可能相关的候选进入
+                    # reranker 的预算窗口。
+                    def _pre_rank(rel: str) -> Tuple[float, str]:
+                        return (-(_KB_KW_WEIGHT * kw_norm.get(rel, 0.0)
+                                  + _KB_SEM_WEIGHT * sem_norm.get(rel, 0.0)),
+                                rel)
+
+                    rels = sorted(candidates, key=_pre_rank)
+                    texts = [
+                        " ".join(filter(None, [
+                            self._rel_body(rel) or rel,
+                            ("category: " + cat_by_rel[rel])
+                            if cat_by_rel.get(rel) else "",
+                        ]))
+                        for rel in rels
+                    ]
                     scores = rer.scores(query, texts, top_n=None)
                     scored = {rels[i]: s for i, s in scores.items()
                               if i < len(rels)}
@@ -1667,10 +1707,8 @@ class KnowledgeBase:
         # 过滤关键词候选：语义路会带进 notes 列表之外的路径（索引投影滞后、
         # 或 vault 里已移动的笔记），只在 notes 上过滤会让 section/category
         # 门被语义路绕过 —— 实测 section="inbox" 仍返回 notes 里的笔记。
-        cat_by_rel: Dict[str, str] = {}
         sec_by_rel: Dict[str, str] = {}
         for n in notes:
-            cat_by_rel[self._rel(n.path)] = n.category
             sec_by_rel[self._rel(n.path)] = n.section
 
         scored: Dict[str, Dict[str, Any]] = {}
@@ -2389,7 +2427,11 @@ class KnowledgeBase:
                 # ``migrate_categories``）—— 导航不该偷偷改数据。
                 cat = _vault.infer_category(
                     note.title, note.tags, note.concepts, note.body)
-            entry = (note.title, rel)
+            # 链接目标必须是**文件名 stem**，不是 frontmatter title：
+            # Obsidian 按文件名解析 ``[[...]]``，而标题里的 ``/`` 在落盘时被
+            # ``_ILLEGAL_FS`` 换成了空格（``…（内存/扩展/存储）`` -> ``…（内存 扩展 存储）``）。
+            # 用 title 做目标会产出死链（实测 1/20）。
+            entry = (note.title, note.path.stem, rel)
             if cat:
                 groups.setdefault(cat, []).append(entry)
             else:
@@ -2405,8 +2447,9 @@ class KnowledgeBase:
         for cat in ordered:
             lines.append("## %s" % cat)
             lines.append("")
-            for title, rel in sorted(groups[cat], key=lambda x: x[0].lower()):
-                lines.append("- [[%s]]" % title)
+            for title, stem, rel in sorted(groups[cat],
+                                           key=lambda x: x[0].lower()):
+                lines.append("- " + _moc_link(title, stem))
             lines.append("")
         if uncategorized:
             lines.append("## Uncategorized")
@@ -2414,8 +2457,9 @@ class KnowledgeBase:
             lines.append("这些笔记没有受控分类，也推不出来。"
                          "用 `kb-add --category` 或 `kb-migrate-category` 补上。")
             lines.append("")
-            for title, rel in sorted(uncategorized, key=lambda x: x[0].lower()):
-                lines.append("- [[%s]]" % title)
+            for title, stem, rel in sorted(uncategorized,
+                                           key=lambda x: x[0].lower()):
+                lines.append("- " + _moc_link(title, stem))
             lines.append("")
 
         index_path = self._vault / _vault._INDEX_FILENAME

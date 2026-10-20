@@ -234,7 +234,7 @@ of them in `$HERMES_HOME/governed_memory.json`.
 | semantic_enabled | true | Semantic (embedding) channel on. |
 | keyword_enabled | true | Keyword channel on. |
 | semantic_min_score | 0.0 | Cosine floor for the semantic channel. **Off by default.** Calibration on the real vault (bge-m3, 21 notes) put relevant hits at 0.41-0.84 and irrelevant ones at 0.31-0.49 — the bands overlap, so there is no usable cosine threshold. Kept for a deployment that wants a hard cosine cut. |
-| rerank_min_score | 0.05 | Floor on the reranker score. This is the real filter: with bge-m3 + bge-reranker-v2-m3 irrelevant queries scored <=0.027 and relevant ones 0.6-0.99. Set to 0.0 to disable. Separate from `semantic_min_score` because the two are on different scales — sharing one threshold once emptied every result below 0.4. |
+| rerank_min_score | 0.0 | Floor on the reranker score. **Code default is off (0.0)**; the shipped example config sets `0.05`, which is the calibrated deployment value. This is the real filter: with bge-m3 + bge-reranker-v2-m3 irrelevant queries scored <=0.027 and relevant ones 0.6-0.99. Set to 0.0 to disable. Separate from `semantic_min_score` because the two are on different scales — sharing one threshold once emptied every result below 0.4. |
 | rerank_trace | false | Log candidate/kept/dropped counts and the floor for KB rerank. |
 | confidence_threshold | 0.7 | Semi-automatic routing: confidence >= threshold goes to `notes/`, below it goes to `inbox/` with `review_required`. |
 | autolink_related | true | Add reciprocal `[[wikilink]]`s between a new note and existing notes sharing concepts/tags. |
