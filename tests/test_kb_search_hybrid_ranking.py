@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import pytest
+
 from pathlib import Path
 
 from plugin.memory_governed._config import GovernedMemoryConfig
@@ -9,6 +11,23 @@ from plugin.memory_governed._kb import (
     KnowledgeBase,
 )
 
+
+
+
+@pytest.fixture(autouse=True)
+def _isolated_home(tmp_path, monkeypatch):
+    """把 ``HERMES_HOME`` 指到本测试的 tmp 目录。
+
+    ``cmd_kb_search`` 的**索引路径**来自 ``HERMES_HOME``（``wiki_dir`` 才是
+    调用方给的）⇒ 不隔离的话，这些用例会共用同一个索引，于是别的用例写进去
+    的行会出现在本用例的检索结果里（"库里没这篇"和"这篇在别的用例里"长得
+    一模一样）。旧实现靠"把不是我的行全删掉"把污染盖住了 —— 那正是本次
+    P0 要禁的删除行为；护栏修好后，污染必须从**测试隔离**上解。
+    """
+    home = tmp_path / "home"
+    (home / "memory").mkdir(parents=True, exist_ok=True)
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    return home
 
 def _vault(tmp_path: Path) -> dict:
     wiki = tmp_path / "wiki"
