@@ -2497,7 +2497,10 @@ class KnowledgeBase:
             # Obsidian 按文件名解析 ``[[...]]``，而标题里的 ``/`` 在落盘时被
             # ``_ILLEGAL_FS`` 换成了空格（``…（内存/扩展/存储）`` -> ``…（内存 扩展 存储）``）。
             # 用 title 做目标会产出死链（实测 1/20）。
-            entry = (note.title, note.path.stem, rel)
+            # 显示名用 frontmatter title（更可读），链接目标用文件名 stem。
+            # 两个 MOC 入口（插件 / CLI）必须给出同一份 index.md。
+            display = str(note.meta.get("title") or note.path.stem).strip()
+            entry = (display, note.path.stem, rel)
             if cat:
                 groups.setdefault(cat, []).append(entry)
             else:

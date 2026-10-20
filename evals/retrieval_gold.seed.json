@@ -1,0 +1,23 @@
+[
+  {"q": "家里 NAS 用的什么 CPU", "expect": ["飞牛 NAS 硬件配置"]},
+  {"q": "本地电脑的系统环境是什么", "expect": ["本地 PC 硬件与系统环境"]},
+  {"q": "公司到家里的 VPN 隧道怎么走的", "expect": ["公司↔家里 WireGuard 隧道拓扑（RouterOS site-to-site）"]},
+  {"q": "Hermes 网关重启后怎么确认生效", "expect": ["Hermes Gateway 重启验证方法"]},
+  {"q": "Hermes 现在默认用哪个模型", "expect": ["Hermes 默认模型已切到 mimo-v2.6-flash"]},
+  {"q": "WorkBuddy 怎么接入共享记忆", "expect": ["WorkBuddy 接入 HGM 共享记忆"]},
+  {"q": "MiMo 的 API 支持什么协议", "expect": ["MiMo API 端点能力"]},
+  {"q": "知识库 embedding 之前选的哪个模型", "expect": ["Octop 知识库选型：jina-v2-base-zh"]},
+  {"q": "SR588 支持哪些 CPU", "expect": ["联想 ThinkServer SR588 服务器 CPU 支持规格"]},
+  {"q": "SR588 的内存和存储规格", "expect": ["ThinkServer SR588 配套规格（内存 扩展 存储）"]},
+  {"q": "我喜欢先讨论方向再动手", "expect": ["用户工作流偏好：先讨论方向再部署"]},
+  {"q": "我住在哪里、主力机是什么配置", "expect": ["用户所在城市与主力 PC 硬件"]},
+  {"q": "dsh 现在是什么版本", "expect": ["dsh 已升级到 0.2.0-rc.2"]},
+  {"q": "ZCode 改 provider kind 有什么坑", "expect": ["ZCode provider kind 配置：不要擅自改 anthropic → openai"]},
+  {"q": "共享记忆是怎么开通的", "expect": ["共享记忆系统开通"]},
+  {"q": "browser-skill 在 Windows 上安装有什么坑", "expect": ["browser-skill (bsk) 安装状态与 Windows 升级坑"]},
+  {"q": "今天上海天气怎么样", "expect": []},
+  {"q": "帮我订一张去北京的机票", "expect": []},
+  {"q": "Python 的 asyncio 怎么用", "expect": []},
+  {"q": "推荐一部科幻电影", "expect": []},
+  {"q": "Kubernetes 的 ingress 怎么配", "expect": []}
+]

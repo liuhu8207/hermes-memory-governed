@@ -54,6 +54,45 @@ python scripts/l2_capacity.py --dry-run         # show rows and overage
 python scripts/redact_l3_archive.py --dry-run   # show how many rows would change
 ```
 
+## Backup Restore Drill
+
+A backup that has never been restored is not a backup. Run this monthly:
+
+```bash
+python scripts/restore_drill.py --dry-run   # show which backups would be used
+python scripts/restore_drill.py             # restore into a temp dir and verify
+```
+
+It copies the newest L2 / L3 / vault backups into a temporary tree, opens them
+the way the runtime does, checks L2 columns, SQLite integrity and vault
+frontmatter, and prints row counts. The live store is only read. `--keep` keeps
+the restored tree for inspection.
+
+If an older L3 backup reports `malformed inverted index for FTS5`, the drill
+rebuilds the index **in the restored copy** and reports it as a warning. Repair
+the live archive with:
+
+```bash
+python scripts/l3_fts_repair.py --dry-run
+python scripts/l3_fts_repair.py --yes       # makes its own backup first
+```
+
+## Retrieval Evaluation
+
+`evals/retrieval_gold.seed.json` is a curated set of realistic queries
+(positives with expected notes, plus negative queries that should return
+nothing). It measures P@1, recall@5, MRR and the negative false-positive rate:
+
+```bash
+python scripts/kb_eval.py --gold evals/retrieval_gold.seed.json
+python scripts/kb_eval.py --gold ... --baseline "$HERMES_HOME/evals/baseline.json"
+```
+
+The baseline form exits non-zero when a metric drops more than `--max-drop`.
+Affinity is disabled by default because it updates during each query and makes
+the same set score differently every run; pass `--with-affinity` only when you
+explicitly want the production full path.
+
 ## Health Check
 
 ```bash
