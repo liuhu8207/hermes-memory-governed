@@ -26,12 +26,16 @@
 |----|------|----------|
 | `environment` | 机器 / 网络 / 系统环境事实 | 飞牛 NAS 硬件配置、本地 PC 硬件、WireGuard 隧道拓扑 |
 | `user` | 用户画像与偏好 | 用户所在城市、用户工作流偏好 |
-| `tooling` | 工具与服务的配置、选型、排障 | dsh 升级、browser-skill 安装坑、ZCode provider kind |
+| `tooling` | 工具与服务的配置与排障 | dsh 升级、browser-skill 安装坑、ZCode provider kind |
 | `workflow` | 流程与方法 | 怎么做一件事、步骤、约定 |
-| `reference` | 外部资料与规格 | MiMo API 端点能力、SR588 CPU 支持规格 |
+| `reference` | 外部资料、规格与选型比较 | MiMo API 端点能力、SR588 CPU 支持规格、选型结论 |
 | `project` | 具体项目的状态与决策 | |
 | `synthesis` | 跨笔记归纳卡 | `*_综合归纳` |
 | `meta` | 关于这套记忆系统本身 | 共享记忆系统开通、Hermes Gateway 重启方法 |
+
+「选型」归 `reference`（它是一次比较结论，不是工具本身怎么配）；工具
+**怎么配置、怎么排障**归 `tooling`。这条边界写在代码的 `_TITLE_MARKERS`
+里，文档与代码必须一致。
 
 主题信息仍然写在 `tags` / `concepts` 里 —— 那两个字段管"这条笔记讲什么"，
 `category` 管"我拿它做什么"。两者不重叠。

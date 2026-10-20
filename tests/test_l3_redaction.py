@@ -25,6 +25,27 @@ def test_redact_for_archive_keeps_clean_text():
     assert redact_for_archive(text) == text
 
 
+def test_policy_prose_is_not_mistaken_for_a_credential():
+    r"""「密码：必须至少 12 位」是规则，不是凭据。
+
+    旧的 ``\S{3,}`` 把冒号后的说明词当成了密码值，脱敏成
+    ``[REDACTED] 12 位`` —— 把一句规则改成了半句话。
+    """
+    for text in (
+        "密码：必须至少 12 位",
+        "口令：请设置为复杂口令",
+        "password: min 12 chars",
+        "password: at least 12 characters",
+    ):
+        assert redact_for_archive(text) == text
+
+
+def test_real_credentials_are_still_redacted():
+    """正对照：别把规则修得太宽，真凭据必须继续拦下。"""
+    for text in ("密码: abc123", "password: hunter2", "token: sk-abcdefghijklmnop1234"):
+        assert "[REDACTED" in redact_for_archive(text)
+
+
 def test_l3_writer_stores_redacted_content(config):
     secret = "sk-" + "A" * 24
     writer = L3Writer(config)

@@ -280,9 +280,19 @@ def sql_quote(value: str) -> str:
     return "'" + str(value).replace("'", "''") + "'"
 
 
+class CapacityRefused(RuntimeError):
+    """容量淘汰被 fail-closed 拒绝（备份失败等），调用方必须当作失败上报。
+
+    ``enforce_capacity`` 历史返回空列表表示「不需要淘汰」，于是一次**被拒绝**
+    的淘汰和「无事可做」在调用方看来一模一样 —— cron 看到 ``demoted: 0`` 和
+    exit 0，以为一切都好。备份失败尤其不能伪装成成功。
+    """
+
+
 def enforce_capacity(table, memory_dir: Path, cap: int,
                      *, agent: Optional[str] = None,
-                     incoming: int = 0) -> List[str]:
+                     incoming: int = 0,
+                     report: Optional[Dict[str, Any]] = None) -> List[str]:
     """Archive the least-used rows until ``cap`` is respected.
 
     This is a **sweep**, not a per-write hook. Running it from the daily job
@@ -310,6 +320,17 @@ def enforce_capacity(table, memory_dir: Path, cap: int,
         return []
 
     usage = usage_last_used(memory_dir)
+    if not usage:
+        # fail-closed：「没有使用度数据」不等于「都没被用过」。此时所有行的
+        # last_used 都是 0，淘汰会退化成**纯按时间删最旧** —— 实测会删掉一条
+        # 被召回过的事实。没有数据就跳过，并在 report 里说明原因，让 cron
+        # 能区分「不需要淘汰」和「拒绝淘汰」。
+        logger.warning(
+            "capacity sweep skipped: no usage data (cannot rank by use) — "
+            "refusing to evict purely by age")
+        if report is not None:
+            report["skipped_reason"] = "no usage data"
+        return []
 
     def _victim_key(row):
         content = str(row.get("content") or "")
@@ -320,16 +341,46 @@ def enforce_capacity(table, memory_dir: Path, cap: int,
     if not victims:
         return []
     l2_db_path = Path(memory_dir) / "l2"
-    if backup_table(l2_db_path, tag="capacity", memory_dir=memory_dir) is None:
-        logger.error("capacity sweep skipped: cannot back up the L2 table")
-        return []
+    backup = backup_table(l2_db_path, tag="capacity", memory_dir=memory_dir)
+    if backup is None:
+        logger.error("capacity sweep refused: cannot back up the L2 table")
+        if report is not None:
+            report["skipped_reason"] = "backup failed"
+        raise CapacityRefused("cannot back up the L2 table; refusing to delete")
+
+    def _row_predicate(row) -> str:
+        """定位**这一行**，不是「所有同内容的行」。
+
+        只按 ``content`` 删会连带删掉同内容的其它行：实测 1 个受害者删掉 3 行
+        重复行（5→2），归档只写 1 条、``demoted`` 少报。带上 timestamp /
+        agent / source_rowid 把范围收到这一行；同内容的真实重复仍会被一并
+        清掉（那正是想要的去重），但删除条数必须如实上报。
+        """
+        parts = ["content = " + sql_quote(str(row.get("content") or ""))]
+        if row.get("timestamp") is not None:
+            parts.append("timestamp = " + sql_quote(str(row["timestamp"])))
+        if row.get("agent") is not None:
+            parts.append("agent = " + sql_quote(str(row["agent"])))
+        sid = row.get("source_rowid")
+        if sid is not None and str(sid).strip().lstrip("-").isdigit():
+            parts.append("source_rowid = %d" % int(sid))
+        return " AND ".join(parts)
 
     now = datetime.now().strftime("%Y-%m-%dT%H:%M:%S")
     demoted: List[str] = []
+    rows_removed = 0
+    seen_content: set = set()
     for row in victims:
         content = str(row.get("content") or "")
-        if not content:
+        if not content or content in seen_content:
             continue
+        seen_content.add(content)
+        pred = _row_predicate(row)
+        try:
+            matched = table.count_rows(filter=pred)
+        except Exception as e:  # noqa: BLE001 — 计数失败不阻断删除，但要可见
+            log_degraded("l2_capacity", "count_rows_failed", exc=e)
+            matched = 1
         try:
             archive_append(memory_dir, {
                 "state": "archived", "reason": "capacity-demoted",
@@ -337,10 +388,14 @@ def enforce_capacity(table, memory_dir: Path, cap: int,
                 "agent": row.get("agent"), "timestamp": row.get("timestamp"),
                 "cap": cap,
             })
-            table.delete("content = " + sql_quote(content))
+            table.delete(pred)
             demoted.append(content[:200])
+            rows_removed += max(1, int(matched or 1))
         except Exception as e:  # noqa: BLE001
             log_degraded("l2_capacity", "demote_failed", detail=content[:80], exc=e)
+    if report is not None:
+        report["rows_removed"] = rows_removed
+        report["backup"] = str(backup)
     return demoted
 
 

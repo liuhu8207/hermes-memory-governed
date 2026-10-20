@@ -85,6 +85,77 @@ class TestExampleCoversEveryCodeField:
                 )
 
 
+def _doc_table_defaults(section_heading: str) -> dict:
+    """解析某个二级标题下的 ``| Key | Default | ... |`` 表 → {key: default}。"""
+    import re
+
+    text = _doc_text()
+    start = text.find(section_heading)
+    if start < 0:
+        return {}
+    nxt = text.find("\n## ", start + len(section_heading))
+    block = text[start: nxt if nxt > 0 else len(text)]
+    out = {}
+    for line in block.splitlines():
+        m = re.match(r"\|\s*([A-Za-z_][A-Za-z0-9_]*)\s*\|\s*([^|]*?)\s*\|", line)
+        if m:
+            out[m.group(1)] = m.group(2).strip()
+    return out
+
+
+def _doc_default(kind, value) -> str:
+    """把 dataclass 默认值渲染成文档里的写法。"""
+    if isinstance(value, bool):
+        return "true" if value else "false"
+    if isinstance(value, str):
+        return '"%s"' % value
+    if isinstance(value, float):
+        return repr(value)
+    return str(value)
+
+
+class TestDocDefaultsMatchCode:
+    """默认值必须与 ``_config.py`` 一致，不只是字段名存在。
+
+    旧守卫只查「名字出现过」，于是把文档里的 ``0.05`` 改成与代码相反的
+    ``0.0``（或反过来）仍然全绿 —— 实测 ``rerank_min_score`` 就漏过了一处。
+    """
+
+    #: 文档里的二级标题 -> _config.py 的 dataclass。
+    SECTIONS = {
+        "## Recall Config": "RecallConfig",
+        "## Sync Config": "SyncConfig",
+        "## Knowledge Base Config (`kb`)": "KnowledgeConfig",
+        "## Reranking Config": "RerankingConfig",
+    }
+
+    @pytest.mark.parametrize("heading,cls_name", sorted(SECTIONS.items()))
+    def test_documented_defaults_match_the_dataclass(self, heading, cls_name):
+        table = _doc_table_defaults(heading)
+        assert table, "%s 下没解析到表格" % heading
+        cls = getattr(_config, cls_name)
+        mismatches = []
+        for f in dataclasses.fields(cls):
+            if f.name in RUNTIME_ONLY or f.name not in table:
+                continue
+            want = _doc_default(cls_name, f.default)
+            got = table[f.name]
+            # 文档里允许带说明空格，取第一个词比较
+            token = got.split()[0]
+            if token != want:
+                # 数值允许 30 与 30.0 等价（文档写整数的可读性优先）
+                same_number = False
+                try:
+                    same_number = float(token) == float(want)
+                except (TypeError, ValueError):
+                    pass
+                if not same_number:
+                    mismatches.append("%s: doc=%r code=%r"
+                                      % (f.name, token, want))
+        assert not mismatches, (
+            "%s 的默认值与代码不一致：\n  " % heading + "\n  ".join(mismatches))
+
+
 class TestDocsNameEveryTunable:
     @pytest.mark.parametrize("cls_name", sorted(SECTION_KEY))
     def test_field_is_documented(self, cls_name):

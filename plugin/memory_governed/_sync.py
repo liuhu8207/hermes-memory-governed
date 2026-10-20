@@ -625,8 +625,14 @@ _MEDIA_PLACEHOLDER_RE = re.compile(
 _CREDENTIAL_RE = re.compile(
     # "LETTERS<sep>digits" — the shape of most hand-made passwords
     r"(?<![A-Za-z0-9])[A-Za-z]{2,12}[@#$!]\d{6,}"
-    # explicit key/value credential rows
-    r"|(?:pass(?:word|wd)?|pwd|密码|口令|token|secret|密钥)\s*[:=：]\s*\S{3,}"
+    # explicit key/value credential rows.
+    # 冒号后面跟的是**策略说明**而不是凭据值时不能脱敏：实测
+    # 「密码：必须至少 12 位」曾被替换成「[REDACTED] 12 位」，把一条规则
+    # 改成了半句话。负向前瞻挡掉这些中文说明词，真实凭据仍会被拦下。
+    r"|(?:pass(?:word|wd)?|pwd|密码|口令|token|secret|密钥)\s*[:=：]\s*"
+    r"(?!(?:必须|至少|要求|需要|不能|不要|请|应|建议|禁止|使用|设置|输入|是|为"
+    r"|must|at\s+least|min(?:imum)?\b|require[sd]?\b|should|needs?\b|use\b|set\b))"
+    r"\S{3,}"
     # API tokens
     r"|\b(?:sk|ak|ghp|xoxb|glpat)-[A-Za-z0-9_\-]{16,}"
     # PEM private key blocks

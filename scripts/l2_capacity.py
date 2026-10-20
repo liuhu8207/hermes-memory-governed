@@ -79,9 +79,27 @@ def main() -> int:
         out.update({"ok": False, "error": "cannot resolve memory directory"})
         print(json.dumps(out, ensure_ascii=False, indent=2))
         return 1
-    demoted = life.enforce_capacity(table, mem_dir, cap, agent=None)
+    report: dict = {}
+    try:
+        demoted = life.enforce_capacity(table, mem_dir, cap, agent=None,
+                                        report=report)
+    except getattr(life, "CapacityRefused", RuntimeError) as e:
+        # 备份失败等 fail-closed 拒绝必须是非零退出：旧行为返回空列表 +
+        # exit 0，cron 看到 ``demoted: 0`` 以为一切正常，实际一行都没保护。
+        out.update({"ok": False, "error": str(e)})
+        if report:
+            out.update(report)
+        print(json.dumps(out, ensure_ascii=False, indent=2))
+        return 1
     out["demoted"] = len(demoted)
     out["demoted_prefixes"] = demoted
+    if report:
+        out.update(report)
+        if report.get("skipped_reason"):
+            out["ok"] = False
+            out["error"] = "sweep skipped: " + report["skipped_reason"]
+            print(json.dumps(out, ensure_ascii=False, indent=2))
+            return 1
     print(json.dumps(out, ensure_ascii=False, indent=2))
     return 0
 

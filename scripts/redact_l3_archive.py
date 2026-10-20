@@ -57,6 +57,26 @@ def _backup(db_path: Path) -> Path:
     return dest
 
 
+def _prune_backups(keep: int) -> list[Path]:
+    """只保留最近 ``keep`` 份脱敏前备份。
+
+    备份是**真还原点**（这一点不能省），但它同时是**一份全库明文副本** ——
+    无保留期会越积越多，等于把凭据搬到了另一个目录。``keep>=1`` 保证在
+    删除之后永远还有一份可回滚的副本。
+    """
+    keep = max(1, int(keep))
+    backups = sorted(BACKUP_DIR.glob("l3_pre_redact_*.db"),
+                     key=lambda p: p.stat().st_mtime, reverse=True)
+    removed: list[Path] = []
+    for old in backups[keep:]:
+        try:
+            old.unlink()
+            removed.append(old)
+        except OSError:
+            pass
+    return removed
+
+
 def _rebuild_fts(conn: sqlite3.Connection) -> None:
     """Rebuild the standalone FTS table with rowid = messages.id.
 
@@ -75,6 +95,10 @@ def main() -> int:
     parser = argparse.ArgumentParser(description="Redact L3 archive secrets")
     parser.add_argument("--dry-run", action="store_true")
     parser.add_argument("--yes", action="store_true", help="Skip confirmation")
+    parser.add_argument("--keep-backups", type=int, default=3,
+                        help="Keep this many pre-redaction backups (default 3); "
+                             "the backup is a full plaintext copy of L3, so it "
+                             "must not accumulate forever")
     args = parser.parse_args()
 
     if not L3_DB_PATH.exists():
@@ -119,7 +143,7 @@ def main() -> int:
                 return 1
 
         backup = _backup(L3_DB_PATH)
-        print(f"backup: {backup}")
+        print(f"backup: {backup} (full plaintext copy — keep it short-lived)")
         with conn:
             for rowid, session_id, role, _original, redacted in changes:
                 conn.execute(
@@ -128,6 +152,9 @@ def main() -> int:
                 )
             _rebuild_fts(conn)
         conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+        removed = _prune_backups(args.keep_backups)
+        if removed:
+            print("pruned old backups: " + ", ".join(p.name for p in removed))
         print(f"redacted {len(changes)} rows; FTS rebuilt")
         return 0
     finally:

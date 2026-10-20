@@ -531,8 +531,17 @@ class KBIndex:
                 # 正本是 vault，可直接重建。此处就地迁移，重建交给
                 # KnowledgeBase.sync_index()（会发现索引为空 → 全量补齐）。
                 if "mtime" not in [f.name for f in self._store.schema]:
-                    logger.info("kb index schema lacks 'mtime' — rebuilding")
-                    db.drop_table(_TABLE_NAME)
+                    # 迁移前先**留一份旧表**：直接 drop 之后若 embedding 失败，
+                    # 索引会变成 0 行且无处可退（实测「老 schema + embedding
+                    # 故障」→ drop 后重建全败，kb_index 无任何备份）。
+                    # 重命名成带时间戳的备份表，失败就抛给外层 fail-closed，
+                    # 绝不先删再试。
+                    backup_name = "%s.bak_%s" % (
+                        _TABLE_NAME, time.strftime("%Y%m%d_%H%M%S"))
+                    logger.info("kb index schema lacks 'mtime' — "
+                                "preserving it as %s and rebuilding",
+                                backup_name)
+                    db.rename_table(_TABLE_NAME, backup_name)
                     self._store = None
             if self._store is None:
                 dim = int(getattr(self._service, "dim", 0) or self._config.vector.dim)
