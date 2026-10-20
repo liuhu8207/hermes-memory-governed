@@ -2905,7 +2905,7 @@ class KnowledgeBase:
         try:
             _vault.write_text_atomic(
                 index_path, "\n".join(lines).rstrip() + "\n")
-        except OSError as e:  # silent-ok: already-reported — 失败进返回值的 errors，调用方读得到
+        except OSError as e:  # silent-ok: already-reported — 写失败进 _kb.rebuild_moc 返回值的 errors 字段，调用方读得到
             # _safe_str 而非 %s：异常对象的 __str__ 本身可能抛，那会把一次
             # 优雅降级变成崩溃（tests/test_no_eager_exception_format.py 钉住）。
             return {"ok": False,
@@ -2960,7 +2960,7 @@ class KnowledgeBase:
                                   note.body).full_text,
                             mtime=_file_mtime(note.path))
                         written.append(rel)
-                    except OSError as e:  # silent-ok: already-reported — 聚合进 errors
+                    except OSError as e:  # silent-ok: already-reported — 写失败聚合进 _kb.migrate_categories 返回值的 errors 字段
                         errors.append(f"write failed: {rel}: {_safe_str(e)}")
                 continue
 
@@ -2987,7 +2987,7 @@ class KnowledgeBase:
                               note.body).full_text,
                         mtime=_file_mtime(note.path))
                     written.append(rel)
-                except OSError as e:  # silent-ok: already-reported — per-item 失败聚合进返回的 errors，避免逐条 log 污染计数
+                except OSError as e:  # silent-ok: already-reported — per-item 失败聚合进 _kb.migrate_categories 返回值的 errors，避免逐条 log 污染计数
                     errors.append(f"write failed: {rel}: {_safe_str(e)}")
 
         return {

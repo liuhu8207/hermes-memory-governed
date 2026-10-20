@@ -220,7 +220,7 @@ def distance_to_score(distance: float) -> float:
     """
     try:
         value = float(distance)
-    except (TypeError, ValueError):  # silent-ok: value-fallback — 坏 _distance 值按正交兜底，非子系统故障
+    except (TypeError, ValueError):  # silent-ok: value-fallback — 距离值脏/缺失时按正交兜底（取缺省距离），非子系统故障
         value = DEFAULT_COSINE_DISTANCE
     # NaN / ±inf 会让后续的比较与排序失去意义，统一按缺省距离处理
     if math.isnan(value) or math.isinf(value):
