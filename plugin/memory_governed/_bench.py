@@ -389,12 +389,15 @@ def run_bench(
         try:
             hits = list(search(q, top_k))
         except Exception as exc:  # noqa: BLE001
-            # silent-ok: already-reported — a probe that raised is a RESULT,
-            # not a swallowed error: it is recorded on the item (undecidable +
-            # the reason) and counted in the report, so the next reader sees
-            # which questions the retrieval could not answer. Raising here would
-            # abandon the whole split, and the remaining items are still valid
-            # measurements.
+            # silent-ok: already-reported — 记录进 ItemResult(undecidable=True, note=_safe_str(exc))，由 run_bench 的 report 汇总，调用方读得到
+            # （展开说明：a probe that raised is a RESULT, not a swallowed
+            # error — it is recorded on the item (undecidable + the reason) and
+            # counted in the report, so the next reader sees which questions the
+            # retrieval could not answer. Raising here would abandon the whole
+            # split, and the remaining items are still valid measurements.
+            #
+            # 理由写成**单行**是硬要求：``# silent-ok:`` 只认它所在的那一行的
+            # 文本，续行不构成理由，审计器会判"理由未点名上报者"。
             #
             # ``_safe_str``, not an f-string: an exception object is untrusted
             # input (a custom ``__str__`` may itself raise), and this runs

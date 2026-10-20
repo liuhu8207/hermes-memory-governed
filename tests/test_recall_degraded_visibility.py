@@ -44,6 +44,7 @@ import os
 import queue
 import re
 import sqlite3
+import sys
 from pathlib import Path
 
 import pytest
@@ -76,356 +77,73 @@ _PACKAGE_ANCHORS = ("_diag.py", "_recall.py")
 #: `_PACKAGE_ANCHORS` 合起来同时防"扫空集"与"路径写错"。
 _PACKAGE_MIN_MODULES = 19
 
-#: 只在**值级**防御里捕获的窄异常类型（**真实类**，按继承关系判定）：解析坏配置
-#: 值 / 坏行字段时返回默认值。这些是**有意的**安静回退（不是子系统故障），不应
-#: 上报（否则 per-row 计数噪音就是另一种"输出不可信"）。
-#:
-#: ⚠️ 但**类型本身不足以豁免**：豁免必须由**逐站点**的显式标记 ``# silent-ok:``
-#: 驱动 —— 否则明天有人用 ``except OSError`` 包住一次真实的磁盘读失败，也会被
-#: 类型规则默默放过。护栏规则：捕获到的类 ``⊆ _NARROW_ERROR_CLASSES``（按
-#: ``issubclass`` **继承关系**判定，所以 ``FileNotFoundError ⊂ OSError`` /
-#: ``UnicodeEncodeError ⊂ ValueError`` / ``json.JSONDecodeError ⊂ ValueError``
-#: 同样可豁免）**或**是 ``_CONTROL_FLOW_CLASSES`` 之一，**且**该处理器带
-#: ``silent-ok`` 标记，才豁免。``KeyError``（``cache[k]`` 缺失 / ``del`` 竞态）
-#: 也是值级回退，一并纳入。
-_NARROW_ERROR_CLASSES: tuple = (TypeError, ValueError, OSError, ImportError, KeyError)
-
-#: **控制流型**异常（正常控制流，不是故障）：worker 每秒 poll 队列，空/满都是
-#: 预期路径 —— 上报会把计数废掉（每秒 +1）。与窄类型**同权**：**仍需标记**才豁免。
-#: ⚠️ **闭合集合**：必须是真实类，**禁止**"名字含 ``Empty``/``Full`` 即豁免"
-#: （那种模糊匹配将来能被人拿去豁免宽 ``except Exception``）。
-_CONTROL_FLOW_CLASSES: tuple = (
-    queue.Empty, queue.Full, asyncio.QueueEmpty, asyncio.QueueFull, StopIteration,
-)
-
-#: 解析 ``except`` 里写的异常**名** → 真实类的标准库命名空间（``except`` 里的名字
-#: 通常来自它们）。解析不到的一律**保守按宽类型**处理（不豁免）。
-_EXC_NAMESPACES = (builtins, json, sqlite3, queue, asyncio)
-
-#: **唯一**被整块豁免的模块。``_diag.py`` 是 ``log_degraded`` 的**实现本身** ——
-#: 它上报会**无限递归**（格式化路径本身走 ``_safe_str``），所以它的兜底**只可能
-#: 标记、不可能上报**；且它的 ``suppressed`` 是 ``stats()`` 的**文档化契约键**
-#: （不能改名），故对本文件的"提及即拦 suppress"全是**误报**。因此对它**同时豁免**
-#: 两个检查。模块级豁免由此**命名常量**驱动（显式、可审计），并在
-#: ``test_diag_is_the_only_self_exempt_module`` 里断言**只含** ``_diag.py``。
-#:
-#: ⚠️ **已知例外**：``_diag.py:72/76`` 两条 ``value-fallback`` 挂在**宽 ``except
-#: Exception``** 上，违反"VF 仅窄类型"规则，仅因**整模块豁免**才过关。语义**正当**
-#: ——那是 ``_safe_str``"永不抛"的终极兜底（异常文本本身可能就是坏的，无法再依赖
-#: 任何可能抛异常的上报路径）。此例外**只被本模块豁免覆盖，不可被其它模块引用**：
-#: 别的文件若把 ``value-fallback`` 挂在宽 ``Exception`` 上，仍照常判红。
-_SELF_EXEMPT_MODULES = frozenset({"_diag.py"})
-
-#: 站点级静默豁免标记（注释不进 AST，用正则扫源文本行）。捕获 ``silent-ok:`` 之后
-#: 的整段 payload（**种类** + 分隔符 + 理由），再手工拆分 —— 因为豁免依据按**种类**
-#: 分（见下）。
-_SILENT_OK_RE = re.compile(r"#\s*silent-ok:\s*(.*)$")
-
-#: **已知**的标记种类。种类不同 = 正当性不同，豁免依据因此**可分类、可审计**：
-#:  - ``value-fallback``：**值级回退**（坏配置值 / 坏行字段 / 可选的缺席文件），
-#:    **仅**窄类型 **或** 控制流型可豁免；
-#:  - ``already-reported``：**已在别处（内层）记录过**，此处再记即**双重计数**，
-#:    **任意**捕获类型（含宽 ``Exception``）可豁免，但**理由必须非空**且看得出
-#:    是谁在报（如"内层 _ingest.transcribe_* 已 log_degraded"）。
-#: ⚠️ **只认这两种**：``# silent-ok: 随便写`` / 未知种类 / 空 payload **一律不豁免**
-#: —— 否则标记就成了"随便写个词就能让护栏闭嘴"的空白支票。
-_SILENT_OK_KINDS = frozenset({"value-fallback", "already-reported"})
-
-#: 标记里"种类"与"理由"之间的分隔符（em-dash / en-dash / 破折号）。
-_SILENT_OK_SEP_RE = re.compile(r"\s*[—–]\s*|\s*--\s*")
-
-
 # ---------------------------------------------------------------------------
-# AST 护栏
+# 判定逻辑：**全部**来自 ``guardrail_rules``（唯一实现，与 CI 审计器共用）
 # ---------------------------------------------------------------------------
+#
+# 护栏此前把判定写在本文件里，CI 侧的 ``scripts/silent_ok_audit.py`` 另有一份
+# "只认标记存在与否"的正则扫描 —— 两份判定必然漂移（护栏收紧了、审计器还按旧
+# 语义放行，或反之），而且**没人跑**的那份等于不存在。
+#
+# 判定现统一放在仓库根的 ``guardrail_rules.py``：本文件与 CI 审计器都 import 它，
+# **改一次、两边同步变化**。下面只做同名绑定 —— 本文件既有的私有名（尤其
+# ``tests/test_guardrail_ratchet.py`` 在用的 ``_violations``）保持不变。
+#
+# 语义说明（抽离未改变任何判定）：
+#   * 结构层（``_violations``）与抽离前**完全一致**，故既有测试的红/绿不变；
+#   * 新增的**理由层**校验（点名谁在报 / 引用是否存在）只有审计器用 —— 闸门不
+#     因此变红，但共用同一份标记解析，不存在第二套判定。
+#   * docstring 覆盖的行会被置空（``guardrail_rules.code_lines``）：文档里讲解
+#     ``# silent-ok:`` / ``contextlib.suppress`` 的示例不再被当成真实代码。
 
-def _name_of(node: ast.AST) -> str:
-    """``except`` 子句里的类型节点 → 名字。
+_REPO_ROOT = Path(__file__).resolve().parents[1]
+if str(_REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(_REPO_ROOT))
 
-    ``ast.Name`` 取 ``id``；``ast.Attribute``（如 ``json.JSONDecodeError``）取
-    ``attr`` —— 否则会被错判成 ``<non-name>``，从而无法走继承关系豁免
-    （``JSONDecodeError ⊂ ValueError``，本就是值级回退）。
-    """
-    if isinstance(node, ast.Name):
-        return node.id
-    if isinstance(node, ast.Attribute):
-        return node.attr
-    return "<non-name>"
+import guardrail_rules as _rules
 
+#: 窄异常类型（**真实类**，按继承关系判定子类）。
+_NARROW_ERROR_CLASSES = _rules.NARROW_ERROR_CLASSES
+#: 控制流型异常（**闭合集合**，禁止模糊匹配）。
+_CONTROL_FLOW_CLASSES = _rules.CONTROL_FLOW_CLASSES
+#: 异常名 → 真实类的解析命名空间。
+_EXC_NAMESPACES = _rules.EXC_NAMESPACES
+#: 唯一被整块豁免的模块。
+_SELF_EXEMPT_MODULES = _rules.SELF_EXEMPT_MODULES
+#: 标记正则 / 已知种类 / 种类-理由分隔符。
+_SILENT_OK_RE = _rules.SILENT_OK_RE
+_SILENT_OK_KINDS = _rules.SILENT_OK_KINDS
+_SILENT_OK_SEP_RE = _rules.SILENT_OK_SEP_RE
 
-def _caught_names(handler: ast.ExceptHandler) -> set:
-    """handler 捕获的异常类型名集合；裸 ``except:`` 记为 ``{"__bare__"}``。"""
-    t = handler.type
-    if t is None:
-        return {"__bare__"}
-    if isinstance(t, ast.Tuple):
-        return {_name_of(elt) for elt in t.elts}
-    return {_name_of(t)}
-
-
-def _resolve_exception_class(name: str):
-    """``except`` 里写的异常**名** → 真实的标准库异常类；解析不到返回 ``None``。
-
-    用真实类（而非字面名）判定才能识别**子类**：``FileNotFoundError`` /
-    ``UnicodeEncodeError`` / ``json.JSONDecodeError`` 字面名都不在白名单里，但
-    语义上都是值级回退。
-    """
-    for ns in _EXC_NAMESPACES:
-        cls = getattr(ns, name, None)
-        if isinstance(cls, type) and issubclass(cls, BaseException):
-            return cls
-    return None
-
-
-def _all_caught_are_narrow(caught: set) -> bool:
-    """捕获集合是否**全部**为豁免-friendly（窄类型 **或** 控制流型）。
-
-    任一名字解析不到（自定义 / 动态异常 / ``<non-name>``）、出现裸 ``except``
-    （``__bare__``）、或解析出的类既不是窄类型子类也不是控制流型类 → 判**非窄**
-    （不豁免）。宁严勿松：豁免须同时满足"捕获的确实是真实窄/控制流类" 与 "显式标记"。
-    """
-    if not caught or "__bare__" in caught or "<non-name>" in caught:
-        return False
-    for name in caught:
-        cls = _resolve_exception_class(name)
-        if cls is None:
-            return False
-        if not (issubclass(cls, _NARROW_ERROR_CLASSES)
-                or issubclass(cls, _CONTROL_FLOW_CLASSES)):
-            return False
-    return True
-
-
-def _direct_diag_call(handler: ast.ExceptHandler) -> bool:
-    """handler 体的**直接语句**里是否上报（``log_degraded`` / ``log_data_loss``）。
-
-    认两种直接语句：``Expr(Call(diag))`` 与 ``Return(Call(diag))``（``return
-    log_degraded(...)`` 确实报了，不能算违规 —— 过严会在安全方向挡住合法代码）。
-    **不认**嵌在 ``if`` / ``def`` / ``try`` 里的调用（``if False:
-    log_degraded(...)`` 是 QA 实测的绕过手法）。
-    """
-    for stmt in handler.body:
-        call = None
-        if isinstance(stmt, ast.Expr) and isinstance(stmt.value, ast.Call):
-            call = stmt.value
-        elif isinstance(stmt, ast.Return) and isinstance(stmt.value, ast.Call):
-            call = stmt.value
-        if call is None:
-            continue
-        func = call.func
-        if isinstance(func, ast.Name) and func.id in ("log_degraded", "log_data_loss"):
-            return True
-    return False
-
-
-def _direct_reraise(handler: ast.ExceptHandler) -> bool:
-    """handler 体的**直接语句**里是否有 ``raise``（**任意形态**）。
-
-    只认顶层 —— 嵌在 ``if`` / ``def`` 里的 ``raise`` **不算**（``if False:
-    raise`` 与 handler 内嵌套 ``def h(): raise`` 都是 QA 实测的绕过手法）。
-
-    形态不限（``raise`` / ``raise e`` / ``raise X(...) from e``）：只要它是 handler
-    的**直接语句**，异常就继续向上传播、上游必然记录 —— 可见性已达成，同层**不必**
-    再报一次（否则 ``raise ... from e`` 会被迫在前面加一个 ``log_degraded``，造成
-    **双重计数**）。"必须是直接语句"这一条已独立防住了 ``if False: raise`` /
-    嵌套 ``def h(): raise`` 那类**假重抛**。
-    """
-    for stmt in handler.body:
-        if isinstance(stmt, ast.Raise):
-            return True
-    return False
-
-
-def _defines_diag(handler: ast.ExceptHandler) -> bool:
-    """handler 体的直接语句是否**定义**了 diag 函数（``_diag`` 导入回退引导块）。
-
-    引导块在 ``log_degraded`` 尚未绑定时运行，**不可能**调用自己 —— 唯一豁免。
-    """
-    for stmt in handler.body:
-        if (isinstance(stmt, ast.FunctionDef)
-                and stmt.name in ("log_degraded", "log_data_loss")):
-            return True
-    return False
+_name_of = _rules._name_of
+_caught_names = _rules.caught_names
+_resolve_exception_class = _rules.resolve_exception_class
+_all_caught_are_narrow = _rules.all_caught_are_narrow
+_direct_diag_call = _rules.direct_diag_call
+_direct_reraise = _rules.direct_reraise
+_defines_diag = _rules.defines_diag
+_bootstrap_spans = _rules.bootstrap_spans
+_in_bootstrap = _rules.in_bootstrap
+_fold_str_constants = _rules.fold_str_constants
+_suppress_mentions = _rules.suppress_mentions
+_line_has_known_marker = _rules.line_has_known_marker
+_handler_marker_verdict = _rules.handler_marker_verdict
+_violations = _rules.violations
 
 
 def _silent_ok_kind_reason(line: str):
-    """解析一行里的 ``# silent-ok:`` 标记 → ``(kind, reason)``；无/空标记返回 ``None``。
+    """兼容旧名：解析一行里的 ``# silent-ok:`` 标记 → ``(kind, reason)``。
 
-    只做**解析**；合法性（种类是否已知、理由是否满足该种类要求）交给调用方按
-    ``_SILENT_OK_KINDS`` 判定。
+    真正的实现在 ``guardrail_rules.parse_marker``（返回 ``Marker``）；这里保留旧
+    的**元组**返回，便于既有用例/外部脚本沿用。
     """
-    m = _SILENT_OK_RE.search(line)
-    if m is None:
-        return None
-    payload = m.group(1).strip()
-    if not payload:
-        return None
-    parts = _SILENT_OK_SEP_RE.split(payload, maxsplit=1)
-    head = parts[0].strip()
-    reason = parts[1].strip() if len(parts) > 1 else ""
-    kind = head.split()[0] if head else ""
-    return kind, reason
+    marker = _rules.parse_marker(line)
+    return None if marker is None else (marker.kind, marker.reason)
 
 
-def _line_has_known_marker(line: str) -> bool:
-    """某行是否有**已知种类**的标记（未知种类 / 空 payload 不算）。"""
-    parsed = _silent_ok_kind_reason(line)
-    return parsed is not None and parsed[0] in _SILENT_OK_KINDS
-
-
-def _handler_marker_verdict(handler: ast.ExceptHandler, lines: list, caught: set) -> bool:
-    """按标记**种类**判定 handler 是否豁免（只认 ``_SILENT_OK_KINDS``）。
-
-    - ``value-fallback``：仅当捕获集合**全**为窄类型/控制流型时豁免（同旧语义）；
-    - ``already-reported``：**任意**捕获类型可豁免，但**理由必须非空**；
-    - 未知种类 / 空 payload：不豁免。
-    """
-    end = handler.body[-1].end_lineno if handler.body else handler.lineno
-    for i in range(handler.lineno - 1, end):
-        if i < 0 or i >= len(lines):
-            continue
-        parsed = _silent_ok_kind_reason(lines[i])
-        if parsed is None:
-            continue
-        kind, reason = parsed
-        if kind == "value-fallback" and _all_caught_are_narrow(caught):
-            return True
-        if kind == "already-reported" and reason:
-            return True
-    return False
-
-
-def _bootstrap_spans(tree: ast.AST) -> list:
-    """返回 ``_diag`` 导入回退块的 ``(start, end)`` 行区间。
-
-    该块（在 ``_diag`` 尚未可用时定义 ``log_degraded`` / ``log_data_loss``）
-    **不可能**调用尚未定义的自己，因此整块豁免 —— 包括兜底实现内部的自身防御
-    （它同样必须"永不抛"，无法把异常交给一个还不存在的上报函数）。区间**之外**
-    的一切仍须上报或重抛。
-    """
-    spans = []
-    for node in ast.walk(tree):
-        if isinstance(node, ast.ExceptHandler) and _defines_diag(node):
-            end = max((getattr(s, "end_lineno", None) or s.lineno) for s in node.body)
-            spans.append((node.lineno, end))
-    return spans
-
-
-def _in_bootstrap(lineno: int, spans: list) -> bool:
-    """行号是否落在某个引导区间内。"""
-    return any(start <= lineno <= end for start, end in spans)
-
-
-# ---------------------------------------------------------------------------
-# 已知边界（**接受为不检测** —— 需刻意构造才可绕过，语义级检测复杂度远超收益）
-#   - 运行时拼串绕过"提及即拦"：``"{a}{b}".format(a="sup", b="press")`` /
-#     ``"%s%s" % ("sup", "press")`` / ``"".join(["sup", "press"])`` —— 运行时才产生
-#     "suppress"，源码里**不含任何 suppress 字面量**。（**纯字面量**的 ``'sup'+'press'``
-#     已由 ``_fold_str_constants`` 折叠后拦下；只有掺入变量/调用的**动态**拼串才落到
-#     这条边界。）
-#   - 自定义上下文管理器吞异常：``with MyCtx(): ...`` 且 ``MyCtx.__exit__`` 返回
-#     ``True`` —— 既无 ``suppress`` 字面、又无 ``ExceptHandler`` 节点；要检测得做
-#     ``__exit__`` 返回值的语义分析，且必须**自己写一个类**才能造出来。
-# 两条都需**刻意构造**（不是顺手写法），故**不检测**；记录在此，以免误以为护栏全覆盖。
-# ---------------------------------------------------------------------------
-
-
-def _fold_str_constants(node: ast.AST):
-    """对**纯字符串字面量**表达式做常量折叠 → ``str``；含非字面量则返回 ``None``。
-
-    Python 解析期已把隐式拼接 ``'sup' 'press'`` 折成单个 ``Constant``；本函数额外
-    处理显式 ``BinOp(Add)``（``'sup'+'press'``），并**递归**到多级嵌套
-    （``'sup'+'pr'+'ess'``）。只要有一侧不是字面量（变量 / 调用 / 非 ``Add``）→ 返回
-    ``None``：**不猜**，避免把动态拼串误判为命中。
-    """
-    if isinstance(node, ast.Constant) and isinstance(node.value, str):
-        return node.value
-    if isinstance(node, ast.BinOp) and isinstance(node.op, ast.Add):
-        left = _fold_str_constants(node.left)
-        right = _fold_str_constants(node.right)
-        if left is not None and right is not None:
-            return left + right
-    return None
-
-
-def _suppress_mentions(tree: ast.AST, lines: list) -> list:
-    """**提及即拦**：模块里凡出现 ``suppress`` 的行都判违规（除非带标记）。
-
-    ``contextlib.suppress`` 静默吞异常却**没有 ExceptHandler 节点**，是护栏的
-    盲区。按"形状"匹配（``with contextlib.suppress(...)``）会被任何一次间接绕过：
-    ``getattr(contextlib, 'suppress')`` / ``functools.partial(contextlib.suppress,
-    ...)`` / 本地别名 ``sup = contextlib.suppress`` / 包装名 ``mysuppress`` ——
-    但它们**最终都得写出 ``suppress`` 这个名字或这个字符串**。所以扫所有
-    ``Name`` / ``Attribute`` / ``Constant(str)`` / ``ImportFrom`` 名中含
-    ``suppress``（不区分大小写）者，命中即违规，除非该行带已知种类的
-    ``# silent-ok:`` 标记。
-
-    对**字符串常量**再做**常量折叠**：``getattr(contextlib, 'sup'+'press')`` 用
-    ``BinOp(Add)`` 拼出的字符串此前能溜过（只匹配单个常量），折叠后即命中；隐式
-    拼接 ``'sup' 'press'`` 解析期本就折成单个 ``Constant``，同样命中。纯字面量才
-    折叠；动态拼串见文件头"已知边界"。误报可接受：真要用就显式加标记并写理由。
-    """
-    out = set()
-    for node in ast.walk(tree):
-        hit = False
-        if isinstance(node, ast.Name):
-            hit = "suppress" in node.id.lower()
-        elif isinstance(node, ast.Attribute):
-            hit = "suppress" in node.attr.lower()
-        elif isinstance(node, (ast.Constant, ast.BinOp)):
-            # Constant(str)：专治 ``getattr(contextlib, 'suppress')``；
-            # BinOp：常量折叠后专治 ``'sup'+'press'``（含多级嵌套）。
-            folded = _fold_str_constants(node)
-            hit = folded is not None and "suppress" in folded.lower()
-        elif isinstance(node, ast.ImportFrom):
-            # 按**原始名**或别名任一含 suppress 即命中（``suppress as _sup`` 也算）。
-            hit = any("suppress" in a.name.lower()
-                      or (a.asname is not None and "suppress" in a.asname.lower())
-                      for a in node.names)
-        if hit and not (1 <= node.lineno <= len(lines)
-                        and _line_has_known_marker(lines[node.lineno - 1])):
-            out.add(node.lineno)
-    return sorted(out)
-
-
-def _violations(source: str, *, filename: str = "") -> list:
-    """返回"静默吞异常"的行号列表（空 = 合规）。
-
-    ``filename``（模块名，如 ``"_diag.py"``）落在 ``_SELF_EXEMPT_MODULES`` 时**整块
-    豁免**（两个检查都豁免，理由见该常量注释）—— 由**命名常量**驱动，显式可审计。
-
-    其余豁免四种：① ``_diag`` 导入回退引导块（整块）；② **标记驱动**的豁免，按标记
-    **种类**判：``value-fallback`` 仅当捕获集合全为**窄类型**（按真实类继承关系判定，
-    子类同样豁免）或**控制流型**（``queue.Empty`` 等）时豁免，``already-reported``
-    （任意类型，含宽 ``Exception``，**理由须非空**）表示"内层已记录、此处再记即双重
-    计数"；未知种类不豁免；③ **直接语句**里的 ``raise``（任意形态：``raise`` /
-    ``raise e`` / ``raise X() from e``，异常继续向上传播）；④ **直接语句**里的
-    ``log_degraded`` / ``log_data_loss`` 调用（含 ``return log_degraded(...)``）。
-    大前提是**判结构位置**而非"出现过"：``if False: raise`` / 嵌套 ``def h():
-    raise`` / ``if False: log_degraded`` 都不算。
-    此外 ``suppress`` 无 ExceptHandler 节点，改由"提及即拦"单独扫。
-    """
-    lines = source.splitlines()
-    tree = ast.parse(source)
-    # _diag.py 是 log_degraded 的实现本身：整块豁免（两个检查）。由 _SELF_EXEMPT_MODULES
-    # 这个**命名常量**驱动 —— 不是"扫到某字符串就 continue"的无声形式。
-    if Path(filename).name in _SELF_EXEMPT_MODULES:
-        return []
-    spans = _bootstrap_spans(tree)
-    out = []
-    for node in ast.walk(tree):
-        if not isinstance(node, ast.ExceptHandler):
-            continue
-        if _in_bootstrap(node.lineno, spans):
-            continue
-        if _direct_diag_call(node) or _direct_reraise(node):
-            continue
-        caught = _caught_names(node)
-        if _handler_marker_verdict(node, lines, caught):
-            continue
-        out.append(node.lineno)
-    out.extend(_suppress_mentions(tree, lines))
-    return sorted(set(out))
+def _silent_ok_audit_is_the_same_judge() -> bool:
+    """**同一份判定**的自证：本文件的 ``_violations`` 就是共享模块的那个函数。"""
+    return _violations is _rules.violations
 
 
 def test_guard_helper_flags_a_synthetic_silent_swallow():

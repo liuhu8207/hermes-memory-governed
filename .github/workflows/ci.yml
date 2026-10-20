@@ -6,8 +6,35 @@ on:
   pull_request:
 
 jobs:
+  # -------------------------------------------------------------------------
+  # 静默吞异常护栏：独立 job，**零依赖**（只用标准库），20 秒内出结果。
+  #
+  # 为什么独立成一个 job：这套护栏此前**只活在 pytest 里**，另有
+  # ``scripts/silent_ok_audit.py`` 这个命令行审计器却**没有任何调用方** ——
+  # 没人跑的检查等于不存在（棘轮曾整轮红着没人发现）。现在它是 CI 的**第一道
+  # 闸门**，``test`` job 用 ``needs`` 显式依赖它：审计红了就根本跑不到测试。
+  #
+  # 判定逻辑不在脚本里另写一份：``guardrail_rules.py`` 与 pytest 闸门共用
+  # （改一次两边同步）。``--check`` 非零即本 job 红。
+  # -------------------------------------------------------------------------
+  guardrail:
+    name: "guardrail · silent-ok audit"
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+
+      - name: Audit "# silent-ok:" exemptions (blocking)
+        run: python scripts/silent_ok_audit.py --check
+
   test:
     name: "py${{ matrix.python-version }} · ${{ matrix.name }}"
+    needs: guardrail
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
