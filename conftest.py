@@ -17,8 +17,20 @@ hermes``）—— 也就是说"一个测试会话指向生产存储"**不需要�
 
 规则
 ----
-* ``HERMES_HOME`` 已设且**不是**生产目录 ⇒ 尊重它（运维显式指定的隔离目录）。
-* ``HERMES_HOME`` 未设，或**就是**生产目录 ⇒ 换成一个仓库外的临时目录。
+* ``HERMES_HOME`` 已设且**不落在**生产目录之内 ⇒ 尊重它（运维显式指定的隔离目录）。
+* ``HERMES_HOME`` 未设，或**落在生产目录之内**（含恰好相等、子目录、尾部分隔符、
+  大小写不同的写法）⇒ 换成一个仓库外的临时目录。
+
+判定为什么必须是"落在之内"而不是"相等"
+--------------------------------------
+用"相等"判定时，``HERMES_HOME`` = 生产目录的**任意一个子目录**（例如
+``%LOCALAPPDATA%/hermes/memory``）会被判成"不是生产" ⇒ 不重定向 ⇒ 整个 pytest
+会话仍然**在生产目录之内**读写 —— 隔离形同虚设（QA 复评实测出来的漏洞）。
+
+而且"相等"这个口径曾经是**两份**：本文件一份、``scripts/hermes_env.py`` 一份。
+两道防线用同一个错口径，就不是互补而是**同漏**。所以这里不再自己实现路径比较，
+而是 import ``scripts/hermes_env.py`` 复用它的 :func:`is_production_home` ——
+判定逻辑**单一实现**，改一次两道防线同时生效。
 
 为什么放在 conftest 而不是某个测试模块里
 --------------------------------------
@@ -29,24 +41,52 @@ hermes``）—— 也就是说"一个测试会话指向生产存储"**不需要�
 
 from __future__ import annotations
 
+import importlib.util
 import os
+import sys
 import tempfile
 from pathlib import Path
 
+_REPO_ROOT = Path(__file__).resolve().parent
+_HERMES_ENV_SCRIPT = _REPO_ROOT / "scripts" / "hermes_env.py"
+
+
+def _load_hermes_env():
+    """按路径加载 ``scripts/hermes_env.py``（它不是包，只能按文件加载）。
+
+    加载它是**刻意**的：conftest 与 ``bootstrap()`` 是两道防线，判定"是不是生产
+    存储"的口径必须只有一份实现 —— 否则它们会以**同一种方式**漏（见模块文档）。
+    ``hermes_env`` 在 import 期**不碰文件系统**（只定义函数与 logger），所以在
+    conftest 的导入期加载它是安全的。
+    """
+    spec = importlib.util.spec_from_file_location(
+        "hermes_env_for_conftest", _HERMES_ENV_SCRIPT)
+    if spec is None or spec.loader is None:
+        raise RuntimeError(
+            "conftest 依赖 %s 判定生产存储，加载失败 ⇒ 拒绝继续（宁可炸在导入期，"
+            "也不能在没有隔离判定的情况下跑测试）" % _HERMES_ENV_SCRIPT)
+    module = importlib.util.module_from_spec(spec)
+    # 登记进 sys.modules：``@dataclass`` 会按 ``cls.__module__`` 回去找模块。
+    sys.modules[spec.name] = module
+    spec.loader.exec_module(module)
+    return module
+
+
+_hermes_env = _load_hermes_env()
+
 
 def _production_home() -> Path:
-    """平台默认的生产 home（与 ``scripts/hermes_env.py`` 同规则）。"""
-    base = os.environ.get("LOCALAPPDATA") or str(Path.home())
-    return Path(base) / "hermes"
-
-
-def _normalize(path: Path) -> str:
-    """路径归一化（用于比较两个路径是不是同一个）。"""
-    return os.path.normcase(os.path.abspath(os.path.expanduser(str(path))))
+    """平台默认的生产 home（单一实现：``scripts/hermes_env.py``）。"""
+    return _hermes_env.production_home()
 
 
 def _is_production_home(raw: str) -> bool:
-    return _normalize(Path(raw)) == _normalize(_production_home())
+    """``raw`` 是否**落在生产目录之内**（含与它相等）。
+
+    判定口径必须是"落在之内"：``HERMES_HOME`` 指到生产目录的**子目录**时，"相等"
+    会判成"不是生产" ⇒ 不重定向 ⇒ pytest 会话仍在生产目录之内读写。
+    """
+    return _hermes_env.is_production_home(Path(raw))
 
 
 #: 会话开始时 ``HERMES_HOME`` 的原值。

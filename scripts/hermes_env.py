@@ -131,8 +131,26 @@ def production_home() -> Path:
 
 
 def is_production_home(path: Path) -> bool:
-    """``path`` 是否就是平台默认的生产 home。"""
-    return _normalize(path) == _normalize(production_home())
+    """``path`` 是否**落在**平台默认的生产 home **之内**（含与它相等）。
+
+    判定口径是"落在之内"而不是"相等"：``HERMES_HOME`` = 生产目录的**子目录**
+    （如 ``%LOCALAPPDATA%/hermes/memory``）时，"相等"会判成"不是生产" ⇒ 放行 ⇒
+    进程仍然**在生产目录之内**读写。测试会话的两道防线（``conftest.py`` 的导入期
+    重定向、``bootstrap()`` 的严格模式拒绝）**共用这一个函数**，正是为了避免
+    "两道防线以同一种方式漏"。
+
+    影响面（改动前后逐条对比，只有前两项是行为变化）：
+
+    * **严格模式**（pytest / ``HGM_STRICT_ISOLATION=1``）+ 未 opt-in：子目录
+      **以前放行、现在拒绝** —— 这就是要修的漏洞，也正是 pytest 会话撞上的形态。
+    * **非严格进程**：子目录**以前静默放行、现在多打一条 WARNING**。不阻断、不改
+      解析结果 —— cron / 运维脚本照常跑。
+    * **已显式 opt-in**（``HGM_ALLOW_PRODUCTION=1`` / ``allow_production=True``）：
+      ``bootstrap()`` 走的是 ``if strict and not allow`` ⇒ ``allow`` 为真时**根本
+      不看本函数的结论** ⇒ 授权放行路径**不受影响**。
+    * 恰好等于生产 home：与改动前完全一致（本来就 True）。
+    """
+    return _is_within(path, production_home())
 
 
 def production_allowed(allow_production: Optional[bool] = None) -> bool:
