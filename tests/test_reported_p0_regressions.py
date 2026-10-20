@@ -87,7 +87,11 @@ class TestCjkNotesSurviveTheRerankBudget:
         kb.search("飞牛 NAS 硬件配置", top_k=10)
 
         assert fake.submitted, "reranker 没被调用"
-        assert any("飞牛" in t for t in fake.submitted), (
+        # ⚠️ submitted 记的是**完整**列表；截断发生在 scores 内部的
+        # ``texts[:top_n]``。只断言完整列表会让坏实现同样通过（复评指出
+        # 这是一条假见证）。必须只看真正进入预算窗口的那一段。
+        window = fake.submitted[:cfg.reranking.top_n]
+        assert any("飞牛" in t for t in window), (
             "进入 reranker 预算窗口的前 %d 条里没有最相关的候选"
             % cfg.reranking.top_n)
 
@@ -115,6 +119,29 @@ class TestRebuildHonoursTombstones:
 
         assert facts == [], "被撤回的事实又被重建带回来了"
         assert stats.get("tombstone") == 1, "丢弃必须可数，不能静默"
+
+    def test_no_gate_does_not_disable_the_tombstone_gate(self, tmp_path,
+                                                          monkeypatch):
+        """``--no-gate`` 只能关质量/密钥门，不能复活已撤回的事实。"""
+        sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent.parent
+                               / "scripts"))
+        import l2_rebuild as rebuild
+        from plugin.memory_governed import _lifecycle as life
+
+        sentence = "生产数据库的备份目录是 /srv/backups/db，每天凌晨执行"
+        monkeypatch.setattr(rebuild, "MEMORY_DIR", tmp_path)
+        (tmp_path / "l2_tombstones.json").write_text(
+            json.dumps({life.content_fp(sentence): {
+                "ts": "2026-10-20T10:00:00", "reason": "test-retract",
+                "content": sentence}}),
+            encoding="utf-8")
+
+        facts, stats = rebuild.extract_facts(
+            [{"role": "user", "content": sentence, "timestamp": 0}],
+            gate=False)
+
+        assert facts == [], "--no-gate 复活了被撤回的事实"
+        assert stats.get("tombstone") == 1
 
     def test_the_control_still_extracts_without_the_gate(self, tmp_path,
                                                         monkeypatch):

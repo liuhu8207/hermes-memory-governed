@@ -2972,6 +2972,7 @@ _TITLE_MARKERS = [
     ("共享记忆", "meta", False),
     ("记忆系统", "meta", False),
     ("重启验证", "meta", False),
+    ("默认模型", "meta", False),
     ("支持规格", "reference", False),
     ("配套规格", "reference", False),
     ("端点能力", "reference", False),

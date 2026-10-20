@@ -42,6 +42,7 @@ a non-zero exit here means "the guard fired", not "the script is broken".
 | `l2_capacity.py` | the pre-delete table backup fails | none — fix the backup target |
 | `l2_capacity.py` | there is no usage data at all; without it eviction degrades to "delete the oldest", which has removed a fact that had been recalled | none — let recall populate `l2_usage.db` |
 | `redact_l3_archive.py` | never refuses, but keeps only the newest `--keep-backups` (default 3) pre-redaction copies | `--keep-backups N` (minimum 1) |
+| `l2_rebuild.py` | **never** lets `--no-gate` bypass the tombstone gate. `--no-gate` turns off only the quality and secret gates; a sentence that was explicitly retracted stays retracted. | none — tombstoned facts cannot be rebuilt |
 
 A pre-redaction backup is a **full plaintext copy of L3**. It is a real restore
 point and must exist before an update, but it must not accumulate — that is why

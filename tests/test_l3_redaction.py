@@ -36,6 +36,9 @@ def test_policy_prose_is_not_mistaken_for_a_credential():
         "口令：请设置为复杂口令",
         "password: min 12 chars",
         "password: at least 12 characters",
+        "token: settings.api_key",
+        "口令：见内部 wiki",
+        "password: see vault",
     ):
         assert redact_for_archive(text) == text
 

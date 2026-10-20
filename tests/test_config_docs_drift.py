@@ -127,6 +127,8 @@ class TestDocDefaultsMatchCode:
         "## Sync Config": "SyncConfig",
         "## Knowledge Base Config (`kb`)": "KnowledgeConfig",
         "## Reranking Config": "RerankingConfig",
+        "## Synthesis Config": "SynthesisConfig",
+        "## ASR Config": "AsrConfig",
     }
 
     @pytest.mark.parametrize("heading,cls_name", sorted(SECTIONS.items()))

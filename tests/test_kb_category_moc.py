@@ -245,6 +245,28 @@ class TestCategoryFiltersRetrieval:
         note = [n for n in kb._iter_notes() if n.title == "某篇无关笔记"][0]
         assert "tooling" in note.short_text.lower()
 
+    def test_borderline_relevant_score_survives_the_floor(self, kb):
+        """0.0488 的相关命中曾被 0.05 门槛筛掉，导致同一查询时有时无。
+
+        部署门槛调到 0.04：无关带 <=0.027 仍被挡住，边界命中保留。
+        """
+        kb._config.reranking.enabled = True
+        kb._config.kb.rerank_min_score = 0.04
+        kb.add("NAS 内存 存储 扩展", "nas 内存 存储", category="environment")
+        kb.add("无关笔记", "完全不同的话题", category="meta")
+
+        class _R:
+            available = True
+
+            def scores(self, query, texts, top_n=None):
+                return {i: (0.0488 if "NAS 内存" in t else 0.01)
+                        for i, t in enumerate(texts)}
+
+        kb._get_reranker = lambda: _R()  # type: ignore[assignment]
+        hits = kb.search("NAS 内存 存储 扩展", top_k=5)
+        assert any(h["title"] == "NAS 内存 存储 扩展" for h in hits), (
+            "边界命中被 0.04 门槛筛掉了")
+
     def test_section_filter_is_not_bypassed_by_the_semantic_channel(self, kb):
         """回归：过滤必须作用在**两路并集**上，不只关键词候选。
 

@@ -198,7 +198,7 @@ def parse_frontmatter(text: str) -> Tuple[Dict[str, Any], str]:
 KB_CATEGORIES = [
     "environment",   # 机器/网络/系统环境事实（本机、NAS、服务器、隧道）
     "user",          # 用户画像与偏好（城市、硬件倾向、工作流习惯）
-    "tooling",       # 工具与服务的配置、选型、排障（Hermes、dsh、browser-skill）
+    "tooling",       # 工具与服务的配置、排障（选型属于 reference）
     "workflow",      # 流程与方法（怎么做事、步骤、约定）
     "reference",     # 外部资料与规格（API 端点能力、硬件规格表）
     "project",       # 具体项目的状态与决策
@@ -263,6 +263,7 @@ _TITLE_MARKERS: List[Tuple[str, str, bool]] = [
     ("共享记忆", "meta", False),
     ("记忆系统", "meta", False),
     ("重启验证", "meta", False),
+    ("默认模型", "meta", False),
     ("支持规格", "reference", False),
     ("配套规格", "reference", False),
     ("端点能力", "reference", False),

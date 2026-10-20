@@ -532,16 +532,38 @@ class KBIndex:
                 # KnowledgeBase.sync_index()（会发现索引为空 → 全量补齐）。
                 if "mtime" not in [f.name for f in self._store.schema]:
                     # 迁移前先**留一份旧表**：直接 drop 之后若 embedding 失败，
-                    # 索引会变成 0 行且无处可退（实测「老 schema + embedding
-                    # 故障」→ drop 后重建全败，kb_index 无任何备份）。
-                    # 重命名成带时间戳的备份表，失败就抛给外层 fail-closed，
-                    # 绝不先删再试。
+                    # 索引会变成 0 行且无处可退。
+                    #
+                    # 注意：不能用 ``db.rename_table`` —— LanceDB OSS 明确
+                    # 不支持（``not supported: rename_table is not supported
+                    # in LanceDB OSS``，0.38 实测）。用它会让迁移永远失败、
+                    # 语义通道永久不可用，而且错误看起来像 embedding 坏了。
+                    # 这里直接复制表目录（``kb_notes.lance``）做备份，再 drop
+                    # 旧表；复制失败就抛错，绝不先删后试。
+                    import shutil
+
                     backup_name = "%s.bak_%s" % (
                         _TABLE_NAME, time.strftime("%Y%m%d_%H%M%S"))
-                    logger.info("kb index schema lacks 'mtime' — "
-                                "preserving it as %s and rebuilding",
-                                backup_name)
-                    db.rename_table(_TABLE_NAME, backup_name)
+                    src_dir = self._db_path / (_TABLE_NAME + ".lance")
+                    dst_dir = self._db_path / (backup_name + ".lance")
+                    try:
+                        if not src_dir.is_dir():
+                            raise RuntimeError(
+                                "table directory %s not found" % src_dir)
+                        shutil.copytree(src_dir, dst_dir)
+                        logger.info("kb index schema lacks 'mtime' — "
+                                    "copied it to %s and rebuilding",
+                                    dst_dir.name)
+                        db.drop_table(_TABLE_NAME)
+                    except Exception as e:  # noqa: BLE001 — 失败要归因到迁移
+                        self._last_error = (
+                            "kb index schema migration failed: "
+                            + _safe_str(e))
+                        log_degraded("kb_index", "schema_migration_failed",
+                                     detail=str(dst_dir), exc=e)
+                        self._store = None
+                        self._available = False
+                        return
                     self._store = None
             if self._store is None:
                 dim = int(getattr(self._service, "dim", 0) or self._config.vector.dim)
@@ -1601,10 +1623,33 @@ class KnowledgeBase:
                     # ``kb-search "飞牛 NAS 硬件配置"`` 不返回该笔记）。
                     # 用两条通道的加权初筛分排序，让最可能相关的候选进入
                     # reranker 的预算窗口。
+                    # 预排序必须与**最终融合方式**一致：配置走 RRF 时，
+                    # 窗口却按线性加权挑候选，会出现「按最终尺子该进前 10
+                    # 的没进窗口」。复评标为未复现的推断风险，这里直接对齐。
+                    pre_fusion = str(
+                        getattr(kb_cfg, "fusion", "linear") or ""
+                    ).strip().lower()
+                    if pre_fusion != "rrf":
+                        pre_fusion = "linear"
+                    pre_kw = _KB_KW_WEIGHT if keyword_on else 0.0
+                    pre_sem = _KB_SEM_WEIGHT if semantic_on else 0.0
+                    pre_total = pre_kw + pre_sem
+                    if pre_total > 0.0:
+                        pre_kw /= pre_total
+                        pre_sem /= pre_total
+                    pre_fused = (
+                        _rrf_fuse(kw_norm, sem_norm, pre_kw, pre_sem)
+                        if pre_fusion == "rrf" else {}
+                    )
+
                     def _pre_rank(rel: str) -> Tuple[float, str]:
-                        return (-(_KB_KW_WEIGHT * kw_norm.get(rel, 0.0)
-                                  + _KB_SEM_WEIGHT * sem_norm.get(rel, 0.0)),
-                                rel)
+                        if pre_fusion == "rrf":
+                            score = float(
+                                (pre_fused.get(rel) or {}).get("rrf", 0.0))
+                        else:
+                            score = (pre_kw * kw_norm.get(rel, 0.0)
+                                     + pre_sem * sem_norm.get(rel, 0.0))
+                        return (-score, rel)
 
                     rels = sorted(candidates, key=_pre_rank)
                     texts = [

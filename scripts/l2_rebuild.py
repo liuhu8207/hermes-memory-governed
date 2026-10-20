@@ -191,9 +191,13 @@ def extract_facts(messages: list[dict[str, Any]], *,
     # 重跑一遍。写入路径会拒绝被 retract 过的句子，回灌路径此前**没有这道门**
     # —— 于是重建会把明确撤回的事实原样带回来，墓碑形同虚设（2026-10-20
     # 端到端实测确认）。这里在抽取阶段就查，与写入门是同一张表、同一个判据。
+    # ⚠️ 墓碑门**不受 --no-gate 影响**：``--no-gate`` 是给排查用的
+    # 「关掉质量/密钥门」开关，而墓碑记录的是「这句话被明确撤回」这一事实。
+    # 让它跟着一起关掉，就等于提供一个能复活已撤回事实的后门（2026-10-20
+    # 复评实测 RESURRECTED=True）。
     tombstones = (
         _life.load_tombstones(MEMORY_DIR)
-        if gate and _life is not None else {}
+        if _life is not None else {}
     )
     for msg in messages:
         content = msg.get("content", "")
@@ -217,11 +221,13 @@ def extract_facts(messages: list[dict[str, Any]], *,
                 if names:
                     stats[f"secret:{'+'.join(names)}"] += 1
                     continue
-                if tombstones and _life.is_tombstoned(sentence, tombstones):
-                    # 不静默丢：被墓碑挡下的条数要可数、可报，否则「重建
-                    # 后少了几条」和「本来就没有」看起来一模一样。
-                    stats["tombstone"] += 1
-                    continue
+            if tombstones and _life is not None and \
+                    _life.is_tombstoned(sentence, tombstones):
+                # 不静默丢：被墓碑挡下的条数要可数、可报，否则「重建
+                # 后少了几条」和「本来就没有」看起来一模一样。
+                # 位置在 ``if gate`` **之外** —— 见上方说明。
+                stats["tombstone"] += 1
+                continue
             facts.append({
                 "content": sentence,
                 "category": "rebuild",
