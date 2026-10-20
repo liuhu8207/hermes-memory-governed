@@ -31,6 +31,28 @@ hermes cron add --name health-report \
   --no-agent
 ```
 
+## Destructive Maintenance — Safety Gates
+
+These scripts delete or rewrite data. Each one refuses rather than guessing, so
+a non-zero exit here means "the guard fired", not "the script is broken".
+
+| Script | Refuses when | Override |
+|--------|--------------|----------|
+| `kb_reindex.py` | the vault scans as empty (usually a mount or `wiki_dir` problem) — syncing would clear every index row | `--allow-empty` |
+| `l2_capacity.py` | the pre-delete table backup fails | none — fix the backup target |
+| `l2_capacity.py` | there is no usage data at all; without it eviction degrades to "delete the oldest", which has removed a fact that had been recalled | none — let recall populate `l2_usage.db` |
+| `redact_l3_archive.py` | never refuses, but keeps only the newest `--keep-backups` (default 3) pre-redaction copies | `--keep-backups N` (minimum 1) |
+
+A pre-redaction backup is a **full plaintext copy of L3**. It is a real restore
+point and must exist before an update, but it must not accumulate — that is why
+retention is on by default.
+
+```bash
+python scripts/kb_reindex.py --dry-run          # show what would sync
+python scripts/l2_capacity.py --dry-run         # show rows and overage
+python scripts/redact_l3_archive.py --dry-run   # show how many rows would change
+```
+
 ## Health Check
 
 ```bash
