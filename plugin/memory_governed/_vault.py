@@ -433,6 +433,26 @@ def infer_category(title: str, tags: Any, concepts: Any = None,
     return scores[0][3] if scores else ""
 
 
+def write_text_atomic(path: Path, text: str) -> None:
+    """原子写纯文本（temp + os.replace）。
+
+    派生视图（如 ``index.md``）也会被多个 agent 同时重建；直接
+    ``write_text`` 在写入中途崩溃时会让读者看到半张导航表。
+    """
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp = tempfile.mkstemp(dir=str(path.parent), suffix=".tmp")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            f.write(text)
+        os.replace(tmp, path)
+    except BaseException:
+        try:
+            os.unlink(tmp)
+        except OSError:  # silent-ok: value-fallback — 临时文件善后不掩盖原异常
+            pass
+        raise
+
+
 def write_note(path: Path, meta: Dict[str, Any], body: str) -> None:
     """原子写一篇笔记（temp + os.replace），frontmatter 在前。"""
     path.parent.mkdir(parents=True, exist_ok=True)

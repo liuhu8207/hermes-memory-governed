@@ -3598,8 +3598,11 @@ def cmd_kb_moc(config: dict) -> dict:
 
     index_path = vault / "index.md"
     try:
-        index_path.write_text("\n".join(lines).rstrip() + "\n",
-                              encoding="utf-8")
+        text = "\n".join(lines).rstrip() + "\n"
+        fd, tmp = tempfile.mkstemp(dir=str(index_path.parent), suffix=".tmp")
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            f.write(text)
+        os.replace(tmp, index_path)
     except OSError as e:
         return _refusal(f"cannot write index.md: {type(e).__name__}: {e}")
 

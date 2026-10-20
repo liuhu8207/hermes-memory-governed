@@ -2485,8 +2485,8 @@ class KnowledgeBase:
 
         index_path = self._vault / _vault._INDEX_FILENAME
         try:
-            index_path.write_text("\n".join(lines).rstrip() + "\n",
-                                  encoding="utf-8")
+            _vault.write_text_atomic(
+                index_path, "\n".join(lines).rstrip() + "\n")
         except OSError as e:  # silent-ok: already-reported — 失败进返回值的 errors，调用方读得到
             # _safe_str 而非 %s：异常对象的 __str__ 本身可能抛，那会把一次
             # 优雅降级变成崩溃（tests/test_no_eager_exception_format.py 钉住）。
