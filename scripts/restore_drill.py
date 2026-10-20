@@ -24,16 +24,26 @@ import sys
 import tempfile
 import time
 from pathlib import Path
-from typing import Any
+from typing import Any, Optional
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 sys.path.insert(0, str(SCRIPT_DIR))
 # 让 ``plugin.*`` 可导入（读取 wiki_dir、定位 vault 备份）
 sys.path.insert(0, str(SCRIPT_DIR.parent))
 
-from hermes_env import bootstrap, env_path
+from hermes_env import bootstrap, env_path, setup_logging
 
 HERMES_HOME = bootstrap(__file__)
+
+logger = setup_logging("restore_drill")
+
+try:  # 软依赖：脚本也要能在仓库安装之外运行
+    from plugin.memory_governed._diag import log_degraded
+except ImportError:  # silent-ok: value-fallback — 插件不在 sys.path 上 → 退回普通 logging
+    def log_degraded(component: str, reason: str, *, detail: str = "",
+                     exc: "Optional[BaseException]" = None) -> None:
+        logger.warning("degraded — %s: %s | %s | %s",
+                       component, reason, detail, exc)
 MEMORY_DIR = env_path("HERMES_MEMORY_DIR", HERMES_HOME / "memory")
 
 
@@ -96,14 +106,87 @@ def _pick_vault(name: str):
     return _latest([p for p in wiki.glob(".kb-backups-*") if p.is_dir()])
 
 
+def _kb_index_table(path: Path):
+    """打开候选索引的表；打不开返回 ``None``（= 不可用）。"""
+    try:
+        import lancedb
+        name = path.name[:-len(".lance")] if path.name.endswith(".lance") else path.name
+        return lancedb.connect(str(path.parent)).open_table(name)
+    except Exception as exc:  # noqa: BLE001 — 候选打不开就当不可用（不是故障）
+        log_degraded("restore_drill", "kb_index_candidate_unreadable",
+                     detail=str(path), exc=exc)
+        return None
+
+
+def _kb_index_rows(path: Path) -> int:
+    """候选索引的行数；读不出来返回 -1（不可用）。"""
+    table = _kb_index_table(path)
+    if table is None:
+        return -1
+    try:
+        return int(table.count_rows())
+    except Exception as exc:  # noqa: BLE001
+        log_degraded("restore_drill", "kb_index_candidate_unreadable",
+                     detail=str(path), exc=exc)
+        return -1
+
+
+def _kb_index_paired_with_vault(path: Path, vault: Path) -> bool:
+    """候选索引与当前 vault 是否**配对**（至少有一行的文件在 vault 里真实存在）。"""
+    table = _kb_index_table(path)
+    if table is None:
+        return False
+    try:
+        n = int(table.count_rows())
+        if n <= 0:
+            return False
+        for row in table.search().limit(n).to_arrow().to_pylist():
+            rel = str(row.get("path") or "")
+            if rel and (vault / rel).is_file():
+                return True
+    except Exception as exc:  # noqa: BLE001
+        log_degraded("restore_drill", "kb_index_candidate_unreadable",
+                     detail=str(path), exc=exc)
+    return False
+
+
 def _pick_kb_index(name: str):
+    """挑一个**校验过**的索引备份。
+
+    候选必须**通过校验**再用：只按 mtime 取"最新"会选中事故残留的 1 行残表
+    （内容是测试夹具），恢复演练于是报 ``index rows=1`` —— 那是**误导**，不是恢复。
+    校验两条：① 行数 > 0；② 与当前 vault **配对**（至少有一行的文件在 vault 里
+    真实存在）。多个候选时取**行数多**的，行数相同再比新鲜度。
+
+    候选集合同时包含 ``kb_notes.old*``：那是换表时留下的旧表副本，不匹配
+    ``bak_*`` ⇒ 以前的清理 glob 永远碰不到它 ⇒ 会永久残留。
+    """
     root = MEMORY_DIR / "kb_index"
     if not root.is_dir():
         return None
     if name and name != "latest":
         candidate = root / name
         return candidate if candidate.is_dir() else None
-    return _latest(list(root.glob("kb_notes.bak_*.lance")))
+    vault = _wiki_dir()
+    candidates = [p for p in list(root.glob("kb_notes.bak_*.lance"))
+                  + list(root.glob("kb_notes.old*.lance")) if p.is_dir()]
+    scored = []
+    for path in candidates:
+        rows = _kb_index_rows(path)
+        if rows <= 0:
+            log_degraded("restore_drill", "kb_index_candidate_rejected",
+                         detail="%s (no usable row)" % path.name)
+            continue
+        if not _kb_index_paired_with_vault(path, vault):
+            log_degraded("restore_drill", "kb_index_candidate_rejected",
+                         detail="%s (not paired with vault %s)"
+                                % (path.name, vault))
+            continue
+        scored.append((rows, path.stat().st_mtime, path))
+    if not scored:
+        return None
+    scored.sort(key=lambda item: (item[0], item[1]), reverse=True)
+    return scored[0][2]
 
 
 def _count_l2(path: Path) -> dict:
