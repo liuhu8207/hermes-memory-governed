@@ -67,6 +67,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import logging
 import os
 import random
 import re
@@ -75,6 +76,8 @@ import sys
 import tempfile
 import time
 from pathlib import Path
+
+logger = logging.getLogger(__name__)
 
 DEFAULT_HERMES_HOME = r"D:/repos\hermes-home"
 VAULT_SUBDIRS = ["inbox", "notes", "projects", "areas", "resources", "archive"]
@@ -1245,6 +1248,11 @@ def _l2_enforce_capacity(table, cfg, agent: str, cap: int) -> list:
     if over <= 0:
         return []
     usage = life.usage_last_used(mem_dir)
+    if not usage:
+        # 与每日 sweep 同一条 fail-closed 规则：没有使用度数据时按时间删最旧
+        # 会删掉被召回过的事实。宁可这一轮超限，下一轮再淘汰。
+        logger.warning("容量淘汰跳过：没有使用度数据（不能按「被用过」排序）")
+        return []
 
     def _victim_key(item):
         content, stamp = item
@@ -1258,12 +1266,22 @@ def _l2_enforce_capacity(table, cfg, agent: str, cap: int) -> list:
         return []
     now = time.strftime("%Y-%m-%dT%H:%M:%S", time.localtime())
     demoted = []
+    seen_content = set()
     for content, stamp in victims:
+        if content in seen_content:
+            continue
+        seen_content.add(content)
+        # 只按 content 删会连带删掉同内容的其它行（实测 1 个受害者删 3 行）。
+        # 带上 timestamp + agent 把范围收到这一行，与每日 sweep 同判据。
+        pred = "content = " + life.sql_quote(content)
+        if stamp is not None:
+            pred += " AND timestamp = " + life.sql_quote(str(stamp))
+        pred += " AND agent = " + life.sql_quote(str(agent))
         life.archive_append(mem_dir, {
             "state": "archived", "reason": "capacity-demoted",
             "ts": now, "content": content, "agent": agent,
             "timestamp": stamp, "cap": cap})
-        table.delete("content = " + life.sql_quote(content))
+        table.delete(pred)
         demoted.append(content[:200])
     return demoted
 

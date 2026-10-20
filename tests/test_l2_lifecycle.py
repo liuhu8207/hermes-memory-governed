@@ -19,6 +19,7 @@
 from __future__ import annotations
 
 import json
+import time
 from pathlib import Path
 
 import pytest
@@ -159,11 +160,17 @@ class TestCapacity:
         _install_fake_embedding(monkeypatch)
         _set_config(store, {"sync": {"l2_max_items": 2}})
 
+        # 容量淘汰现在要求**有使用度数据**（没有数据时 fail-closed，见
+        # tests/test_cli_capacity.py）：先登记 A/B 的使用时间，再按 last_used
+        # 排序。否则「没有数据」会被当成「都没被用过」，删掉被召回过的事实。
+        life.usage_touch(_memory_dir(store), [_FACT_A])
+        time.sleep(0.02)
+        life.usage_touch(_memory_dir(store), [_FACT_B])
         cli.cmd_remember({}, _FACT_A, "dsh")
         cli.cmd_remember({}, _FACT_B, "dsh")
         out = cli.cmd_remember({}, _FACT_C, "dsh")
         assert out["ok"] is True, out
-        # 两条都没被召回过 → 平手按写入顺序，最早写的 A 先走
+        # A 的 last_used 更早 → 最早写的 A 先走
         assert len(out.get("demoted", [])) == 1
         assert out["demoted"][0].startswith("家用NAS")
 
@@ -182,6 +189,10 @@ class TestCapacity:
         pytest.importorskip("lancedb")
         _install_fake_embedding(monkeypatch)
         _set_config(store, {"sync": {"l2_max_items": 1}})
+        # 同上：先登记使用度，A 更早、B 更晚 → 挤出 A。
+        life.usage_touch(_memory_dir(store), [_FACT_A])
+        time.sleep(0.02)
+        life.usage_touch(_memory_dir(store), [_FACT_B])
         cli.cmd_remember({}, _FACT_A, "dsh")
         cli.cmd_remember({}, _FACT_B, "dsh")  # A 被挤出
         assert _FACT_A not in _table_contents(store)
