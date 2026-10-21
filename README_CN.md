@@ -223,7 +223,7 @@ LLM 归纳（与 agent 对话模型同款）
 
 其它 agent 使用的独立七工具 stdio MCP 接口见[接入说明](docs/attach-agents.md)。
 MCP 写入工具可在提供本轮对话文本时自动归档到 L3；没有记忆/知识写入的轮次，
-应调用 `hgm_sync_turn`，以保持会话归档完整。
+**外部接入 agent** 应调用 `hgm_sync_turn`，以保持会话归档完整；Hermes 自己使用进程内 `memory.provider: governed`，不调用这个 MCP。
 
 ## 模块地图
 

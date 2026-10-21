@@ -228,7 +228,7 @@ The plugin registers **11 tools** (3 memory + 8 KB):
 
 For the separate seven-tool stdio MCP interface used by other agents, see
 [Attaching another agent](docs/attach-agents.md). MCP write calls can archive
-their supplied turn text to L3; turns without a write use `hgm_sync_turn`.
+their supplied turn text to L3; **attached agents** use `hgm_sync_turn` for turns without a write. Hermes itself uses the in-process `memory.provider: governed` and does not call this MCP.
 
 ## Module map
 
