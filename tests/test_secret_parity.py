@@ -70,8 +70,8 @@ class TestTheTwoCopiesAreIdentical:
 class TestCsvCredentialShape:
     # 只用占位符，绝不出现真实凭据。
     @pytest.mark.parametrize("text", [
-        "SSH-云服务器,root,password123,ssh://192.168.1.1",
-        "SSH-NAS2,admin,password456,ssh://192.168.1.2",
+        "SSH-云服务器,root,password123,ssh://192.0.2.1",
+        "SSH-NAS2,admin,password456,ssh://192.0.2.2",
         "ssh-example,user,aaaaaaaaaaaa,ssh://host",
     ])
     def test_caught_by_both_sides(self, text):
@@ -80,14 +80,14 @@ class TestCsvCredentialShape:
 
     def test_the_bridge_names_it(self):
         names = bridge.matched_secret_patterns(
-            "SSH-云服务器,root,password123,ssh://192.168.1.1")
+            "SSH-云服务器,root,password123,ssh://192.0.2.1")
         assert "csv_credential_record" in names
 
     @pytest.mark.parametrize("text", [
         "vaultwarden 备份路径在 /vol2/1000/Docker/vaultwarden",
         "LanceDB 的 add_columns 接受 pa.Field 参数，传映射会抛 TypeError",
         "HGM 的 L2 写入门禁阈值是 strong_signal>=2",
-        "内网 SSH 免密：私钥集中在 C:/Users/lionlliu/.ssh/, 两把无口令密钥",
+        "内网 SSH 免密：私钥集中在 C:/Users/<user>/.ssh/, 两把无口令密钥",
         "公司设备 → Tailscale → 家里 NAS Vaultwarden",
     ])
     def test_no_false_positive_on_real_facts(self, text):
@@ -128,7 +128,7 @@ class TestRebuildAppliesTheGate:
             # 分隔线：短且无信息
             "------------------------------------------",
             # CSV 凭据：必须被拦
-            "SSH-云服务器,root,password123,ssh://192.168.1.1",
+            "SSH-云服务器,root,password123,ssh://192.0.2.1",
             # 像事实的句子：应当留下
             "HGM 的 L2 表 memories 新增 project 列，NULL 表示全局事实。",
         ])
@@ -142,7 +142,7 @@ class TestRebuildAppliesTheGate:
         mod = _load_script("l2_rebuild")
         if not mod._GATE_AVAILABLE:
             pytest.skip("门禁模块不可用（插件导入失败）")
-        msgs = self._msgs(["SSH-云服务器,root,password123,ssh://192.168.1.1"])
+        msgs = self._msgs(["SSH-云服务器,root,password123,ssh://192.0.2.1"])
         facts, stats = mod.extract_facts(msgs, gate=False)
         assert any("password123" in f["content"] for f in facts)
         assert stats == {}

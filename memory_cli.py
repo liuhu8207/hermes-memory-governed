@@ -1812,22 +1812,48 @@ def cmd_bench(config: dict, split: str = "dev", top_k: int = 5,
     return out
 
 
+def _load_title_map(path: str) -> dict:
+    """实体 -> 占位符映射（脱敏 gold 对着真实库跑时用）。"""
+    if not path:
+        return {}
+    data = json.loads(Path(path).read_text(encoding="utf-8"))
+    if not isinstance(data, dict):
+        raise ValueError("title map must be a JSON object")
+    return {str(k): str(v) for k, v in data.items()}
+
+
+def _map_title(text: str, mapping: dict) -> str:
+    out = str(text or "")
+    for key in sorted(mapping, key=len, reverse=True):
+        if key:
+            out = out.replace(key, mapping[key])
+    return out
+
+
 def cmd_eval(config: dict, qa_file: str = "", top_k: int = 5,
              min_hit: float = 0.0, seed: int = 0,
-             engine_kind: str = "cli") -> dict:
-    """检索评测：QA 集跑 ``recall_l2``，出 hit@k（Phase 4 验收门）。
+             engine_kind: str = "cli", path: str = "auto",
+             title_map: str = "") -> dict:
+    """检索评测：L2 事实召回或 KB 笔记检索，出 hit@k。
 
-    两种集：
+    两条路径**不是同一种评测**，必须显式区分：
 
-    * 默认 ``self-snapshot`` —— 从 L2 快照抽最多 ``EVAL_MAX_QUERIES`` 条
-      事实，问句 = 事实本身，期望 = 找回自己。这不是智力题，是**通道健康
-      检查**：任何 P0（分数换算错误、门槛错层、通道二选一退化）都会让它
-      掉下去 —— 每个阶段开关切换前后各跑一次，就是本方案的验收门。
-    * ``--qa file.json`` —— ``[{"q": ..., "expect": ...}, ...]``。
+    * ``--path l2``（默认 self-snapshot 也是它）—— QA 的 ``expect`` 是事实
+      文本，走 ``recall_l2`` / plugin RecallEngine。
+    * ``--path kb`` —— ``expect`` 是笔记标题（可为列表），走 ``cmd_kb_search``。
+    * ``--path auto`` —— 文件里 ``expect`` 是列表 ⇒ KB；否则 L2。自带的
+      ``evals/retrieval_gold.*`` 是 KB 集，不会再被误当成 L2 打出 hit@k=0。
 
-    Returns:
-        ``{ok, basis, evaluated, hit_at_k, top_k, misses, degraded?}``。
+    脱敏 gold 需要 ``--title-map``；否则占位符永远匹配不上真实标题。
     """
+    try:
+        mapping = _load_title_map(title_map)
+    except (OSError, ValueError) as e:  # silent-ok: already-reported — 错误写进 refusal
+        return _refusal("title map unreadable: %s" % _safe_exc(e))
+
+    sampled_from = None
+    snapshot_truncated = None
+    has_list_expect = False
     if qa_file:
         try:
             raw = json.loads(Path(qa_file).read_text(encoding="utf-8"))
@@ -1835,12 +1861,21 @@ def cmd_eval(config: dict, qa_file: str = "", top_k: int = 5,
             return _refusal(f"qa file unreadable: {e}")
         if not isinstance(raw, list):
             return _refusal("qa file must be a JSON list of {q, expect}")
-        qa = [{"q": str(it.get("q") or ""), "expect": str(it.get("expect") or "")}
-              for it in raw if isinstance(it, dict)]
+        qa = []
+        for it in raw:
+            if not isinstance(it, dict):
+                continue
+            expect_raw = it.get("expect")
+            if isinstance(expect_raw, list):
+                has_list_expect = True
+                expects = [str(x) for x in expect_raw if str(x).strip()]
+            elif expect_raw is None:
+                expects = []
+            else:
+                expects = [str(expect_raw)]
+            qa.append({"q": str(it.get("q") or ""), "expects": expects})
         basis = "file"
     else:
-        # cmd_snapshot 的返回值只带计数（facts 落在文件里）—— 先刷新快照，
-        # 再从快照文件读事实。两条路径（写文件 / 返回计数）本就分工如此。
         snap = cmd_snapshot(config)
         if not snap.get("ok"):
             return _refusal(f"snapshot unavailable: {snap.get('error')}")
@@ -1856,67 +1891,104 @@ def cmd_eval(config: dict, qa_file: str = "", top_k: int = 5,
             return {"ok": True, "basis": "self-snapshot", "evaluated": 0,
                     "hit_at_k": None, "top_k": top_k, "misses": [],
                     "note": "no facts to evaluate"}
-        # **随机（固定种子）抽样**，不是等距切片：快照是"最新优先且可能被截断"
-        # 的，等距取 20 条永远落在同一批上、且永远取不到最旧/最衰减的事实 ——
-        # 那样的门既不可复现也不代表全库。固定种子 = 可复现的随机。
         pool = sorted(set(facts))
         samples = (random.Random(seed).sample(pool, EVAL_MAX_QUERIES)
                    if len(pool) > EVAL_MAX_QUERIES else pool)
         sampled_from = len(pool)
         snapshot_truncated = bool(data.get("truncated"))
-        qa = [{"q": s, "expect": s} for s in samples]
+        qa = [{"q": s, "expects": [s]} for s in samples]
         basis = "self-snapshot"
+
     qa = [item for item in qa if item["q"]]
     if not qa:
         return _refusal("no usable queries (all q fields empty)")
 
+    if path == "auto":
+        eval_path = "kb" if has_list_expect else "l2"
+    else:
+        eval_path = path
+    if eval_path == "l2" and has_list_expect:
+        return _refusal(
+            "list-valued expect is a KB gold set; pass --path kb "
+            "(or --path auto) instead of measuring it as L2 facts")
+
     hits = 0
     misses = []
     degraded: list = []
-    # 引擎选择：默认 ``cli`` 是兼容路径（**看不见 ``recall.l2_fusion``**），
-    # ``--engine plugin`` 才走与实际召回同源的引擎（融合命中按 native_score
-    # 过门槛）。无论用哪条，报告里都写明 —— 上个版本的门对本次交付全盲、
-    # 却自称是它的验收门，就是因为"用哪条路"从来没被写出来过。
-    engine = None
-    engine_name = "cli-recall_l2"
-    if str(engine_kind).lower() == "plugin":
-        try:
-            engine = plugin_module("_recall").RecallEngine(plugin_config())
-            engine_name = "plugin-recall"
-        except Exception as e:  # noqa: BLE001 — 要报出来，不能静默换引擎
-            return _refusal(f"plugin engine unavailable: {type(e).__name__}: {e}",
-                            hint="omit --engine plugin to use the CLI path")
 
-    for item in qa:
-        if engine is not None:
-            got = [str(getattr(r, "content", "") or "")
-                   for r in engine.admitted_l2(item["q"], top_k)]
-        else:
-            result = recall_l2(item["q"], top_k, degraded)
-            got = [str(h.get("content") or "") for h in result.get("hits", [])]
-        if any(_eval_hit(g, item["expect"]) for g in got):
-            hits += 1
-        else:
-            misses.append({"q": item["q"][:80],
-                           "expect": item["expect"][:80]})
-    out = {"ok": True, "basis": basis, "evaluated": len(qa),
-           "hit_at_k": round(hits / len(qa), 4) if qa else None,
-           "top_k": top_k, "hits": hits, "misses": misses,
-           "engine": engine_name}
-    if basis == "self-snapshot":
-        out["sampled_from"] = sampled_from
-        out["snapshot_truncated"] = snapshot_truncated
+    if eval_path == "kb":
+        positives = [it for it in qa if it["expects"]]
+        negatives = [it for it in qa if not it["expects"]]
+        if not positives:
+            return _refusal(
+                "KB eval needs at least one positive query; this file has none")
+        for item in positives:
+            results = cmd_kb_search(config, item["q"], top_k, "", degraded)
+            got = [_map_title(str(r.get("title") or ""), mapping)
+                   for r in results]
+            expected = [_map_title(e, mapping) for e in item["expects"]]
+            if any(_eval_hit(g, e) for g in got for e in expected):
+                hits += 1
+            else:
+                misses.append({"q": item["q"][:80],
+                               "expect": expected[:3], "got": got[:top_k]})
+        false_positives = []
+        for item in negatives:
+            results = cmd_kb_search(config, item["q"], top_k, "", degraded)
+            if results:
+                false_positives.append({
+                    "q": item["q"][:80],
+                    "got": [str(r.get("title") or "")[:80]
+                            for r in results[:3]]})
+        out = {"ok": True, "basis": basis, "path": "kb",
+               "engine": "kb-search", "evaluated": len(positives),
+               "negatives": len(negatives), "hit_at_k": round(hits / len(positives), 4),
+               "top_k": top_k, "hits": hits, "misses": misses,
+               "negative_false_positive_rate": (
+                   round(len(false_positives) / len(negatives), 4)
+                   if negatives else None),
+               "negative_false_positives": false_positives,
+               "title_map_used": bool(mapping)}
+    else:
+        engine = None
+        engine_name = "cli-recall_l2"
+        if str(engine_kind).lower() == "plugin":
+            try:
+                engine = plugin_module("_recall").RecallEngine(plugin_config())
+                engine_name = "plugin-recall"
+            except Exception as e:  # noqa: BLE001 — 要报出来，不能静默换引擎
+                return _refusal(
+                    f"plugin engine unavailable: {type(e).__name__}: {e}",
+                    hint="omit --engine plugin to use the CLI path")
+        for item in qa:
+            if engine is not None:
+                got = [str(getattr(r, "content", "") or "")
+                       for r in engine.admitted_l2(item["q"], top_k)]
+            else:
+                result = recall_l2(item["q"], top_k, degraded)
+                got = [str(h.get("content") or "") for h in result.get("hits", [])]
+            if any(_eval_hit(g, e) for g in got for e in item["expects"]):
+                hits += 1
+            else:
+                misses.append({"q": item["q"][:80],
+                               "expect": item["expects"][:1]})
+        out = {"ok": True, "basis": basis, "path": "l2",
+               "evaluated": len(qa),
+               "hit_at_k": round(hits / len(qa), 4) if qa else None,
+               "top_k": top_k, "hits": hits, "misses": misses,
+               "engine": engine_name}
+        if basis == "self-snapshot":
+            out["sampled_from"] = sampled_from
+            out["snapshot_truncated"] = snapshot_truncated
+
     if degraded:
         out["degraded"] = degraded
-    # 门槛判定：没有它，hit@k 只是个数字 —— 实测它在 floor∈[0.0,0.99] 全程恒为
-    # 1.0，只有 1.01 才掉下去，等于"永远通过"的橡皮章。有了下限，
-    # ``ok:false`` 会让 CLI 以非零退出，才配叫验收门。
     if min_hit > 0.0:
         out["min_hit_at_k"] = min_hit
         if out["hit_at_k"] is None or out["hit_at_k"] < min_hit:
             out["ok"] = False
             out["error"] = (f"hit@{top_k} {out['hit_at_k']} below the required "
-                            f"{min_hit}（engine={engine_name}）")
+                            f"{min_hit}（engine={out['engine']}）")
     return out
 
 
@@ -3938,9 +4010,16 @@ def build_parser() -> argparse.ArgumentParser:
                          "this. Without a floor the number can never fail.")
     ev.add_argument("--seed", type=int, default=0,
                     help="Sampling seed for the self-QA draw (reproducible)")
+    ev.add_argument("--path", default="auto", choices=("auto", "l2", "kb"),
+                    help="What to measure: 'l2' = durable facts, 'kb' = notes. "
+                         "auto = KB when the QA file's expect is a list, "
+                         "otherwise L2.")
+    ev.add_argument("--title-map", default="",
+                    help="Entity -> placeholder JSON map for desensitised KB "
+                         "gold sets (e.g. $HERMES_HOME/evals/entity_map.json)")
     ev.add_argument("--engine", default="cli", choices=("cli", "plugin"),
-                    help="Which retrieval path to measure. 'cli' = the CLI's "
-                         "own recall_l2 (compatibility path; it does NOT follow "
+                    help="L2-only: 'cli' = the CLI's own recall_l2 "
+                         "(compatibility path; it does NOT follow "
                          "recall.l2_fusion). 'plugin' = the plugin engine the "
                          "agent actually runs, which does.")
 
@@ -4115,7 +4194,8 @@ def main():
     elif args.cmd == "eval":
         out = cmd_eval(config, args.qa, args.top_k,
                        min_hit=args.min_hit, seed=args.seed,
-                       engine_kind=args.engine)
+                       engine_kind=args.engine, path=args.path,
+                       title_map=args.title_map)
     elif args.cmd == "bench":
         out = cmd_bench(config, split=args.split, top_k=args.top_k,
                         engine_kind=args.engine)

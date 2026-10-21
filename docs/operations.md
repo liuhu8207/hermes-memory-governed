@@ -135,6 +135,17 @@ python scripts/kb_eval.py --gold evals/retrieval_gold.acceptance.json --set B \
     --baseline evals/baseline.acceptance.json
 ```
 
+`memory_cli eval` has the same split: it defaults to L2 facts and **auto-selects
+KB when the QA file's `expect` is a list**. To be explicit:
+
+```bash
+python memory_cli.py eval --qa evals/retrieval_gold.acceptance.json \
+    --path kb --title-map "$HERMES_HOME/evals/entity_map.json" --top-k 5
+```
+
+Before this split, feeding a KB gold set to `eval --qa` measured L2 facts and
+reported `hit@k = 0.0` — a false red, not a retrieval failure.
+
 The baseline form exits non-zero when a metric drops more than `--max-drop`.
 It only accepts the **acceptance** set: `--baseline` refuses a calibration or
 smoke run, and refuses a baseline file produced from a *different* set — two
