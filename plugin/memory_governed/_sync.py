@@ -32,6 +32,7 @@ from typing import Any, Dict, List, Optional, Tuple
 from ._config import GovernedMemoryConfig
 from ._diag import log_data_loss, log_degraded, record_metric
 from ._synthesize import _content_to_text
+from ._quality import admission_rejection
 
 logger = logging.getLogger(__name__)
 
@@ -1417,6 +1418,13 @@ def external_write_verdict(text: str) -> Tuple[bool, str]:
         return False, "empty"
 
     cleaned = _undecorate(raw)
+
+    # High-precision quality gate: test residue and assistant meta fragments
+    # are not durable facts. They are rejected here so the next audit does not
+    # have to clean them by hand.
+    quality_reject = admission_rejection(cleaned)
+    if quality_reject:
+        return False, quality_reject
 
     # Same content-shape checks the Bridge gate applies. Kept in sync by living
     # in this module, which is the single definition site for all of them.
