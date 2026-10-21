@@ -94,11 +94,26 @@ step of the identity chain below:
       "type": "stdio",
       "command": "python",
       "args": ["<repo>/scripts/hgm_mcp.py"],
-      "env": { "HGM_AGENT": "<this-agent-name>" }
+      "env": {
+        "HGM_AGENT": "<this-agent-name>",
+        "HERMES_HOME": "<hermes-home>"
+      }
     }
   }
 }
 ```
+
+> **Launch the script from the repository checkout.** `hgm_sync_turn` imports
+> `plugin.memory_governed`; the deployed copy at `$HERMES_HOME/scripts/hgm_mcp.py`
+> sits outside that package and fails with `No module named 'plugin'` unless
+> `HGM_REPO` points at the checkout. The repo copy is self-locating:
+> `args: ["<repo>/scripts/hgm_mcp.py"]` needs no `PYTHONPATH`.
+>
+> **Hermes itself does not register this MCP.** It loads the provider in-process
+> through `memory.provider: governed` in `config.yaml`; its turns are archived by
+> the plugin. This stdio server is for *other* agents (Codex, MiMo, WorkBuddy,
+> DSH, …). If a host insists on the deployed path, add
+> `"HGM_REPO": "<repo>"` to its `env`.
 
 Any script that reads stdin must declare its encoding
 (`sys.stdin.reconfigure(encoding="utf-8")`). The one shipped here does; a host

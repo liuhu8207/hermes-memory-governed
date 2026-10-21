@@ -51,7 +51,27 @@ for _stream in (sys.stdin, sys.stdout, sys.stderr):
         except (ValueError, OSError):
             pass
 
-REPO = Path(__file__).resolve().parent.parent
+def _resolve_repo() -> Path:
+    """Locate the checkout that contains ``plugin/memory_governed``.
+
+    The deployed copy lives at ``$HERMES_HOME/scripts/hgm_mcp.py``; its
+    parent.parent is HERMES_HOME, which has no ``plugin`` package. MCP clients
+    should launch the **repo** script, but ``HGM_REPO`` makes the deployed copy
+    usable too and turns a bare "No module named 'plugin'" into a clear error.
+    """
+    here = Path(__file__).resolve().parent.parent
+    candidates = []
+    configured = os.environ.get("HGM_REPO")
+    if configured:
+        candidates.append(Path(configured).expanduser())
+    candidates.append(here)
+    for candidate in candidates:
+        if (candidate / "plugin" / "memory_governed" / "__init__.py").is_file():
+            return candidate
+    return here
+
+
+REPO = _resolve_repo()
 if str(REPO) not in sys.path:
     sys.path.insert(0, str(REPO))
 
@@ -285,7 +305,15 @@ def _provider():
     """
     import os  # noqa: PLC0415
 
-    from plugin.memory_governed import GovernedMemoryProvider  # noqa: PLC0415
+    try:
+        from plugin.memory_governed import GovernedMemoryProvider  # noqa: PLC0415
+    except ModuleNotFoundError as e:
+        raise RuntimeError(
+            "hgm_mcp cannot import plugin.memory_governed. Launch the server as "
+            "<repo>/scripts/hgm_mcp.py, or set HGM_REPO to the checkout root "
+            "(current REPO=%s). Hermes itself uses the in-process provider "
+            "(memory.provider: governed) and does not need this MCP." % REPO
+        ) from e
 
     provider = GovernedMemoryProvider()
     provider.initialize(_agent() + "-session", hermes_home=os.environ.get("HERMES_HOME"))
