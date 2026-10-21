@@ -156,6 +156,31 @@ the same set score differently every run; pass `--affinity on` (or the legacy
 `--with-affinity`) only when you explicitly want the production full path.
 `--affinity both` reports both variants in one run, off first.
 
+## Backup Retention
+
+Every ``retract`` creates a full L2 table backup, so one-by-one cleanup can
+grow ``l2_backups`` quickly (a 19-fact cleanup grew it from 25 to 46 copies,
+~690 MB). The standard is enforced by ``scripts/backup_retention.py`` and runs
+as a daily cron step (``backup-retention``):
+
+| Backup | Keep |
+|--------|------|
+| L2 table directories | newest 7 + newest of each of the last 3 months + named milestones (`cleanup`, `planB`, `pre_restore`) |
+| L3 databases | newest 5 |
+| KB index backups | 2 |
+| Vault `.kb-backups-*` | newest 2 in the vault; older moved to `$HERMES_HOME/memory/vault_backups/`, where newest 3 are kept |
+
+Timestamps are parsed from the **name**, not mtime (copied directories often
+inherit an old mtime). The script is report-only by default; cron passes
+``--apply --yes``. Preview manually with:
+
+```bash
+python scripts/backup_retention.py --dry-run
+```
+
+The first real run reclaimed 544.4 MB (774 MB → 229.6 MB) and left the
+milestone backups intact.
+
 ## Test Isolation vs Production Scripts
 
 These are two different situations and must not be conflated:

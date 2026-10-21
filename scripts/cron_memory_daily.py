@@ -22,7 +22,8 @@ Steps (in order)
 5. kb-index — ``kb_reindex.py``                   KB vector index sync
 6. l2-quality — ``l2_quality_sweep.py``           test-residue sweep
 7. l2-capacity — ``l2_capacity.py``                global L2 cap sweep
-8. health  — ``memory_health_report.py``          health report
+8. backup-retention — ``backup_retention.py``      prune old backups
+9. health  — ``memory_health_report.py``          health report
 
 Each step is failure-isolated: a failing step is reported but the remaining
 steps still run.  The wrapper exits non-zero if any step failed (so the cron
@@ -92,6 +93,8 @@ STEPS: List[Step] = [
          ("--apply", "--yes", "--kinds", "test_residue"),
          supports_dry_run=True),
     Step("l2-capacity", "l2_capacity.py", (), supports_dry_run=True),
+    Step("backup-retention", "backup_retention.py",
+         ("--apply", "--yes"), supports_dry_run=True),
     Step("health", "memory_health_report.py", (), supports_dry_run=False),
 ]
 
