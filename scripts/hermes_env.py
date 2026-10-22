@@ -187,6 +187,61 @@ def strict_isolation() -> bool:
     return "pytest" in sys.modules
 
 
+class HGMRepoNotConfiguredError(RuntimeError):
+    """A deployed script cannot locate the repository that holds ``plugin/``."""
+
+
+def _source_repo_from_config() -> "Optional[Path]":
+    """Read ``source_repo`` from ``$HERMES_HOME/governed_memory.json``.
+
+    A deployment copies ``scripts/`` into ``$HERMES_HOME/scripts`` and the plugin
+    into ``$HERMES_HOME/plugins``; the checkout that actually contains
+    ``plugin/memory_governed`` is therefore not implied by the script path.
+    ``source_repo`` is the explicit pointer for that layout.
+    """
+    raw_home = (os.environ.get("HERMES_HOME") or "").strip()
+    if not raw_home:
+        return None
+    cfg_path = Path(raw_home).expanduser() / "governed_memory.json"
+    try:
+        data = json.loads(cfg_path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):  # silent-ok: value-fallback — config missing/corrupt → no source_repo
+        return None
+    raw = str(data.get("source_repo") or "").strip() if isinstance(data, dict) else ""
+    return Path(raw).expanduser() if raw else None
+
+
+def resolve_repo(script_file: str) -> Path:
+    """Locate the checkout containing ``plugin/memory_governed``.
+
+    Resolution order:
+      1. ``HGM_REPO`` (explicit, always wins);
+      2. the script's parent.parent (works for a repo checkout);
+      3. ``source_repo`` in ``$HERMES_HOME/governed_memory.json`` (deployed
+         scripts; the path is intentionally data, not a hardcoded machine path).
+
+    Raises :class:`HGMRepoNotConfiguredError` with the candidates it tried.
+    """
+    here = Path(script_file).resolve().parent.parent
+    candidates: List[Path] = []
+    configured = (os.environ.get("HGM_REPO") or "").strip()
+    if configured:
+        candidates.append(Path(configured).expanduser())
+    candidates.append(here)
+    from_config = _source_repo_from_config()
+    if from_config is not None:
+        candidates.append(from_config)
+
+    for candidate in candidates:
+        if (candidate / "plugin" / "memory_governed" / "__init__.py").is_file():
+            return candidate
+    raise HGMRepoNotConfiguredError(
+        "cannot locate the HGM repository (looked for "
+        "plugin/memory_governed/__init__.py). Tried: %s. Set HGM_REPO or "
+        "source_repo in $HERMES_HOME/governed_memory.json."
+        % ", ".join(str(c) for c in candidates))
+
+
 # ---------------------------------------------------------------------------
 # .env 读取
 # ---------------------------------------------------------------------------

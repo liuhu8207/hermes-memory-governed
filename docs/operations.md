@@ -31,6 +31,20 @@ hermes cron add --name health-report \
   --no-agent
 ```
 
+### Deployed cron scripts
+
+A cron job's `script` must be a filename under `$HERMES_HOME/scripts`, so the
+deployed copy cannot infer the checkout from its own path. Set `source_repo` in
+`governed_memory.json` (or `HGM_REPO`):
+
+```json
+"source_repo": "D:/path/to/hermes-memory-governed"
+```
+
+`cron_memory_daily.py` resolves it once, exports `HGM_REPO` to every child step,
+and clears the gateway's inherited `PYTHONPATH`/`PYTHONHOME` so the repo venv
+does not load incompatible compiled wheels.
+
 ## Destructive Maintenance — Safety Gates
 
 These scripts delete or rewrite data. Each one refuses rather than guessing, so

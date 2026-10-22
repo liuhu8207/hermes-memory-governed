@@ -23,7 +23,7 @@ from pathlib import Path
 SCRIPT_DIR = Path(__file__).resolve().parent
 sys.path.insert(0, str(SCRIPT_DIR))
 
-from hermes_env import bootstrap, setup_logging
+from hermes_env import bootstrap, resolve_repo, setup_logging
 
 HERMES_HOME = bootstrap(__file__)
 
@@ -49,16 +49,8 @@ except ImportError:  # silent-ok: value-fallback — 插件不在 sys.path 上 �
 
 
 def _repo_root() -> Path:
-    """Locate the repository without hardcoding a user path."""
-    configured = os.environ.get("HGM_REPO")
-    candidates = [Path(configured)] if configured else []
-    candidates.append(SCRIPT_DIR.parent)
-    for candidate in candidates:
-        if (candidate / "plugin" / "memory_governed" / "_kb.py").exists():
-            return candidate
-    raise SystemExit(
-        "cannot locate the HGM repository; set HGM_REPO to the checkout root"
-    )
+    """Locate the checkout via HGM_REPO / source_repo / script location."""
+    return resolve_repo(__file__)
 
 
 def _confirm(action: str, *, assume_yes: bool) -> bool:

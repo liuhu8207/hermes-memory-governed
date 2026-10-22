@@ -1,6 +1,7 @@
 {
   "scripts_dir": "~/.hermes/scripts",
   "wiki_dir": "~/wiki",
+  "source_repo": "",
   "recall": {
     "l1_budget_tokens": 800,
     "l23_budget_tokens": 1200,

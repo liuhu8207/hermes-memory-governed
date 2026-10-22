@@ -21,21 +21,14 @@ from pathlib import Path
 SCRIPT_DIR = Path(__file__).resolve().parent
 sys.path.insert(0, str(SCRIPT_DIR))
 
-from hermes_env import bootstrap
+from hermes_env import bootstrap, resolve_repo
 
 HERMES_HOME = bootstrap(__file__)
 
 
 def _repo_root() -> Path:
-    configured = os.environ.get("HGM_REPO")
-    candidates = [Path(configured)] if configured else []
-    candidates.append(SCRIPT_DIR.parent)
-    for candidate in candidates:
-        if (candidate / "memory_cli.py").exists():
-            return candidate
-    raise SystemExit(
-        "cannot locate the HGM repository; set HGM_REPO to the checkout root"
-    )
+    """Locate the checkout via HGM_REPO / source_repo / script location."""
+    return resolve_repo(__file__)
 
 
 def main() -> int:

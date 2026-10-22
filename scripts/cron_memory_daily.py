@@ -58,10 +58,13 @@ ENV_PRESET: Dict[str, str] = {
     "HF_HUB_DISABLE_XET": "1",
 }
 
-#: When this file lives in the repository, point the KB step at that checkout.
-_REPO_ROOT = SCRIPTS_DIR.parent
-if (_REPO_ROOT / "plugin" / "memory_governed" / "_kb.py").exists():
-    ENV_PRESET.setdefault("HGM_REPO", str(_REPO_ROOT))
+#: Locate the checkout that owns ``plugin/memory_governed``. A deployed copy
+#: lives under ``$HERMES_HOME/scripts`` and cannot infer that from its path;
+#: the resolver reads ``HGM_REPO`` or ``source_repo`` from governed_memory.json.
+from hermes_env import resolve_repo  # noqa: E402  (narrow, local helper)
+
+REPO = resolve_repo(__file__)
+ENV_PRESET.setdefault("HGM_REPO", str(REPO))
 
 #: Per-step hard timeout in seconds (mirrors memory_pipeline.run_script).
 STEP_TIMEOUT_SECONDS: int = 900
@@ -113,9 +116,18 @@ class StepOutcome:
 
 
 def _build_env() -> Dict[str, str]:
-    """Child environment: inherit os.environ, then force the CN presets."""
+    """Child environment: CN presets, explicit HGM_REPO, clean import path.
+
+    The gateway sets ``PYTHONPATH`` for its own Python 3.14 tree. Passing that
+    to the repo venv (3.12) can make it import incompatible compiled wheels
+    (observed: ``pydantic_core._pydantic_core`` missing). The venv already has
+    everything the steps need, so drop inherited import-path overrides.
+    """
     env = dict(os.environ)
+    env.pop("PYTHONPATH", None)
+    env.pop("PYTHONHOME", None)
     env.update(ENV_PRESET)
+    env["HGM_REPO"] = str(REPO)
     return env
 
 
@@ -127,8 +139,7 @@ def _python_executable() -> str:
     even though the store was healthy. The venv is the interpreter the
     plugin actually uses.
     """
-    repo = os.environ.get("HGM_REPO") or ENV_PRESET.get("HGM_REPO") \
-        or str(SCRIPTS_DIR.parent)
+    repo = os.environ.get("HGM_REPO") or ENV_PRESET.get("HGM_REPO") or str(REPO)
     for candidate in (
         Path(repo) / ".venv" / "Scripts" / "python.exe",
         Path(repo) / ".venv" / "bin" / "python",
@@ -216,6 +227,7 @@ def main() -> int:
         f"[cron_memory_daily] start {started_at.isoformat(timespec='seconds')} "
         f"dry_run={args.dry_run} steps={len(STEPS)}"
     )
+    print(f"[cron_memory_daily] repo={REPO} python={_python_executable()}")
 
     outcomes: List[StepOutcome] = []
     for index, step in enumerate(STEPS, 1):

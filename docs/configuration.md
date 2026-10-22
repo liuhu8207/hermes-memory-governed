@@ -8,6 +8,7 @@ Location: `$HERMES_HOME/governed_memory.json`
 {
   "scripts_dir": "~/.hermes/scripts",
   "wiki_dir": "~/wiki",
+  "source_repo": "",
   "recall": {
     "l1_budget_tokens": 800,
     "l23_budget_tokens": 1200,
@@ -61,6 +62,12 @@ Location: `$HERMES_HOME/governed_memory.json`
   }
 }
 ```
+
+`source_repo` is the absolute path of the checkout that contains
+`plugin/memory_governed`. It is only needed when `scripts/` is deployed under
+`$HERMES_HOME/scripts` (the checkout cannot be inferred from that path). An
+explicit `HGM_REPO` environment variable wins over it. Leave it empty when the
+scripts run from the checkout.
 
 ## Recall Config
 

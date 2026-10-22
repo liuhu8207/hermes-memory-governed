@@ -29,9 +29,12 @@ SCRIPT_DIR = Path(__file__).resolve().parent
 sys.path.insert(0, str(SCRIPT_DIR))
 sys.path.insert(0, str(SCRIPT_DIR.parent))
 
-from hermes_env import bootstrap
+from hermes_env import bootstrap, resolve_repo
 
 HERMES_HOME = bootstrap(__file__)
+REPO = resolve_repo(__file__)
+if str(REPO) not in sys.path:
+    sys.path.insert(0, str(REPO))
 
 
 def _normalize(text: str) -> str:

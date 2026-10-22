@@ -2324,16 +2324,51 @@ class KnowledgeBase:
 
     @staticmethod
     def _autolink(body: str, concepts: List[str]) -> str:
-        """对 concepts 里的词在正文首次出现处加 [[词]]（已链接的跳过）。"""
-        for c in concepts:
-            c = c.strip()
+        """对 concepts 里的词在**普通正文**首次出现处加 ``[[词]]``。
+
+        绝不能在 URL / 行内代码 / 代码块 / 已有 wikilink 里注入：实测
+        ``https://token-plan-cn.xiaomimimo.com/v1`` 被改成了
+        ``xiaomi[[mimo]].com``，链接直接失效。ASCII 概念还要求词边界，
+        避免 ``mimo`` 命中 ``xiaomimimo`` 这类更长标识符。
+        """
+        forbidden = []
+        for pattern in (
+            r"```.*?```",                  # fenced code
+            r"`[^`\n]*`",                  # inline code
+            r"https?://\S+",        # URL
+            r"\[\[[^\]]*\]\]",            # existing wikilink
+        ):
+            forbidden.extend((m.start(), m.end())
+                             for m in re.finditer(pattern, body, re.S))
+
+        def _inside(pos: int, end: int) -> bool:
+            return any(start <= pos and end <= stop
+                       for start, stop in forbidden)
+
+        for raw in concepts:
+            c = raw.strip()
             if not c:
                 continue
             if re.search(rf"\[\[{re.escape(c)}(\||\])", body):
                 continue
-            idx = body.find(c)
-            if idx != -1:
-                body = body[:idx] + f"[[{c}]]" + body[idx + len(c):]
+            if c.isascii():
+                pat = re.compile(r"(?<![A-Za-z0-9])" + re.escape(c)
+                                 + r"(?![A-Za-z0-9])", re.IGNORECASE)
+            else:
+                pat = re.compile(re.escape(c))
+            hit = next((m for m in pat.finditer(body)
+                        if not _inside(m.start(), m.end())), None)
+            if hit is not None:
+                # Preserve the matched casing; the wikilink target is still
+                # resolved case-insensitively by Obsidian.
+                body = body[:hit.start()] + f"[[{hit.group(0)}]]" + body[hit.end():]
+                # Recompute forbidden spans: the inserted link shifts offsets.
+                forbidden = []
+                for pattern in (r"```.*?```", r"`[^`\n]*`",
+                                r"https?://\S+",
+                                r"\[\[[^\]]*\]\]"):
+                    forbidden.extend((m.start(), m.end())
+                                     for m in re.finditer(pattern, body, re.S))
         return body
 
     @staticmethod
