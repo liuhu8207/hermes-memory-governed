@@ -3278,6 +3278,9 @@ def _kb_hybrid_search(config: dict, query: str, top_k: int, section: str,
         for key, value in ((config or {}).get("reranking") or {}).items():
             if hasattr(cfg_obj.reranking, key):
                 setattr(cfg_obj.reranking, key, value)
+        for key, value in ((config or {}).get("routing") or {}).items():
+            if hasattr(cfg_obj.routing, key):
+                setattr(cfg_obj.routing, key, value)
         kb = plugin_module("_kb").KnowledgeBase(cfg_obj)
         out = kb.search(query, top_k=top_k, section=section or "",
                         category=category or "")

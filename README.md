@@ -316,11 +316,24 @@ Configuration lives in `$HERMES_HOME/governed_memory.json` (see [`config/governe
 | `vector` | L2 backend, model, dimension |
 | `embedding` | remote embedding API (OpenAI-compatible `/embeddings`) |
 | `reranking` | optional reranker (SiliconFlow bge-reranker) |
+| `routing` | deterministic query-entry routing; prefers exact identifiers and skips rerank only when a small strong match set is unambiguous |
+| `decision` | optional Jev advisory layer for KB novelty decisions; disabled and shadow-only by default |
 | `kb` | KB top-k, thresholds, semantic/keyword toggles, autolink |
 | `asr` | audio transcription (XingChenASR) — `api_style` (default `transcriptions`; use `chat_audio` for a chat-completions-style audio endpoint), `timeout_seconds` (default 600: per-request ceiling), `chunk_minutes` (default 10: recordings longer than this are split and their transcripts joined in order), and `max_encoded_bytes` (default 10000000: cap on the base64 payload in `chat_audio`). All have defaults, so no config edit is needed. |
 | `synthesis` | session distillation (provider/model/key, enabled flag) |
 
 > ⚠️ **Dimension consistency**: a given L2 table can hold only one vector dimension. Switching backends (API ↔ local) or models changes the dimension, so you must rebuild L2: `python scripts/l2_rebuild.py`.
+
+### Optional Jev decision layer
+
+The `decision` section is an advisory plane, not another memory store. It
+requires the optional `jev` extra (`pip install -e '.[jev]'`) and
+`TYPESAFE_API_KEY`. Its default is `enabled: false`. When enabled in `shadow`
+mode, KB writes proceed unchanged and a background worker records a bounded
+duplicate/extension/conflict/new suggestion in
+`$HERMES_HOME/memory/decision_audit.jsonl`. No raw note text is written to that
+audit file. Set `background_shadow: false` for short-lived CLI processes where
+the decision must complete before process exit.
 
 ### HuggingFace in China
 

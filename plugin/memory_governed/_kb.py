@@ -33,11 +33,13 @@ from pathlib import Path
 from typing import Any, Dict, Iterator, List, Optional, Tuple
 
 from ._config import GovernedMemoryConfig
+from ._decision import DecisionEngine
 from ._embedding import EmbeddingService
 from ._bridge import has_secret_like_text
 from ._llm import chat_completion
 from ._recall import row_to_score
 from ._rerank import Reranker
+from ._routing import QueryRouter, QueryRoute
 from ._text import DEDUP_MIN_CHARS, normalize_for_match
 from . import _vault
 
@@ -1036,6 +1038,13 @@ class KnowledgeBase:
         # 索引被删空过一次，光看「missing=52」是看不出来的 —— 状态面板要能
         # 一眼回答"上次同步到底成没成、删了多少行"。
         self._last_sync: Dict[str, Any] = {}
+        self._router = QueryRouter(getattr(config, "routing", None))
+        decision_cfg = getattr(config, "decision", None)
+        self._decision: Optional[DecisionEngine] = None
+        if decision_cfg is not None and bool(getattr(decision_cfg, "enabled", False)):
+            audit_path = (str(getattr(decision_cfg, "audit_path", "") or "").strip()
+                          or str(self._usage_db.parent / "decision_audit.jsonl"))
+            self._decision = DecisionEngine(decision_cfg, audit_path=audit_path)
 
     # -- 索引新鲜度探测（廉价，只读元数据） ----------------------------
 
@@ -1892,6 +1901,7 @@ class KnowledgeBase:
         """
         if not query.strip():
             return []
+        route: QueryRoute = self._router.route(query)
         top_k = max(1, min(int(top_k), 50))
         status = self._ensure_fresh_index()
         notes = self._iter_notes()
@@ -1931,6 +1941,26 @@ class KnowledgeBase:
                 s = self._keyword_score_norm(query, note)
                 if s > 0.0:
                     kw_norm[rel] = s
+            if route.enabled and route.exact_terms:
+                for note in notes:
+                    rel = self._rel(note.path)
+                    title_l = note.title.lower()
+                    short_l = note.short_text.lower()
+                    body_l = note.body.lower()
+                    term_scores = []
+                    for term in route.exact_terms:
+                        needle = term.lower()
+                        if needle in title_l:
+                            term_scores.append(1.0)
+                        elif needle in short_l:
+                            term_scores.append(0.95)
+                        elif needle in body_l:
+                            term_scores.append(0.72)
+                        else:
+                            term_scores.append(0.0)
+                    if term_scores and any(term_scores):
+                        exact_score = sum(term_scores) / len(term_scores)
+                        kw_norm[rel] = max(kw_norm.get(rel, 0.0), exact_score)
 
         sem_norm: Dict[str, float] = {}
         idx = self._index_get()
@@ -1980,7 +2010,30 @@ class KnowledgeBase:
         cat_by_rel: Dict[str, str] = {}
         for n in notes:
             cat_by_rel[self._rel(n.path)] = n.category
-        if candidates and kb_rerank_on and rerank_floor > 0.0:
+        route_fast_skip = False
+        if route.enabled and route.fast_keyword and candidates:
+            exact_threshold = float(getattr(
+                getattr(self._config, "routing", None),
+                "exact_keyword_threshold", 0.80) or 0.80)
+            max_exact = max(1, int(getattr(
+                getattr(self._config, "routing", None),
+                "max_exact_candidates", 5) or 5))
+            strong = {rel for rel in candidates
+                      if float(kw_norm.get(rel, 0.0) or 0.0) >= exact_threshold}
+            route_fast_skip = 0 < len(strong) <= max_exact
+            if route_fast_skip:
+                candidates = strong
+                kw_norm = {k: v for k, v in kw_norm.items() if k in strong}
+                sem_norm = {k: v for k, v in sem_norm.items() if k in strong}
+                rerank_state = "routed_keyword"
+                if bool(getattr(getattr(self._config, "routing", None),
+                                "trace", False)):
+                    logger.debug(
+                        "kb routing: mode=%s strong=%d rerank=skipped terms=%s",
+                        route.mode, len(strong), route.exact_terms)
+
+        if (candidates and kb_rerank_on and rerank_floor > 0.0
+                and not route_fast_skip):
             rer = self._get_reranker()
             if rer.available:
                 try:
@@ -2220,6 +2273,14 @@ class KnowledgeBase:
                     "sem_rank": sem_rank,
                     "base": round(base, 4),
                     "affinity": round(affinity, 4),
+                    "route": {
+                        "enabled": route.enabled,
+                        "mode": route.mode,
+                        "reasons": list(route.reasons),
+                        "exact_terms": list(route.exact_terms),
+                        "preferred_layers": list(route.preferred_layers),
+                        "rerank": rerank_state,
+                    },
                 },
             }
 
@@ -2444,6 +2505,89 @@ class KnowledgeBase:
             added += len(pending)
         return added
 
+    def _decision_candidates(
+        self,
+        title: str,
+        body: str,
+        tags: List[str],
+        concepts: List[str],
+        current_path: Path,
+    ) -> List[Dict[str, Any]]:
+        """Return a small, deterministic candidate set for advisory decisions.
+
+        This path is deliberately cheaper than ``search()``: it never invokes
+        the reranker. In shadow mode the caller runs it on the background worker,
+        so an optional embedding lookup cannot delay the actual note write.
+        """
+        decision_cfg = getattr(self._config, "decision", None)
+        limit = max(1, int(getattr(decision_cfg, "max_candidates", 5) or 5))
+        query = " ".join(filter(None, [title, *tags, *concepts, body[:800]]))
+        target_bigrams = _bigrams(query.lower())
+        target_tags = {x.strip().lower() for x in tags if x.strip()}
+        target_concepts = {x.strip().lower() for x in concepts if x.strip()}
+        scored: Dict[str, Dict[str, Any]] = {}
+        live_notes = [note for note in self._iter_notes()
+                      if note.path != current_path and not _is_archived(note)]
+        notes_by_rel = {self._rel(note.path): note for note in live_notes}
+
+        for note in live_notes:
+            note_bigrams = _bigrams(note.full_text[:2000].lower())
+            overlap = (len(target_bigrams & note_bigrams) / len(target_bigrams)
+                       if target_bigrams else 0.0)
+            note_tags = {x.strip().lower() for x in note.tags if x.strip()}
+            note_concepts = {x.strip().lower()
+                             for x in note.concepts if x.strip()}
+            tag_union = target_tags | note_tags
+            concept_union = target_concepts | note_concepts
+            tag_overlap = (len(target_tags & note_tags) / len(tag_union)
+                           if tag_union else 0.0)
+            concept_overlap = (len(target_concepts & note_concepts)
+                               / len(concept_union) if concept_union else 0.0)
+            title_boost = 0.2 if title.lower() in note.title.lower() else 0.0
+            score = min(1.0, 0.55 * overlap + 0.2 * tag_overlap
+                        + 0.2 * concept_overlap + title_boost)
+            if score <= 0.0:
+                continue
+            rel = self._rel(note.path)
+            scored[rel] = {
+                "title": note.title,
+                "path": rel,
+                "snippet": note.body[:800],
+                "tags": note.tags,
+                "concepts": note.concepts,
+                "score": score,
+            }
+
+        # A semantic lookup adds bilingual/paraphrase candidates that character
+        # overlap misses. It is optional and best effort; failure keeps the
+        # lexical candidates rather than turning an advisory feature into a gate.
+        try:
+            idx = self._index_get()
+            if idx.available and query.strip():
+                for hit in idx.search(query[:1200], max(limit * 3, 8)):
+                    rel = str(hit.get("path") or "")
+                    if not rel or rel == self._rel(current_path):
+                        continue
+                    note = notes_by_rel.get(rel)
+                    if note is None:
+                        continue
+                    previous = scored.get(rel, {})
+                    scored[rel] = {
+                        "title": note.title,
+                        "path": rel,
+                        "snippet": note.body[:800],
+                        "tags": note.tags,
+                        "concepts": note.concepts,
+                        "score": max(float(previous.get("score", 0.0) or 0.0),
+                                     float(hit.get("score", 0.0) or 0.0)),
+                    }
+        except Exception as e:  # noqa: BLE001 - optional candidate enrichment
+            log_degraded("decision", "kb_candidate_semantic_failed", exc=e)
+
+        return sorted(scored.values(),
+                      key=lambda x: (-float(x.get("score", 0.0) or 0.0),
+                                     str(x.get("path") or "")))[:limit]
+
     def add(
         self,
         title: str,
@@ -2533,6 +2677,23 @@ class KnowledgeBase:
                                  "title), or rewrite to add new information"),
                     }
 
+        decision_report: Optional[Dict[str, Any]] = None
+        if self._decision is not None:
+            decision_report = self._decision.observe_kb_novelty(
+                {
+                    "title": title,
+                    "body": body,
+                    "tags": tags,
+                    "concepts": concepts,
+                    "section": section,
+                },
+                lambda: self._decision_candidates(title, body, tags, concepts, path),
+            )
+            if (self._decision.mode == "active" and decision_report
+                    and not decision_report.get("fallback")
+                    and decision_report.get("action") in ("warn", "review")):
+                review_required = True
+
         now = time_str()
         # 受控分类：调用方显式传的优先（非法值丢弃而非硬塞），否则按
         # title/tags/concepts 推断。推断不出就**不写这个键** —— 空分类
@@ -2557,6 +2718,11 @@ class KnowledgeBase:
             meta.update(_enrich_note(title, body, self._config))
         if confidence is not None:
             meta["confidence"] = float(confidence)
+        if (self._decision is not None and self._decision.mode == "active"
+                and decision_report and not decision_report.get("fallback")):
+            meta["decision_action"] = str(decision_report.get("action") or "")
+            meta["decision_confidence"] = float(
+                decision_report.get("confidence", 0.0) or 0.0)
         if review_required:
             meta["review_required"] = True
         if update:
@@ -2597,6 +2763,7 @@ class KnowledgeBase:
             "review_required": review_required,
             "links_added": links_added,
             "moc_rebuilt": moc_rebuilt,
+            **({"decision": decision_report} if decision_report is not None else {}),
         }
 
     def list_review(self, limit: int = 50) -> List[Dict[str, Any]]:

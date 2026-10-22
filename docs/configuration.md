@@ -210,6 +210,97 @@ Format and normalisation:
 - **A partial result is not a success:** if some chunks fail you get `ok: false`
   plus the text that was obtained. Check `ok`.
 
+## Query Routing Config
+
+`routing` is a deterministic local router. It does not call an LLM and does not
+replace the hybrid retriever. It classifies a query into `exact`,
+`navigational`, `episodic`, `conceptual`, or `general`, extracts identifiers
+such as paths, versions, flags, error codes, file names, and mixed
+letter-number IDs, and records the route in KB trace metadata.
+
+When an exact or navigational query has a small number of strong title/tag
+matches, the KB channel can use the keyword-first entry and skip the reranker.
+If matches are numerous or weak, it keeps the normal reranker path. Conceptual
+and general queries continue to use the existing hybrid retrieval unchanged.
+
+```json
+"routing": {
+  "enabled": false,
+  "max_exact_terms": 12,
+  "exact_keyword_threshold": 0.8,
+  "max_exact_candidates": 5,
+  "trace": false
+}
+```
+
+| Key | Default | Description |
+|-----|---------|-------------|
+| enabled | false | Enable deterministic entry routing. Disabled preserves the historical retrieval path exactly. |
+| max_exact_terms | 12 | Maximum extracted exact identifiers retained for scoring. Clamped to 1-50. |
+| exact_keyword_threshold | 0.8 | A title match scores 1.0, short metadata 0.95, body-only 0.72. Only matches at or above this threshold count as strong. |
+| max_exact_candidates | 5 | Skip rerank only when the strong candidate set contains at most this many notes. More matches are treated as ambiguous and still reranked. |
+| trace | false | Emit a debug line when an exact route skips rerank. Route diagnostics are also attached to KB result trace metadata. |
+
+## Decision Config (optional Jev layer)
+
+`decision` adds a fast advisory policy without replacing L1-L4, LanceDB,
+SQLite, the knowledge base, or the reranker. It is off by default. Install the
+optional SDK first:
+
+```bash
+pip install -e '.[jev]'
+```
+
+```json
+"decision": {
+  "enabled": false,
+  "mode": "shadow",
+  "backend": "jev",
+  "base_url": "",
+  "api_key_env": "TYPESAFE_API_KEY",
+  "model": "jev-latest",
+  "timeout_seconds": 1.5,
+  "cache_size": 256,
+  "audit_path": "",
+  "background_shadow": true,
+  "max_candidates": 5,
+  "max_content_chars": 1600,
+  "warn_confidence": 0.85,
+  "review_confidence": 0.65,
+  "kb_novelty_enabled": true
+}
+```
+
+| Key | Default | Description |
+|-----|---------|-------------|
+| enabled | false | Master switch. A missing key, missing SDK, timeout, or malformed response never blocks the legacy path. |
+| mode | "shadow" | `shadow` records advice only. `active` can add a review flag/metadata, but this version never rejects a KB note from a Jev answer. |
+| backend | "jev" | Only `jev` is accepted. Unknown values fall back with a warning. |
+| base_url | "" | Optional TypeSafe API base URL. Empty uses the SDK default. |
+| api_key_env | "TYPESAFE_API_KEY" | Name of the environment variable, never the key itself. `$HERMES_HOME/.env` is supported by the shared secret loader. |
+| model | "jev-latest" | Jev model identifier. |
+| timeout_seconds | 1.5 | Per-call ceiling. The adapter disables SDK retries so one advisory call cannot multiply the read/write delay. |
+| cache_size | 256 | Bounded in-process decision cache keyed by operation, model, state, and question version. |
+| audit_path | "" | Empty resolves to `$HERMES_HOME/memory/decision_audit.jsonl`. Audit rows contain hashes, labels, confidence, latency, and fallback state, not raw memory text. |
+| background_shadow | true | Queue `shadow` decisions so persistent MCP/Hermes sessions do not pay the network round trip on the KB write path. Set false for short-lived CLI processes. |
+| max_candidates | 5 | Maximum candidate summaries sent to Jev. Clamped to 1-20. |
+| max_content_chars | 1600 | Maximum new-note body sent to Jev. Candidate snippets are capped separately. |
+| warn_confidence | 0.85 | A duplicate at or above this confidence is reported as `warn`. It still does not delete or reject anything. |
+| review_confidence | 0.65 | Below this confidence, the decision is `review`. |
+| kb_novelty_enabled | true | Enable the KB duplicate/extension/conflict/new advisory operation. |
+
+The first integrated operation is `kb_novelty`. It asks Jev to choose exactly
+one of `duplicate`, `extends`, `conflicts`, `new`, or `uncertain` after the
+existing exact-content dedupe runs. The prompt receives only the new note's
+bounded title/body/tags/concepts and a small local candidate set. The
+reranker, L2/L3 storage, and all existing admission gates remain authoritative.
+
+Inspect the local audit without exposing note bodies:
+
+```bash
+python scripts/decision_audit.py --json
+```
+
 ## Environment Variables
 
 | Variable | Description |
@@ -227,6 +318,7 @@ Format and normalisation:
 | LLM_API_KEY | LLM API key for extraction |
 | LLM_BASE_URL | LLM base URL |
 | LLM_MODEL | LLM model name |
+| TYPESAFE_API_KEY | Optional Jev API key when `decision.enabled=true` |
 
 ## Knowledge Base Config (`kb`)
 
