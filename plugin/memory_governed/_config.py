@@ -403,6 +403,9 @@ class RoutingConfig:
     max_exact_terms: int = 12
     exact_keyword_threshold: float = 0.80
     max_exact_candidates: int = 5
+    confidence_skip_rerank: bool = False
+    confidence_skip_min_score: float = 0.98
+    confidence_skip_min_margin: float = 0.05
     trace: bool = False
 
 
@@ -641,7 +644,8 @@ _NUMERIC_FIELDS = {
     "decision": ["timeout_seconds", "cache_size", "max_candidates",
                  "max_content_chars", "warn_confidence", "review_confidence"],
     "routing": ["max_exact_terms", "exact_keyword_threshold",
-                "max_exact_candidates"],
+                "max_exact_candidates", "confidence_skip_min_score",
+                "confidence_skip_min_margin"],
 }
 
 #: 必须为正的数值字段（超时 / 拆段阈值 / base64 上限）。0 或负数不是「关闭功能」
@@ -705,6 +709,10 @@ def _validate_routing_config(config: GovernedMemoryConfig) -> None:
         20, max(1, int(routing.max_exact_candidates)))
     routing.exact_keyword_threshold = min(
         1.0, max(0.0, float(routing.exact_keyword_threshold)))
+    routing.confidence_skip_min_score = min(
+        1.0, max(0.0, float(routing.confidence_skip_min_score)))
+    routing.confidence_skip_min_margin = min(
+        1.0, max(0.0, float(routing.confidence_skip_min_margin)))
 
 
 def _validate_positive_fields(config: GovernedMemoryConfig) -> None:

@@ -231,10 +231,25 @@ def test_decision_audit_summary(tmp_path):
         + "\nmalformed\n",
         encoding="utf-8",
     )
-    result = summarize(path)
+    result = summarize(path, decision_enabled=True)
     assert result["ok"] is True
+    assert result["status"] == "ready"
+    assert result["enabled"] is True
     assert result["rows"] == 2
     assert result["malformed"] == 1
     assert result["fallback_rate"] == 0.5
     assert result["actions"]["warn"] == 1
     assert result["latency_ms_p95"] == 200.0
+
+
+def test_decision_audit_missing_file_is_not_a_failure(tmp_path):
+    missing = tmp_path / "missing.jsonl"
+    disabled = summarize(missing, decision_enabled=False)
+    assert disabled["ok"] is True
+    assert disabled["status"] == "disabled"
+    assert disabled["rows"] == 0
+
+    enabled = summarize(missing, decision_enabled=True)
+    assert enabled["ok"] is True
+    assert enabled["status"] == "enabled_no_records"
+    assert enabled["rows"] == 0

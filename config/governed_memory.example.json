@@ -81,6 +81,9 @@
     "max_exact_terms": 12,
     "exact_keyword_threshold": 0.8,
     "max_exact_candidates": 5,
+    "confidence_skip_rerank": false,
+    "confidence_skip_min_score": 0.98,
+    "confidence_skip_min_margin": 0.05,
     "trace": false
   },
   "kb": {

@@ -31,6 +31,8 @@ def test_config_loads_and_clamps_routing(tmp_path, monkeypatch):
             "max_exact_terms": 100,
             "exact_keyword_threshold": 2.0,
             "max_exact_candidates": 0,
+            "confidence_skip_min_score": 2.0,
+            "confidence_skip_min_margin": -1.0,
         }
     }), encoding="utf-8")
     monkeypatch.setenv("HERMES_HOME", str(home))
@@ -39,6 +41,8 @@ def test_config_loads_and_clamps_routing(tmp_path, monkeypatch):
     assert cfg.routing.max_exact_terms == 50
     assert cfg.routing.exact_keyword_threshold == 1.0
     assert cfg.routing.max_exact_candidates == 1
+    assert cfg.routing.confidence_skip_min_score == 1.0
+    assert cfg.routing.confidence_skip_min_margin == 0.0
 
 
 def test_router_detects_exact_identifiers_and_versions():
@@ -57,13 +61,16 @@ def test_router_distinguishes_navigation_episodic_and_conceptual():
     assert _router().route("推荐一部科幻电影").mode == "general"
 
 
-def _kb(tmp_path, *, max_exact_candidates=5):
+def _kb(tmp_path, *, max_exact_candidates=5,
+        confidence_skip_rerank=False, confidence_skip_min_score=0.98):
     cfg = GovernedMemoryConfig()
     cfg.wiki_dir = str(tmp_path / "wiki")
     cfg.l2_db_path = str(tmp_path / "memory" / "l2")
     cfg.vector.backend = "none"
     cfg.routing = RoutingConfig(enabled=True,
-                                max_exact_candidates=max_exact_candidates)
+                                max_exact_candidates=max_exact_candidates,
+                                confidence_skip_rerank=confidence_skip_rerank,
+                                confidence_skip_min_score=confidence_skip_min_score)
     cfg.reranking.enabled = True
     cfg.kb.rerank_min_score = 0.08
     kb = KnowledgeBase(cfg)
@@ -109,3 +116,42 @@ def test_ambiguous_exact_match_keeps_reranker(tmp_path, monkeypatch):
     assert hits
     assert reranker.calls == 1
     assert hits[0]["trace"]["route"]["rerank"] == "reranked"
+
+
+def test_body_only_identifier_is_weak_and_keeps_reranker(tmp_path, monkeypatch):
+    kb = _kb(tmp_path)
+    kb.add(title="服务器说明", body="SR588 支持 Xeon Silver 处理器。",
+           section="notes")
+
+    class _Reranker:
+        available = True
+
+        def __init__(self):
+            self.calls = 0
+
+        def scores(self, query, texts, top_n=None):
+            self.calls += 1
+            return {i: 0.9 for i in range(len(texts))}
+
+    reranker = _Reranker()
+    monkeypatch.setattr(kb, "_get_reranker", lambda: reranker)
+    hits = kb.search("SR588 支持哪些 CPU", top_k=5)
+    assert hits
+    assert reranker.calls == 1
+    assert hits[0]["trace"]["route"]["rerank"] == "reranked"
+
+
+def test_high_confidence_fusion_can_skip_reranker(tmp_path, monkeypatch):
+    kb = _kb(tmp_path, confidence_skip_rerank=True,
+             confidence_skip_min_score=0.35)
+    kb.add(title="NAS CPU 配置", body="使用低功耗处理器。", section="notes")
+
+    def _must_not_call():
+        raise AssertionError("high-confidence fusion should skip reranker")
+
+    monkeypatch.setattr(kb, "_get_reranker", _must_not_call)
+    hits = kb.search("NAS CPU 配置", top_k=5)
+    assert hits
+    assert hits[0]["title"] == "NAS CPU 配置"
+    assert hits[0]["trace"]["route"]["mode"] == "general"
+    assert hits[0]["trace"]["route"]["rerank"] == "routed_confidence"

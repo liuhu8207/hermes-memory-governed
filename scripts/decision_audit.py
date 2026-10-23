@@ -25,6 +25,7 @@ sys.path.insert(0, str(SCRIPT_DIR.parent))
 from hermes_env import bootstrap
 
 HERMES_HOME = bootstrap(__file__)
+sys.path.insert(0, str(Path(HERMES_HOME) / "plugins"))
 
 
 def _percentile(values: list[float], fraction: float) -> float:
@@ -35,7 +36,7 @@ def _percentile(values: list[float], fraction: float) -> float:
     return round(float(ordered[index]), 3)
 
 
-def summarize(path: Path) -> dict:
+def summarize(path: Path, *, decision_enabled: bool | None = None) -> dict:
     rows: list[dict] = []
     malformed = 0
     try:
@@ -51,8 +52,16 @@ def summarize(path: Path) -> dict:
                     continue
                 if isinstance(item, dict):
                     rows.append(item)
-    except FileNotFoundError:  # silent-ok: already-reported — returned as ok=false with a stable error tag
-        return {"ok": False, "error": "audit file not found", "path": str(path)}
+    except FileNotFoundError:  # silent-ok: already-reported — a missing file is a normal pre-first-decision state
+        if decision_enabled is False:
+            status = "disabled"
+        elif decision_enabled is True:
+            status = "enabled_no_records"
+        else:
+            status = "no_records"
+        return {"ok": True, "status": status,
+                "enabled": decision_enabled, "rows": 0,
+                "path": str(path)}
     except OSError as exc:  # silent-ok: already-reported — returned as ok=false with the exception type
         return {"ok": False,
                 "error": "cannot read audit: " + type(exc).__name__,
@@ -66,8 +75,14 @@ def summarize(path: Path) -> dict:
     sources = Counter(str(r.get("source") or "unknown") for r in rows)
     confidences = [float(r.get("confidence", 0.0) or 0.0) for r in rows
                    if not r.get("fallback")]
+    if not rows:
+        status = "enabled_no_records" if decision_enabled is True else "no_records"
+    else:
+        status = "ready"
     return {
         "ok": True,
+        "status": status,
+        "enabled": decision_enabled,
         "path": str(path),
         "rows": len(rows),
         "malformed": malformed,
@@ -94,7 +109,17 @@ def main() -> int:
     args = parser.parse_args()
     path = Path(args.path) if args.path else (
         Path(HERMES_HOME) / "memory" / "decision_audit.jsonl")
-    result = summarize(path)
+    decision_enabled = None
+    try:
+        from plugin.memory_governed._config import load_governed_config
+        decision_enabled = bool(load_governed_config(HERMES_HOME).decision.enabled)
+    except Exception:  # noqa: BLE001  # silent-ok: already-reported — fallback import is attempted; final status is surfaced in result
+        try:
+            from governed._config import load_governed_config
+            decision_enabled = bool(load_governed_config(HERMES_HOME).decision.enabled)
+        except Exception:  # noqa: BLE001  # silent-ok: already-reported — unknown is surfaced as enabled=None and status in result
+            decision_enabled = None
+    result = summarize(path, decision_enabled=decision_enabled)
     if args.json:
         print(json.dumps(result, ensure_ascii=False, indent=2))
     else:

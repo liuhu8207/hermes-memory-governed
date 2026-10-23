@@ -229,6 +229,9 @@ and general queries continue to use the existing hybrid retrieval unchanged.
   "max_exact_terms": 12,
   "exact_keyword_threshold": 0.8,
   "max_exact_candidates": 5,
+  "confidence_skip_rerank": false,
+  "confidence_skip_min_score": 0.98,
+  "confidence_skip_min_margin": 0.05,
   "trace": false
 }
 ```
@@ -239,6 +242,9 @@ and general queries continue to use the existing hybrid retrieval unchanged.
 | max_exact_terms | 12 | Maximum extracted exact identifiers retained for scoring. Clamped to 1-50. |
 | exact_keyword_threshold | 0.8 | A title match scores 1.0, short metadata 0.95, body-only 0.72. Only matches at or above this threshold count as strong. |
 | max_exact_candidates | 5 | Skip rerank only when the strong candidate set contains at most this many notes. More matches are treated as ambiguous and still reranked. |
+| confidence_skip_rerank | false | Enable a second rerank bypass for concept/general queries when the pre-rerank fused score is both very high and clearly ahead. |
+| confidence_skip_min_score | 0.98 | Minimum pre-rerank top-1 fused score for the confidence bypass. |
+| confidence_skip_min_margin | 0.05 | Minimum top-1 minus top-2 fused-score margin for the confidence bypass. |
 | trace | false | Emit a debug line when an exact route skips rerank. Route diagnostics are also attached to KB result trace metadata. |
 
 ## Decision Config (optional Jev layer)

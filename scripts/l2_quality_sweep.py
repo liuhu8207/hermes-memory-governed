@@ -83,7 +83,8 @@ def main() -> int:
     candidates = []
     for index, row in enumerate(rows):
         content = str(row.get("content") or "")
-        verdict = classify_fact(content)
+        verdict = classify_fact(content, role=str(row.get("role") or ""),
+                                source=str(row.get("source") or ""))
         if verdict is None:
             norm = _normalize(content)
             if norm_counts[norm] > 1:

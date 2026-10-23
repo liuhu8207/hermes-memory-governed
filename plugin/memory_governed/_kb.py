@@ -2031,6 +2031,49 @@ class KnowledgeBase:
                     logger.debug(
                         "kb routing: mode=%s strong=%d rerank=skipped terms=%s",
                         route.mode, len(strong), route.exact_terms)
+        routing_cfg = getattr(self._config, "routing", None)
+        if (not route_fast_skip and route.enabled and candidates
+                and bool(getattr(routing_cfg,
+                                 "confidence_skip_rerank", False))):
+            pre_fusion = str(
+                getattr(kb_cfg, "fusion", "linear") or ""
+            ).strip().lower()
+            if pre_fusion != "rrf":
+                pre_fusion = "linear"
+            pre_kw = _KB_KW_WEIGHT if keyword_on else 0.0
+            pre_sem = _KB_SEM_WEIGHT if semantic_on else 0.0
+            pre_total = pre_kw + pre_sem
+            if pre_total > 0.0:
+                pre_kw /= pre_total
+                pre_sem /= pre_total
+            pre_rrf = (
+                _rrf_fuse(kw_norm, sem_norm, pre_kw, pre_sem)
+                if pre_fusion == "rrf" else {}
+            )
+
+            def _route_pre_score(rel: str) -> float:
+                if pre_fusion == "rrf":
+                    return float((pre_rrf.get(rel) or {}).get("rrf", 0.0))
+                return (pre_kw * kw_norm.get(rel, 0.0)
+                        + pre_sem * sem_norm.get(rel, 0.0))
+
+            pre_scores = sorted((_route_pre_score(rel) for rel in candidates),
+                                reverse=True)
+            top1 = pre_scores[0] if pre_scores else 0.0
+            top2 = pre_scores[1] if len(pre_scores) > 1 else 0.0
+            raw_min_score = getattr(
+                routing_cfg, "confidence_skip_min_score", 0.98)
+            raw_min_margin = getattr(
+                routing_cfg, "confidence_skip_min_margin", 0.05)
+            min_score = float(raw_min_score if raw_min_score is not None else 0.98)
+            min_margin = float(raw_min_margin if raw_min_margin is not None else 0.05)
+            if top1 >= min_score and top1 - top2 >= min_margin:
+                route_fast_skip = True
+                rerank_state = "routed_confidence"
+                if bool(getattr(routing_cfg, "trace", False)):
+                    logger.debug(
+                        "kb routing: mode=%s rerank=skipped top1=%.4f margin=%.4f",
+                        route.mode, top1, top1 - top2)
 
         if (candidates and kb_rerank_on and rerank_floor > 0.0
                 and not route_fast_skip):

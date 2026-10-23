@@ -1322,6 +1322,8 @@ def dialogue_fact_admits(text: str, role: str = "") -> bool:
     Returns:
         True when the sentence may enter L2.
     """
+    if admission_rejection(text, role=role):
+        return False
     if _has_self_sufficient_modal(text):
         return True
     floor = _MIN_SIGNAL_ASSISTANT if role == "assistant" else _MIN_SIGNAL_USER

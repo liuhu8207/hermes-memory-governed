@@ -30,6 +30,16 @@ def test_assistant_fragment_is_flagged_and_rejected():
     assert admission_rejection(text) == "assistant_fragment"
 
 
+def test_assistant_status_report_is_rejected_only_with_assistant_context():
+    text = ("本轮三个问题全部修复且均为根因修复：① cron 4/9 失败→9/9 全绿，"
+            "测试 2032 passed")
+    verdict = classify_fact(text, role="assistant", source="auto-extract")
+    assert verdict and verdict["kind"] == "assistant_fragment"
+    assert admission_rejection(text, role="assistant") == "assistant_fragment"
+    # The same prose from an external fact writer is not rejected by text alone.
+    assert classify_fact(text) is None
+
+
 def test_a_real_fact_is_not_flagged():
     text = "Hermes Gateway 重启必须用 schtasks /run /tn Hermes_Gateway 计划任务"
     assert classify_fact(text) is None
