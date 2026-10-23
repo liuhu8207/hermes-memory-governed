@@ -367,6 +367,7 @@ python scripts/memory_pipeline.py persona        # regenerate L4 persona
 python scripts/l2_categorize.py                  # dry-run L2 category migration
 python scripts/kb_graph_audit.py --strict        # fail on true orphans/unknown links
 python scripts/backup_retention.py --dry-run     # preview backup retention
+python scripts/decision_gold_build.py --dry-run  # preview private real-data decision set
 ```
 
 ### Bridge review
@@ -383,9 +384,15 @@ Decision-layer seed contract:
 python -m pytest tests/test_decision_gold_contract.py -q
 ```
 
+Build the private 100-item real-data set under `$HERMES_HOME/evals/`:
+
+```bash
+python scripts/decision_gold_build.py --count 100
+```
+
 ## Testing & CI
 
-- Local full suite: `python -m pytest tests/ -q` → **2046 passed, 1 skipped** (2026-10-23).
+- Local full suite: `python -m pytest tests/ -q` → **2049 passed, 1 skipped** (2026-10-23).
 - CI (`[.github/workflows/ci.yml](.github/workflows/ci.yml)`) runs a **4-dimension matrix** — `py3.10` / `py3.13` × `core` / `vector`:
   - `core` installs `.[dev]` only (no vector backend → exercises the degradation path).
   - `vector` installs the lightweight backend (`lancedb` + `pyarrow` + `fastembed`, **not** `sentence-transformers`, which would pull ~2GB of torch).

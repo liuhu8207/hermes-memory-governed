@@ -9,6 +9,20 @@ extends, conflicts, new, and uncertain. It contains synthetic note summaries
 only, so it can exercise Jev or a future local compatible backend without
 leaking production content.
 
+For local evaluation, build a private set directly from the live KB, active L2,
+L2 archive, and current maintenance state:
+
+```bash
+python scripts/decision_gold_build.py --dry-run
+python scripts/decision_gold_build.py --count 100
+```
+
+The default output is `$HERMES_HOME/evals/decision_gold.real.json`; the builder
+refuses to write it inside the public repository. Every item carries source IDs,
+source kinds, a deterministic label method, confidence, and an explicit
+`rule-labeled-not-human-reviewed` status. Temporal old/new status changes are
+kept as `uncertain` rather than being forced into `conflicts`.
+
 | Set | File | Role | What it may decide |
 |-----|------|------|--------------------|
 | seed | `retrieval_gold.seed.json` | smoke | nothing — it only proves the channel answers. It has **no discriminability**, so it can never pick a floor. |
