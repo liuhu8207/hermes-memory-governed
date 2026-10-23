@@ -18,9 +18,9 @@ are not counted and are removed with their database.
 
 KB index backups (``kb_notes.bak_*.lance`` / ``kb_notes.old*.lance``): keep 2.
 
-Vault backups (``<wiki>/.kb-backups-*``): keep the newest 2 inside the vault;
-older ones are **moved** to ``memory/vault_backups/`` (outside Obsidian), where
-the newest 3 are kept.
+Vault backups (``<wiki>/.kb-backups-*``): keep **none** inside the vault. Every
+backup is moved to ``memory/vault_backups/`` (outside Obsidian), where the
+newest 3 are kept.
 
 Default is a read-only report. ``--apply --yes`` performs deletions/moves.
 """
@@ -49,7 +49,7 @@ L2_KEEP_MONTHS = 3
 L2_MILESTONES = ("cleanup", "planb", "pre_restore")
 L3_KEEP = 5
 KB_KEEP = 2
-VAULT_KEEP = 2
+VAULT_KEEP = 0
 VAULT_ARCHIVE_KEEP = 3
 
 _STAMP = re.compile(r"(\d{8})_(\d{6})")

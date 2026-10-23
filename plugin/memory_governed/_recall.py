@@ -885,6 +885,8 @@ class RecallEngine:
                         results.append(item)
                         seen.add(item.content)
 
+            results = self._limit_l3_sessions(results)
+
             # Normalize scores to 0~1 (max -> 1.0) so L3 scores are
             # comparable with L2 scores and survive MIN_SCORE filtering.
             # FTS5 rank absolute values are tiny (1e-6 scale) which would
@@ -912,10 +914,10 @@ class RecallEngine:
         role_placeholders = ",".join("?" * len(L3_RECALL_ROLES))
         try:
             rows = conn.execute(
-                "SELECT rowid, content, rank, timestamp FROM messages_fts "
+                "SELECT rowid, content, rank, timestamp, session_id FROM messages_fts "
                 f"WHERE messages_fts MATCH ? AND role IN ({role_placeholders}) "
                 "ORDER BY rank LIMIT ?",
-                (fts_query, *L3_RECALL_ROLES, self._config.recall.l3_max_results),
+                (fts_query, *L3_RECALL_ROLES, self._l3_fetch_limit()),
             ).fetchall()
         except Exception as e:
             log_degraded("l3", "fts_search_failed", exc=e)
@@ -948,6 +950,7 @@ class RecallEngine:
                 content=row["content"],
                 score=score * age_factor,
                 source="sqlite",
+                metadata={"session_id": str(row["session_id"] or "")},
             ))
         return results
 
@@ -1027,10 +1030,10 @@ class RecallEngine:
             # 括号保证语义是 (片段1 OR 片段2 ...) AND role IN (...)，
             # 而不是把 role 条件并进 OR 链（那样会让任意 tool 行都被命中）。
             rows = conn.execute(
-                "SELECT rowid, content, timestamp FROM messages "
+                "SELECT rowid, content, timestamp, session_id FROM messages "
                 f"WHERE ({where_clause}) AND role IN ({role_placeholders}) "
                 "ORDER BY timestamp DESC LIMIT ?",
-                (*patterns, *L3_RECALL_ROLES, self._config.recall.l3_max_results),
+                (*patterns, *L3_RECALL_ROLES, self._l3_fetch_limit()),
             ).fetchall()
         except Exception as e:
             log_degraded("l3", "like_search_failed", exc=e)
@@ -1059,9 +1062,35 @@ class RecallEngine:
                 content=content,
                 score=(0.5 + 0.3 * ratio) * age_factor,
                 source="sqlite",
+                metadata={"session_id": str(row["session_id"] or "")},
             ))
 
         return results
+
+    def _limit_l3_sessions(self, results: List[RecallResult]) -> List[RecallResult]:
+        """Cap one session's share while preserving best-score order."""
+        cap = int(getattr(self._config.recall, "l3_max_per_session", 0) or 0)
+        if cap <= 0 or not results:
+            return results[:self._config.recall.l3_max_results]
+        ordered = sorted(results, key=lambda r: r.score, reverse=True)
+        counts: Dict[str, int] = {}
+        out: List[RecallResult] = []
+        for result in ordered:
+            session_id = str((result.metadata or {}).get("session_id") or "")
+            if session_id and counts.get(session_id, 0) >= cap:
+                continue
+            out.append(result)
+            if session_id:
+                counts[session_id] = counts.get(session_id, 0) + 1
+            if len(out) >= self._config.recall.l3_max_results:
+                break
+        return out
+
+    def _l3_fetch_limit(self) -> int:
+        """Over-fetch when a per-session cap is active so diversity can fill the budget."""
+        base = max(1, int(self._config.recall.l3_max_results))
+        cap = int(getattr(self._config.recall, "l3_max_per_session", 0) or 0)
+        return min(500, base * 5) if cap > 0 else base
 
     def _split_like_segments(self, query: str) -> List[str]:
         """把查询拆成可 OR 匹配的片段。

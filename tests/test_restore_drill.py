@@ -71,3 +71,15 @@ def test_restore_drill_verifies_all_three_stores(drill_env, capsys, tmp_path):
     # 默认用后即删，不留下明文 L3 副本
     drills = tmp_path / "home" / "restore_drills"
     assert not drills.exists() or not list(drills.iterdir())
+
+
+def test_latest_vault_backup_can_live_outside_wiki(tmp_path, monkeypatch):
+    mod = _load()
+    wiki = tmp_path / "wiki"
+    memory = tmp_path / "memory"
+    wiki.mkdir()
+    archived = memory / "vault_backups" / ".kb-backups-20261023_100000"
+    archived.mkdir(parents=True)
+    monkeypatch.setattr(mod, "_wiki_dir", lambda: wiki)
+    monkeypatch.setattr(mod, "MEMORY_DIR", memory)
+    assert mod._pick_vault("latest") == archived

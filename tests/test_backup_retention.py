@@ -92,3 +92,28 @@ def test_cron_runs_backup_retention():
     steps = {s.label: s for s in mod.STEPS}
     assert "backup-retention" in steps
     assert "--apply" in steps["backup-retention"].args
+
+
+def test_all_vault_backups_move_outside_obsidian(tmp_path, monkeypatch, capsys):
+    mod = _load()
+    home = tmp_path / "home"
+    memory = home / "memory"
+    wiki = tmp_path / "wiki"
+    memory.mkdir(parents=True)
+    wiki.mkdir()
+    (home / "governed_memory.json").write_text(
+        json.dumps({"wiki_dir": str(wiki), "l2_db_path": str(memory / "l2")}),
+        encoding="utf-8")
+    for stamp in ("20261021_120000", "20261022_120000"):
+        backup = wiki / f".kb-backups-{stamp}"
+        backup.mkdir()
+        (backup / "a.md").write_text("body", encoding="utf-8")
+
+    monkeypatch.setattr(mod, "HERMES_HOME", home)
+    monkeypatch.setattr(mod, "MEMORY_DIR", memory)
+    monkeypatch.setattr(sys, "argv",
+                        ["backup_retention.py", "--apply", "--yes"])
+    assert mod.main() == 0
+    capsys.readouterr()
+    assert not list(wiki.glob(".kb-backups-*"))
+    assert len(list((memory / "vault_backups").glob(".kb-backups-*"))) == 2

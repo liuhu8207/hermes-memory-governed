@@ -103,7 +103,13 @@ def _pick_vault(name: str):
         if not candidate.is_absolute():
             candidate = wiki / name
         return candidate if candidate.is_dir() else None
-    return _latest([p for p in wiki.glob(".kb-backups-*") if p.is_dir()])
+    in_vault = [p for p in wiki.glob(".kb-backups-*") if p.is_dir()]
+    if in_vault:
+        return _latest(in_vault)
+    archive = MEMORY_DIR / "vault_backups"
+    archived = ([p for p in archive.glob(".kb-backups-*") if p.is_dir()]
+                if archive.is_dir() else [])
+    return _latest(archived)
 
 
 def _kb_index_table(path: Path):

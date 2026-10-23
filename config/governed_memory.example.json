@@ -11,6 +11,7 @@
     "l2_fusion": false,
     "l2_min_score": 0.0,
     "l3_max_results": 20,
+    "l3_max_per_session": 0,
     "l2_max_results": 15,
     "cross_layer_fusion": false
   },

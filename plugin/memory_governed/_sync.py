@@ -33,6 +33,7 @@ from ._config import GovernedMemoryConfig
 from ._diag import log_data_loss, log_degraded, record_metric
 from ._synthesize import _content_to_text
 from ._quality import admission_rejection
+from ._categories import classify_fact_category
 
 logger = logging.getLogger(__name__)
 
@@ -2430,21 +2431,8 @@ class WriteQueue:
 
     @staticmethod
     def _categorize(sentence: str) -> str:
-        """Simple category assignment."""
-        lower = sentence.lower()
-        tech_kw = ["python", "docker", "linux", "api", "code", "database", "server",
-                    "git", "script", "代码", "函数", "配置", "部署"]
-        work_kw = ["project", "deadline", "meeting", "task", "项目", "需求", "进度"]
-        life_kw = ["health", "exercise", "travel", "run", "park", "walk",
-                    "健康", "运动", "旅行", "跑步"]
-
-        if any(kw in lower for kw in tech_kw):
-            return "tech"
-        if any(kw in lower for kw in work_kw):
-            return "work"
-        if any(kw in lower for kw in life_kw):
-            return "life"
-        return "other"
+        """Assign one category from the shared controlled vocabulary."""
+        return classify_fact_category(sentence)
 
     @property
     def stats(self) -> dict:

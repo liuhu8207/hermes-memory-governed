@@ -3,6 +3,12 @@
 Three gold sets, three jobs. They are **not** interchangeable, and the tool
 refuses to mix them.
 
+`decision_gold.seed.json` is separate from retrieval scoring. It is the
+replayable contract for the optional KB-novelty decision layer: duplicate,
+extends, conflicts, new, and uncertain. It contains synthetic note summaries
+only, so it can exercise Jev or a future local compatible backend without
+leaking production content.
+
 | Set | File | Role | What it may decide |
 |-----|------|------|--------------------|
 | seed | `retrieval_gold.seed.json` | smoke | nothing — it only proves the channel answers. It has **no discriminability**, so it can never pick a floor. |

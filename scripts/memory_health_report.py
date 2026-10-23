@@ -128,6 +128,19 @@ def check_l3(h: HealthCheck):
         if "messages" in tables:
             count = conn.execute("SELECT COUNT(*) FROM messages").fetchone()[0]
             h.check("L3 messages", True, f"{count} rows")
+            if count:
+                largest = conn.execute(
+                    "SELECT session_id, COUNT(*) AS n FROM messages "
+                    "GROUP BY session_id ORDER BY n DESC LIMIT 1"
+                ).fetchone()
+                if largest:
+                    share = largest[1] / count
+                    detail = (f"largest {largest[0] or '?'}: "
+                              f"{largest[1]}/{count} ({share:.1%})")
+                    if share >= 0.5 and count >= 500:
+                        h.check_warning("L3 session balance", detail)
+                    else:
+                        h.check("L3 session balance", True, detail)
 
         if "messages_fts" in tables:
             h.check("L3 FTS5", True, "indexed")

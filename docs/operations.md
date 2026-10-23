@@ -182,7 +182,7 @@ as a daily cron step (``backup-retention``):
 | L2 table directories | newest 7 + newest of each of the last 3 months + named milestones (`cleanup`, `planB`, `pre_restore`) |
 | L3 databases | newest 5 |
 | KB index backups | 2 |
-| Vault `.kb-backups-*` | newest 2 in the vault; older moved to `$HERMES_HOME/memory/vault_backups/`, where newest 3 are kept |
+| Vault `.kb-backups-*` | never kept in the vault; all moved to `$HERMES_HOME/memory/vault_backups/`, where newest 3 are kept |
 
 Timestamps are parsed from the **name**, not mtime (copied directories often
 inherit an old mtime). The script is report-only by default; cron passes
@@ -194,6 +194,34 @@ python scripts/backup_retention.py --dry-run
 
 The first real run reclaimed 544.4 MB (774 MB → 229.6 MB) and left the
 milestone backups intact.
+
+## L2 Category Migration
+
+New facts use the same controlled vocabulary as KB navigation. Existing rows
+can be normalized with a report-only pass first:
+
+```bash
+python scripts/l2_categorize.py --dry-run
+python scripts/l2_categorize.py --apply --yes
+```
+
+The apply path backs up the full Lance table before changing categories and
+reports per-row failures rather than partially hiding them.
+
+## KB Graph Audit
+
+`kb_graph_audit.py` separates three cases that a raw broken-link count conflates:
+resolved notes, intentional concept placeholders, and genuinely unknown
+targets. It also reports notes with neither incoming nor outgoing graph links.
+
+```bash
+python scripts/kb_graph_audit.py --json
+python scripts/kb_graph_audit.py --strict  # fail on orphans or unknown targets
+```
+
+Concept placeholders are not failures: they preserve a future note target and
+remain visible in frontmatter. Only `unknown_links` and `orphans` are strict
+failures.
 
 ## Test Isolation vs Production Scripts
 

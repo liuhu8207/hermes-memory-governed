@@ -28,6 +28,8 @@ class RecallConfig:
     prefetch_ttl_seconds: float = 30.0
     l3_time_decay_hours: float = 168.0  # 7-day half-life
     l3_max_results: int = 20
+    #: Maximum hits from one L3 session after ranking. 0 = unlimited (legacy).
+    l3_max_per_session: int = 0
     l2_max_results: int = 15
     parallel_timeout_seconds: float = 2.0
     #: L2（向量语义层）**专用**的最低相关分阈值；``0.0`` = 关闭（沿用
@@ -631,7 +633,7 @@ def _inherit_synthesis_model(config: GovernedMemoryConfig, hermes_home: Path) ->
 _NUMERIC_FIELDS = {
     "recall": ["l1_budget_tokens", "l23_budget_tokens", "prefetch_ttl_seconds",
                "l3_time_decay_hours", "l3_max_results", "l2_max_results",
-               "parallel_timeout_seconds", "l2_min_score"],
+               "l3_max_per_session", "parallel_timeout_seconds", "l2_min_score"],
     "sync": ["write_queue_maxsize", "l2_max_facts_per_turn"],
     "mermaid_compress": ["canvas_max_tokens"],
     "vector": ["dim"],

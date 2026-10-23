@@ -16,6 +16,7 @@ Location: `$HERMES_HOME/governed_memory.json`
     "l3_time_decay_hours": 168,
     "parallel_timeout_seconds": 2.0,
     "l3_max_results": 20,
+    "l3_max_per_session": 0,
     "l2_max_results": 15
   },
   "sync": {
@@ -79,6 +80,7 @@ scripts run from the checkout.
 | l3_time_decay_hours | 168 | Half-life for L3 time decay (7 days). |
 | parallel_timeout_seconds | 2.0 | Max wait for parallel L2+L3+L4 recall. |
 | l3_max_results | 20 | Max L3 search results before ranking. |
+| l3_max_per_session | 0 | Max hits from one L3 session. 0 preserves legacy unlimited behavior; a positive value over-fetches and keeps the best hits from other sessions. |
 | l2_max_results | 15 | Max L2 search results before ranking. |
 
 ## Sync Config

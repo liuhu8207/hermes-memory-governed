@@ -55,7 +55,9 @@
  },
  {
   "q": "TrueNAS 换成 Unraid 然后挂载 ZFS 备份数据可行吗",
-  "expect": []
+  "expect": [
+   "Unraid 导入 TrueNAS ZFS 池流程"
+  ]
  },
  {
   "q": "帮我安排晨间邮件摘要并推送到企业微信",

@@ -378,9 +378,9 @@ class TestSyncEngine:
         from plugin.memory_governed._config import GovernedMemoryConfig
         config = GovernedMemoryConfig()
         q = WriteQueue(config)
-        assert q._categorize("Python is installed") == "tech"
-        assert q._categorize("Project deadline is Friday") == "work"
-        assert q._categorize("I went for a run in the park") == "life"
+        assert q._categorize("Python is installed") == "tooling"
+        assert q._categorize("Project deadline is Friday") == "project"
+        assert q._categorize("I went for a run in the park") == "user"
 
     def test_migrate_null_vectors(self, tmp_path):
         """_migrate_null_vectors re-embeds rows with NULL vector column."""
