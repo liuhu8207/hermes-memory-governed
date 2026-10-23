@@ -60,23 +60,6 @@
     "top_n": 10,
     "enabled": false
   },
-  "decision": {
-    "enabled": false,
-    "mode": "shadow",
-    "backend": "jev",
-    "base_url": "",
-    "api_key_env": "TYPESAFE_API_KEY",
-    "model": "jev-latest",
-    "timeout_seconds": 1.5,
-    "cache_size": 256,
-    "audit_path": "",
-    "background_shadow": true,
-    "max_candidates": 5,
-    "max_content_chars": 1600,
-    "warn_confidence": 0.85,
-    "review_confidence": 0.65,
-    "kb_novelty_enabled": true
-  },
   "routing": {
     "enabled": false,
     "max_exact_terms": 12,

@@ -33,7 +33,6 @@ from pathlib import Path
 from typing import Any, Dict, Iterator, List, Optional, Tuple
 
 from ._config import GovernedMemoryConfig
-from ._decision import DecisionEngine
 from ._embedding import EmbeddingService
 from ._bridge import has_secret_like_text
 from ._llm import chat_completion
@@ -1039,13 +1038,6 @@ class KnowledgeBase:
         # 一眼回答"上次同步到底成没成、删了多少行"。
         self._last_sync: Dict[str, Any] = {}
         self._router = QueryRouter(getattr(config, "routing", None))
-        decision_cfg = getattr(config, "decision", None)
-        self._decision: Optional[DecisionEngine] = None
-        if decision_cfg is not None and bool(getattr(decision_cfg, "enabled", False)):
-            audit_path = (str(getattr(decision_cfg, "audit_path", "") or "").strip()
-                          or str(self._usage_db.parent / "decision_audit.jsonl"))
-            self._decision = DecisionEngine(decision_cfg, audit_path=audit_path)
-
     # -- 索引新鲜度探测（廉价，只读元数据） ----------------------------
 
     def _walk(self) -> List[Path]:
@@ -2548,89 +2540,6 @@ class KnowledgeBase:
             added += len(pending)
         return added
 
-    def _decision_candidates(
-        self,
-        title: str,
-        body: str,
-        tags: List[str],
-        concepts: List[str],
-        current_path: Path,
-    ) -> List[Dict[str, Any]]:
-        """Return a small, deterministic candidate set for advisory decisions.
-
-        This path is deliberately cheaper than ``search()``: it never invokes
-        the reranker. In shadow mode the caller runs it on the background worker,
-        so an optional embedding lookup cannot delay the actual note write.
-        """
-        decision_cfg = getattr(self._config, "decision", None)
-        limit = max(1, int(getattr(decision_cfg, "max_candidates", 5) or 5))
-        query = " ".join(filter(None, [title, *tags, *concepts, body[:800]]))
-        target_bigrams = _bigrams(query.lower())
-        target_tags = {x.strip().lower() for x in tags if x.strip()}
-        target_concepts = {x.strip().lower() for x in concepts if x.strip()}
-        scored: Dict[str, Dict[str, Any]] = {}
-        live_notes = [note for note in self._iter_notes()
-                      if note.path != current_path and not _is_archived(note)]
-        notes_by_rel = {self._rel(note.path): note for note in live_notes}
-
-        for note in live_notes:
-            note_bigrams = _bigrams(note.full_text[:2000].lower())
-            overlap = (len(target_bigrams & note_bigrams) / len(target_bigrams)
-                       if target_bigrams else 0.0)
-            note_tags = {x.strip().lower() for x in note.tags if x.strip()}
-            note_concepts = {x.strip().lower()
-                             for x in note.concepts if x.strip()}
-            tag_union = target_tags | note_tags
-            concept_union = target_concepts | note_concepts
-            tag_overlap = (len(target_tags & note_tags) / len(tag_union)
-                           if tag_union else 0.0)
-            concept_overlap = (len(target_concepts & note_concepts)
-                               / len(concept_union) if concept_union else 0.0)
-            title_boost = 0.2 if title.lower() in note.title.lower() else 0.0
-            score = min(1.0, 0.55 * overlap + 0.2 * tag_overlap
-                        + 0.2 * concept_overlap + title_boost)
-            if score <= 0.0:
-                continue
-            rel = self._rel(note.path)
-            scored[rel] = {
-                "title": note.title,
-                "path": rel,
-                "snippet": note.body[:800],
-                "tags": note.tags,
-                "concepts": note.concepts,
-                "score": score,
-            }
-
-        # A semantic lookup adds bilingual/paraphrase candidates that character
-        # overlap misses. It is optional and best effort; failure keeps the
-        # lexical candidates rather than turning an advisory feature into a gate.
-        try:
-            idx = self._index_get()
-            if idx.available and query.strip():
-                for hit in idx.search(query[:1200], max(limit * 3, 8)):
-                    rel = str(hit.get("path") or "")
-                    if not rel or rel == self._rel(current_path):
-                        continue
-                    note = notes_by_rel.get(rel)
-                    if note is None:
-                        continue
-                    previous = scored.get(rel, {})
-                    scored[rel] = {
-                        "title": note.title,
-                        "path": rel,
-                        "snippet": note.body[:800],
-                        "tags": note.tags,
-                        "concepts": note.concepts,
-                        "score": max(float(previous.get("score", 0.0) or 0.0),
-                                     float(hit.get("score", 0.0) or 0.0)),
-                    }
-        except Exception as e:  # noqa: BLE001 - optional candidate enrichment
-            log_degraded("decision", "kb_candidate_semantic_failed", exc=e)
-
-        return sorted(scored.values(),
-                      key=lambda x: (-float(x.get("score", 0.0) or 0.0),
-                                     str(x.get("path") or "")))[:limit]
-
     def add(
         self,
         title: str,
@@ -2720,23 +2629,6 @@ class KnowledgeBase:
                                  "title), or rewrite to add new information"),
                     }
 
-        decision_report: Optional[Dict[str, Any]] = None
-        if self._decision is not None:
-            decision_report = self._decision.observe_kb_novelty(
-                {
-                    "title": title,
-                    "body": body,
-                    "tags": tags,
-                    "concepts": concepts,
-                    "section": section,
-                },
-                lambda: self._decision_candidates(title, body, tags, concepts, path),
-            )
-            if (self._decision.mode == "active" and decision_report
-                    and not decision_report.get("fallback")
-                    and decision_report.get("action") in ("warn", "review")):
-                review_required = True
-
         now = time_str()
         # 受控分类：调用方显式传的优先（非法值丢弃而非硬塞），否则按
         # title/tags/concepts 推断。推断不出就**不写这个键** —— 空分类
@@ -2761,11 +2653,6 @@ class KnowledgeBase:
             meta.update(_enrich_note(title, body, self._config))
         if confidence is not None:
             meta["confidence"] = float(confidence)
-        if (self._decision is not None and self._decision.mode == "active"
-                and decision_report and not decision_report.get("fallback")):
-            meta["decision_action"] = str(decision_report.get("action") or "")
-            meta["decision_confidence"] = float(
-                decision_report.get("confidence", 0.0) or 0.0)
         if review_required:
             meta["review_required"] = True
         if update:
@@ -2806,7 +2693,6 @@ class KnowledgeBase:
             "review_required": review_required,
             "links_added": links_added,
             "moc_rebuilt": moc_rebuilt,
-            **({"decision": decision_report} if decision_report is not None else {}),
         }
 
     def list_review(self, limit: int = 50) -> List[Dict[str, Any]]:

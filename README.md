@@ -317,23 +317,11 @@ Configuration lives in `$HERMES_HOME/governed_memory.json` (see [`config/governe
 | `embedding` | remote embedding API (OpenAI-compatible `/embeddings`) |
 | `reranking` | optional reranker (SiliconFlow bge-reranker) |
 | `routing` | deterministic query-entry routing; prefers exact identifiers and skips rerank only when a small strong match set is unambiguous |
-| `decision` | optional Jev advisory layer for KB novelty decisions; disabled and shadow-only by default |
 | `kb` | KB top-k, thresholds, semantic/keyword toggles, autolink |
 | `asr` | audio transcription (XingChenASR) — `api_style` (default `transcriptions`; use `chat_audio` for a chat-completions-style audio endpoint), `timeout_seconds` (default 600: per-request ceiling), `chunk_minutes` (default 10: recordings longer than this are split and their transcripts joined in order), and `max_encoded_bytes` (default 10000000: cap on the base64 payload in `chat_audio`). All have defaults, so no config edit is needed. |
 | `synthesis` | session distillation (provider/model/key, enabled flag) |
 
 > ⚠️ **Dimension consistency**: a given L2 table can hold only one vector dimension. Switching backends (API ↔ local) or models changes the dimension, so you must rebuild L2: `python scripts/l2_rebuild.py`.
-
-### Optional Jev decision layer
-
-The `decision` section is an advisory plane, not another memory store. It
-requires the optional `jev` extra (`pip install -e '.[jev]'`) and
-`TYPESAFE_API_KEY`. Its default is `enabled: false`. When enabled in `shadow`
-mode, KB writes proceed unchanged and a background worker records a bounded
-duplicate/extension/conflict/new suggestion in
-`$HERMES_HOME/memory/decision_audit.jsonl`. No raw note text is written to that
-audit file. Set `background_shadow: false` for short-lived CLI processes where
-the decision must complete before process exit.
 
 ### HuggingFace in China
 
@@ -367,7 +355,6 @@ python scripts/memory_pipeline.py persona        # regenerate L4 persona
 python scripts/l2_categorize.py                  # dry-run L2 category migration
 python scripts/kb_graph_audit.py --strict        # fail on true orphans/unknown links
 python scripts/backup_retention.py --dry-run     # preview backup retention
-python scripts/decision_gold_build.py --dry-run  # preview private real-data decision set
 ```
 
 ### Bridge review
@@ -378,21 +365,9 @@ python scripts/scope_recall_bridge.py status          # check status
 python scripts/scope_recall_bridge.py validate        # validate candidates
 ```
 
-Decision-layer seed contract:
-
-```bash
-python -m pytest tests/test_decision_gold_contract.py -q
-```
-
-Build the private 100-item real-data set under `$HERMES_HOME/evals/`:
-
-```bash
-python scripts/decision_gold_build.py --count 100
-```
-
 ## Testing & CI
 
-- Local full suite: `python -m pytest tests/ -q` → **2049 passed, 1 skipped** (2026-10-23).
+- Local full suite: `python -m pytest tests/ -q` → **2035 passed, 1 skipped** (2026-10-23).
 - CI (`[.github/workflows/ci.yml](.github/workflows/ci.yml)`) runs a **4-dimension matrix** — `py3.10` / `py3.13` × `core` / `vector`:
   - `core` installs `.[dev]` only (no vector backend → exercises the degradation path).
   - `vector` installs the lightweight backend (`lancedb` + `pyarrow` + `fastembed`, **not** `sentence-transformers`, which would pull ~2GB of torch).

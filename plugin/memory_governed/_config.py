@@ -372,32 +372,6 @@ class SynthesisConfig:
 
 
 @dataclass
-class DecisionConfig:
-    """Optional fast-decision layer (Jev or a compatible policy).
-
-    This layer is deliberately advisory. Existing deterministic gates remain
-    authoritative; Jev can annotate writes, route work, or raise a review flag,
-    but it must never become the only gate protecting memory from corruption.
-    """
-
-    enabled: bool = False
-    mode: str = "shadow"             # shadow | active
-    backend: str = "jev"
-    base_url: str = ""
-    api_key_env: str = "TYPESAFE_API_KEY"
-    model: str = "jev-latest"
-    timeout_seconds: float = 1.5
-    cache_size: int = 256
-    audit_path: str = ""
-    background_shadow: bool = True
-    max_candidates: int = 5
-    max_content_chars: int = 1600
-    warn_confidence: float = 0.85
-    review_confidence: float = 0.65
-    kb_novelty_enabled: bool = True
-
-
-@dataclass
 class RoutingConfig:
     """Deterministic query-entry routing for the knowledge-base channel."""
 
@@ -439,7 +413,6 @@ class GovernedMemoryConfig:
     kb: KnowledgeConfig = field(default_factory=KnowledgeConfig)
     asr: AsrConfig = field(default_factory=AsrConfig)
     synthesis: SynthesisConfig = field(default_factory=SynthesisConfig)
-    decision: DecisionConfig = field(default_factory=DecisionConfig)
     routing: RoutingConfig = field(default_factory=RoutingConfig)
 
 
@@ -554,7 +527,6 @@ def load_governed_config(hermes_home: str | Path) -> GovernedMemoryConfig:
     _validate_numeric_fields(config)
     _validate_positive_fields(config)
     _validate_api_style(config)
-    _validate_decision_config(config)
     _validate_routing_config(config)
 
     # Env var overrides (backward compat)
@@ -643,8 +615,6 @@ _NUMERIC_FIELDS = {
            "rerank_min_score"],
     "asr": ["timeout_seconds", "chunk_minutes", "max_encoded_bytes"],
     "reranking": ["top_n"],
-    "decision": ["timeout_seconds", "cache_size", "max_candidates",
-                 "max_content_chars", "warn_confidence", "review_confidence"],
     "routing": ["max_exact_terms", "exact_keyword_threshold",
                 "max_exact_candidates", "confidence_skip_min_score",
                 "confidence_skip_min_margin"],
@@ -675,30 +645,6 @@ def _validate_api_style(config: GovernedMemoryConfig) -> None:
         style, ", ".join(_ASR_API_STYLES),
     )
     asr.api_style = "transcriptions"
-
-
-def _validate_decision_config(config: GovernedMemoryConfig) -> None:
-    """Clamp advisory-layer settings without changing legacy behaviour."""
-    decision = getattr(config, "decision", None)
-    if decision is None:
-        return
-    if decision.mode not in ("shadow", "active"):
-        logger.warning("Config decision.mode = %r unknown — using 'shadow'",
-                       decision.mode)
-        decision.mode = "shadow"
-    if str(decision.backend or "").strip().lower() != "jev":
-        decision.backend = "jev"
-    if decision.max_candidates < 1:
-        decision.max_candidates = 1
-    if decision.max_candidates > 20:
-        decision.max_candidates = 20
-    if decision.max_content_chars < 200:
-        decision.max_content_chars = 200
-    if decision.cache_size < 0:
-        decision.cache_size = 0
-    for name in ("warn_confidence", "review_confidence"):
-        value = float(getattr(decision, name, 0.0) or 0.0)
-        setattr(decision, name, min(1.0, max(0.0, value)))
 
 
 def _validate_routing_config(config: GovernedMemoryConfig) -> None:
